@@ -1,0 +1,37 @@
+# Watchlist
+
+> Tickers you don't currently hold but want monitored.
+> The portfolio agent reads this on every run.
+> Edit freely; the agent will respect changes from the next run.
+
+## Tech / AI
+
+- **NVDA** — AI compute cycle, watch for $110 pullback
+- **MSFT** — Copilot adoption signal in next earnings
+- **AMD** — server CPU share, watch margin trajectory
+- **META** — capex pace; thesis is "AI as product moat"
+
+## Semis (separate from AI compute)
+
+- **TSM** — wafer cycle; key for the whole chain
+- **AVGO** — networking + custom silicon
+
+## Energy
+
+- **XOM** — Permian production growth, base position consideration
+- **PBR** — high dividend yield, political risk
+
+## Watching for re-entry
+
+- **NFLX** — sold at $480, watching for $350 base
+- **GOOG** — antitrust overhang priced in? wait for clarity
+
+## Notes / annotations
+
+- For NVDA: previous resistance at $135. Buy zone if it tests $110 with volume hold.
+- For TSM: respect ER dates; volatility around prints
+- AVGO: capex commitments from hyperscaler customers are the lead indicator
+
+---
+
+_Edit this file freely. The agent reads it on each run and the format is intentionally loose — pure markdown, free-form notes welcome._

@@ -1,0 +1,162 @@
+[project]
+name = "eonlet"
+version = "0.0.0"
+description = "A local-first runtime for stateful AI agents — the systemd for agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ziyu" }]
+keywords = ["ai", "agent", "llm", "runtime", "daemon", "systemd", "tmux"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+dependencies = [
+    # Async runtime
+    "anyio>=4.4",
+    # HTTP
+    "httpx>=0.27",
+    # Data validation
+    "pydantic>=2.7",
+    # SQLite with extended features
+    "apsw>=3.46",
+    # CLI
+    "typer>=0.12",
+    "rich>=13.7",
+    "prompt-toolkit>=3.0",
+    # Configuration
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    # Logging
+    "structlog>=24.1",
+    # LLM SDKs
+    "anthropic>=0.40",
+    "openai>=1.40",
+    # Filesystem watching (for hot-reload of definitions in v0.2+)
+    "watchdog>=4.0",
+    # Cron-style scheduling
+    "croniter>=2.0",
+    # Time zone handling
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    # Serialization
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+search = ["tavily-python>=0.3"]                  # web_search backend
+mcp = ["mcp>=0.5"]                                # v0.2: MCP integration
+otel = ["opentelemetry-api", "logfire"]           # v0.2: tracing
+tui = ["textual>=0.70"]                           # v0.2: TUI
+
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pytest-recording>=0.13",
+    "hypothesis>=6.100",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+
+[project.scripts]
+eonlet = "eonlet.cli.main:cli_main"
+eonlet-worker = "eonlet.worker.main:main"
+# v0.4+: eonletd = "eonlet.supervisor.main:main"
+
+[project.urls]
+Homepage = "https://eonlet.dev"
+Documentation = "https://eonlet.dev/docs"
+Repository = "https://github.com/eonlet/eonlet"
+Issues = "https://github.com/eonlet/eonlet/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eonlet"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/eonlet/templates" = "eonlet/templates"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Templates ship as user-facing example code; they're documentation as much as
+# they are Python. Lint them on a separate, looser pass if at all.
+extend-exclude = ["src/eonlet/templates"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET", "PTH", "ASYNC", "RUF"]
+ignore = [
+    "E501",   # handled by formatter
+    "RUF002", # en-dashes in docstrings are intentional
+    "RUF003", # ditto for non-prose comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer's canonical pattern puts ``typer.Option(...)`` in defaults; suppressing
+# B008 only there. ``apiVersion`` is mixed-case to match the YAML field name.
+"src/eonlet/cli/main.py" = ["B008"]
+"src/eonlet/config.py" = ["N815"]
+# Test files: relax a handful of style rules that fire on legitimate patterns
+# in pytest code — polling for a socket file from an async test, sleeping in a
+# `while` loop to wait for IPC notes, opening a log handle that's passed to
+# ``subprocess.Popen`` (which takes ownership), nested async `with` blocks for
+# readability, and ``os.path.expanduser`` in tests that explicitly want the
+# stdlib helper.
+"tests/**" = ["ASYNC110", "ASYNC240", "SIM115", "SIM117", "PTH111", "PTH123"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_any_unimported = true
+exclude = ["src/eonlet/templates/"]
+
+# Modules that adapt external SDKs with extremely rich union types. They sit
+# at a network boundary and are fully exercised by tests/unit/test_providers.py.
+# Strict mode on the union/arg-type/attr-defined axes is more noise than signal.
+[[tool.mypy.overrides]]
+module = [
+    "eonlet.llm.anthropic_provider",
+    "eonlet.llm.openai_provider",
+]
+disable_error_code = [
+    "union-attr",
+    "arg-type",
+    "attr-defined",
+    "call-overload",
+    "unused-ignore",
+    "no-any-unimported",
+    "no-any-return",
+    "misc",
+]
+
+# Third-party deps without published stubs.
+[[tool.mypy.overrides]]
+module = ["croniter", "apsw", "msgpack", "yaml"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+# Coverage is enabled but the floor is set at the v0.0.4 baseline. Raise this
+# as new tests land; v0.1.0 target is 70% per SPEC §12.
+# (CI invokes pytest with --cov-fail-under explicitly so dev-local runs don't
+# break when running a subset of tests.)
+
+[tool.coverage.run]
+branch = true
+source = ["src/eonlet"]

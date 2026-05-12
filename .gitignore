@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.env
+!.env.example
+
+# Eonlet runtime
+.eonlet-local/                  # local development data
+eonlet-test-home/               # for tests
+
+# Documentation builds
+docs/_build/
+site/
+
+# Logs
+*.log
+logs/
+
+# Per-agent secrets and runtime data (in agent dev directories)
+agents/*/workspace/
+agents/*/state.db*
+agents/*/memory/
+agents/*/logs/
+agents/*/.env
+
+# Keep example files
+!agents/*/.env.example
+!agents/*/workspace/.gitkeep

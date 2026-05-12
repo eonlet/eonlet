@@ -1,0 +1,86 @@
+apiVersion: eonlet/v1
+kind: Agent
+
+metadata:
+  name: x-digest
+  description: "Daily summary of X (Twitter) timeline from people I follow, delivered by email"
+  version: 0.1.0
+  authors: ["Eonlet contributors"]
+  tags: [scheduled, personal, digest]
+  specialty: information_curation
+  capabilities:
+    - "fetch.social_media_timeline"
+    - "summarize.daily_digest"
+    - "deliver.email"
+
+runtime:
+  model: claude-sonnet-4-6@anthropic
+  fallback_model: claude-haiku-4-5-20251001@anthropic
+  max_context_tokens: 180000
+  max_steps_per_run: 50
+  budget:
+    daily_usd: 1.0
+    on_exceed: warn
+
+triggers:
+  - id: morning_digest
+    kind: cron
+    schedule: "0 8 * * *"          # daily at 08:00 local
+    timezone: Asia/Tokyo
+    grace_period: 2h
+    message: |
+      Time for the morning digest.
+      
+      1. Use x_timeline_fetch with `since` set to the timestamp recorded in
+         memory/last_run.md (or "24 hours ago" if no record exists).
+      2. Group the tweets by theme.
+      3. For each theme, write 2-4 concise bullets summarizing what's notable.
+      4. Write the full digest to workspace/outputs/{{fired_at_date}}-digest.md.
+      5. Use send_email to deliver it (subject: "X Digest {{fired_at_date}}").
+      6. Append a one-line entry to memory/last_run.md with the timestamp
+         and a summary of main themes.
+
+tools:
+  builtin:
+    - file_read
+    - file_write
+    - note
+    - todo
+    - recall
+    - memory
+    - send_email
+    - sleep
+  custom:
+    - ./tools/x_timeline.py
+
+env:
+  required:
+    - X_BEARER_TOKEN
+    - SMTP_HOST
+    - SMTP_USER
+    - SMTP_PASSWORD
+    - EMAIL_TO
+  optional:
+    - SMTP_PORT                    # defaults to 587
+    - X_DIGEST_MAX_TWEETS          # defaults to 200
+  defaults:
+    SMTP_PORT: "587"
+    X_DIGEST_MAX_TWEETS: "200"
+
+permissions:
+  mode: yolo                        # autonomous; no user to ask
+  extra_deny:
+    - "Bash(*)"                     # this agent should never need shell
+
+memory:
+  enabled: true
+  compaction_model: claude-haiku-4.5@anthropic
+  conversation:
+    working_memory_tokens: 6000     # mostly scheduled runs, short context
+    keep_recent_messages_min: 4
+    short_term_tokens: 3000
+    long_term_tokens: 6000
+    auto_compact: true
+
+lifecycle:
+  on_crash: warn

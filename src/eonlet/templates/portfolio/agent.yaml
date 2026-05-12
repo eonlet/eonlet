@@ -1,0 +1,136 @@
+apiVersion: eonlet/v1
+kind: Agent
+
+metadata:
+  name: portfolio
+  description: "Daily portfolio analysis, market scan, and rebalancing suggestions for personal US equity portfolio"
+  version: 0.1.0
+  authors: ["Eonlet contributors"]
+  tags: [scheduled, finance, personal, advanced]
+  specialty: portfolio_analysis
+  capabilities:
+    - "read.broker_positions"
+    - "analyze.equity_holdings"
+    - "scan.market_news"
+    - "report.investment_decisions"
+
+runtime:
+  model: claude-opus-4-7@anthropic
+  fallback_model: claude-sonnet-4-6@anthropic
+  max_context_tokens: 200000
+  max_steps_per_run: 100
+  max_wall_clock_per_run: 30m
+  budget:
+    daily_usd: 3.0
+    monthly_usd: 60.0
+    on_exceed: pause                  # pause; user must inspect before resuming
+
+triggers:
+  - id: pre_market
+    kind: cron
+    schedule: "30 8 * * 1-5"          # 08:30 ET weekdays (1h before US open)
+    timezone: America/New_York
+    grace_period: 1h
+    message: |
+      Pre-market briefing.
+      
+      1. Read memory/watchlist.md and memory/target_allocation.md.
+      2. For each holding and each watchlist ticker, check overnight news
+         via news_scan(tickers=[...], since=last_close).
+      3. Identify pre-market movers (>2% in either direction) using
+         market_data.
+      4. Write a short (≤300 word) pre-market brief to
+         workspace/outputs/{{fired_at_date}}-premarket.md.
+      5. Email me with subject "Pre-market <YYYY-MM-DD>".
+      6. Append a line to memory/history.md.
+      
+      Keep it short. I need to decide whether to look at my screen before market open.
+
+  - id: post_close
+    kind: cron
+    schedule: "30 16 * * 1-5"         # 16:30 ET weekdays (30m after close)
+    timezone: America/New_York
+    grace_period: 2h
+    message: |
+      Post-close full analysis.
+      
+      1. Read all memory files: watchlist.md, target_allocation.md, 
+         history.md, notes.md.
+      2. Use portfolio_read to get current positions and today's P&L.
+      3. Use market_data for closing quotes on holdings + watchlist.
+      4. Use news_scan for major news on holdings + watchlist today.
+      5. For each holding, assess: meaningful news? unusual price action?
+         changes to thesis?
+      6. Compute current allocation vs target_allocation. Flag any
+         position that's >5% deviation from target.
+      7. Scan watchlist: any candidate near a buy zone you'd previously
+         identified in notes.md?
+      8. If you would like to load the technical_analysis or 
+         fundamental_analysis skill for any specific ticker, use load_skill.
+      9. Write the full report to workspace/outputs/{{fired_at_date}}-report.md.
+      10. Email me. Subject: "Portfolio <YYYY-MM-DD> — <one-line headline>".
+      11. Append today's P&L and key decisions to memory/history.md.
+      
+      NEVER place orders. NEVER suggest specific share counts. 
+      Suggest direction and rough magnitude only ("trim 1/3 of XYZ", 
+      "add starter position in ABC"). Final decisions are mine.
+
+tools:
+  builtin:
+    - file_read
+    - file_write
+    - note
+    - todo
+    - recall
+    - memory
+    - web_search
+    - web_fetch
+    - send_email
+    - load_skill
+    - sleep
+  custom:
+    - ./tools/portfolio_read.py
+    - ./tools/market_data.py
+    - ./tools/news_scan.py
+
+env:
+  required:
+    - BROKER_API_KEY                  # IBKR / Schwab / Alpaca / etc.
+    - BROKER_API_SECRET               # required for Alpaca and most modern brokers
+    - BROKER_ACCOUNT_ID
+    - MARKET_DATA_API_KEY             # Polygon / Tiingo / etc., or use yfinance (free)
+    - SMTP_HOST
+    - SMTP_USER
+    - SMTP_PASSWORD
+    - EMAIL_TO
+  optional:
+    - BROKER_PROVIDER                 # alpaca | ibkr | schwab | yfinance_only
+    - MARKET_DATA_PROVIDER            # polygon | tiingo | yfinance
+    - NEWS_API_KEY                    # for news_scan; optional
+  defaults:
+    BROKER_PROVIDER: "alpaca"
+    MARKET_DATA_PROVIDER: "yfinance"
+
+permissions:
+  mode: yolo                          # autonomous; no user attached at run time
+  extra_deny:
+    # CRITICAL: never let the agent place orders, even hypothetically
+    - "broker_place_order(*)"
+    - "broker_cancel_order(*)"
+    - "broker_modify_order(*)"
+    # The agent has read-only data tools; this is belt-and-suspenders
+    - "Bash(*)"                       # no shell access for a finance agent
+
+memory:
+  enabled: true
+  compaction_model: claude-haiku-4.5@anthropic
+  conversation:
+    working_memory_tokens: 10000
+    keep_recent_messages_min: 4
+    short_term_tokens: 4000
+    long_term_tokens: 10000           # finance state is denser; retain more
+    auto_compact: true
+
+lifecycle:
+  on_crash: warn
+  max_lifetime: 730d                  # 2 years; just a sanity bound

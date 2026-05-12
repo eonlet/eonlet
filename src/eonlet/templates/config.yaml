@@ -1,0 +1,30 @@
+# ~/.eonlet/config.yaml — global defaults
+defaults:
+  model: claude-sonnet-4-6
+  permissions:
+    mode: ask
+  budget:
+    daily_usd: 5.0
+
+# Custom providers — reference with  model@provider  in agent.yaml.
+# Built-in providers (anthropic, openai) need no entry here; they read
+# ANTHROPIC_API_KEY / OPENAI_API_KEY automatically.
+#
+providers:
+#   openrouter:
+#     api: openai
+#     base_url: https://openrouter.ai/api/v1
+#     api_key_env: OPENROUTER_API_KEY     # optional; defaults to OPENROUTER_API_KEY
+#
+  deepseek:
+    api: openai
+    base_url: https://api.deepseek.com
+    # api_key_env omitted → defaults to DEEPSEEK_API_KEY
+#
+#   my-anthropic-proxy:
+#     api: anthropic
+#     base_url: https://my-proxy.internal/v1
+#     api_key_env: PROXY_API_KEY
+
+logging:
+  level: info

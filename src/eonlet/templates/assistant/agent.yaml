@@ -1,0 +1,62 @@
+apiVersion: eonlet/v1
+kind: Agent
+
+metadata:
+  name: assistant
+  description: "General-purpose interactive assistant with persistent notes"
+  version: 0.1.0
+  authors: ["Eonlet contributors"]
+  tags: [interactive, general, default]
+  specialty: general_assistance
+  capabilities:
+    - "general.conversation"
+    - "research.web"
+    - "write.code"
+    - "manage.notes"
+
+runtime:
+  model: deepseek-v4-pro@deepseek
+  fallback_model: deepseek-v4-flash@deepseek
+  max_context_tokens: 180000
+  max_steps_per_run: 100
+  budget:
+    daily_usd: 5.0
+    on_exceed: warn
+
+# No triggers section -- this agent is purely interactive.
+# It waits for the user to `eonlet attach` and chat.
+
+tools:
+  builtin:
+    - bash
+    - file_read
+    - file_write
+    - file_edit
+    - glob
+    - grep
+    # web_search and web_fetch land in v0.0.2 — see ROADMAP.md
+    - note
+    - todo
+    - recall
+    - memory
+    - remember
+    - forget
+    - load_skill
+    - sleep
+    - schedule
+
+permissions:
+  mode: ask                    # always ask before destructive tool calls
+
+memory:
+  enabled: true
+  compaction_model: deepseek-v4-flash@deepseek
+  conversation:
+    working_memory_tokens: 12000     # higher cap for chatty interactive use
+    keep_recent_messages_min: 6
+    short_term_tokens: 4000
+    long_term_tokens: 8000
+    auto_compact: true
+
+lifecycle:
+  on_crash: warn               # MVP: just log; v0.4+ supervisor will auto-restart
