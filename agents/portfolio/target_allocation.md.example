@@ -1,0 +1,38 @@
+# Target Allocation
+
+> Your portfolio's intended composition.
+> The agent compares your actual allocation to this and flags deviations > 5pp.
+> Edit anytime; agent reads on each run.
+
+## By bucket
+
+| Bucket            | Target % | Notes |
+|-------------------|----------|-------|
+| US Large Tech     | 30       | Concentrated bet, AI cycle |
+| US Other Equities | 25       | Broad market diversification |
+| International     | 15       | Mostly developed markets, some EM |
+| Bonds (LT)        | 10       | Duration exposure |
+| Bonds (ST)        | 5        | Cash-alternative |
+| Cash              | 15       | Dry powder for opportunities |
+| **Total**         | **100**  |   |
+
+## Rebalance rules
+
+- **5pp deviation**: flag in the report
+- **8pp deviation**: agent should explicitly recommend rebalancing
+- **15pp deviation**: agent should mark this as urgent
+
+## Individual position caps
+
+No single position > 8% of total portfolio (let winners run, but not infinitely)
+No single non-major position > 3% of total
+
+## Style / tilt
+
+- Quality bias: prefer companies with consistent FCF, healthy balance sheets
+- Anti-meme: avoid hype-cycle names without numerical support
+- Patience over precision: don't chase exact target allocation; rebalance quarterly unless urgent
+
+---
+
+_Edit freely. The agent reads this on every run. If the numbers don't add to 100, the agent will flag it._

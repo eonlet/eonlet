@@ -1,0 +1,53 @@
+apiVersion: eonlet/v1
+kind: Agent
+
+metadata:
+  name: assistant
+  description: "General-purpose interactive assistant with persistent notes"
+  version: 0.1.0
+  authors: ["Eonlet contributors"]
+  tags: [interactive, general, default]
+  specialty: general_assistance
+  capabilities:
+    - "general.conversation"
+    - "research.web"
+    - "write.code"
+    - "manage.notes"
+
+runtime:
+  model: claude-sonnet-4-6
+  fallback_model: claude-haiku-4-5
+  max_context_tokens: 180000
+  max_steps_per_run: 100
+  budget:
+    daily_usd: 5.0
+    on_exceed: warn
+
+# No triggers section -- this agent is purely interactive.
+# It waits for the user to `eonlet attach` and chat.
+
+tools:
+  builtin:
+    - bash
+    - file_read
+    - file_write
+    - file_edit
+    - glob
+    - grep
+    # web_search and web_fetch land in v0.0.2 — see ROADMAP.md
+    - notes_read
+    - notes_append
+    - load_skill
+    - sleep
+
+permissions:
+  mode: ask                    # always ask before destructive tool calls
+
+memory:
+  recent_messages_in_context: 50
+  notes_files:
+    - notes.md                 # free-form journal across conversations
+    - todo.md                  # active tasks
+
+lifecycle:
+  on_crash: warn               # MVP: just log; v0.4+ supervisor will auto-restart

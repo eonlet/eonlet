@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: sync
+        run: uv sync --dev
+      - name: lint
+        run: uv run ruff check .
+      - name: format check
+        run: uv run ruff format --check .
+      - name: typecheck (advisory)
+        # mypy strict is the v0.1.0 goal — currently treated as advisory while
+        # we close the gap. Tracked in CLAUDE.md "Project Status".
+        run: uv run mypy src
+        continue-on-error: true
+      - name: test
+        # 70% is the SPEC §12 target. Hit in v0.0.5 via worker integration +
+        # provider unit tests. Raise after each round of new tests.
+        run: uv run pytest --cov=src/eonlet --cov-fail-under=70 -q
