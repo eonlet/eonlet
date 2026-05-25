@@ -18,15 +18,25 @@
 | 2 | [`AGENT_CONFIG_SPEC.md`](AGENT_CONFIG_SPEC.md) | The `agent.yaml` schema in full detail. **The most important doc for users.** |
 | 3 | [`DIRECTORY_LAYOUT.md`](DIRECTORY_LAYOUT.md) | Every file and directory Eonlet creates or expects |
 | 4 | [`CLI_REFERENCE.md`](CLI_REFERENCE.md) | Every CLI command and option |
-| 5 | [`TOOL_SPEC.md`](TOOL_SPEC.md) | Tool interface and the 13 builtin tools |
+| 5 | [`TOOL_SPEC.md`](TOOL_SPEC.md) | Tool interface and the 21+ builtin tools |
 | 6 | [`TRIGGER_SPEC.md`](TRIGGER_SPEC.md) | Cron and interactive triggers |
-| 7 | [`SECURITY.md`](SECURITY.md) | Threat model, defenses, and explicit limits |
+| 7 | [`MEMORY_SPEC.md`](MEMORY_SPEC.md) | Memory subsystem — storage layout, three-tier compaction, FTS5 recall |
+| 8 | [`SECURITY.md`](SECURITY.md) | Threat model, defenses, and explicit limits |
+
+## Plans (in-flight design work)
+
+| Document | What's In It |
+|---|---|
+| [`plans/web-tools.md`](plans/web-tools.md) | Implementation plan for the v0.1 web-tools upgrade (companion to ADR-0004) |
 
 ## Architecture Decision Records
 
 | # | Title | Status |
 |---|---|---|
 | [0001](adr/0001-no-supervisor-mvp.md) | No Supervisor in MVP | Accepted |
+| [0002](adr/0002-dynamic-triggers.md) | Dynamic Triggers — In-Conversation Schedule Management | Accepted (shipped v0.0.2) |
+| [0003](adr/0003-memory-system.md) | Memory System — Compaction, LTM, Notes, TODOs, Recall | Accepted (shipped v0.0.6) |
+| [0004](adr/0004-web-tools.md) | Web Tools — Search Provider Abstraction and Structured Fetch Pipeline | Proposed |
 
 ADRs document *why* we made specific architectural decisions. New ADRs follow the template in 0001.
 
@@ -83,8 +93,14 @@ eonlet/
     ├── TOOL_SPEC.md            ← tool interface + builtins
     ├── TRIGGER_SPEC.md         ← schedule and event triggers
     ├── SECURITY.md             ← threat model
+    ├── MEMORY_SPEC.md          ← memory subsystem spec
     ├── adr/                    ← architecture decisions
-    │   └── 0001-no-supervisor-mvp.md
+    │   ├── 0001-no-supervisor-mvp.md
+    │   ├── 0002-dynamic-triggers.md
+    │   ├── 0003-memory-system.md
+    │   └── 0004-web-tools.md
+    ├── plans/                  ← in-flight implementation plans
+    │   └── web-tools.md
     ├── concepts/                ← conceptual narrative docs
     │   └── teams-and-organizations.md
     └── tutorials/              ← (future) step-by-step guides

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted (shipped in v0.0.6) |
 | Date | 2026-05-22 |
 | Deciders | Ziyu |
 | Supersedes | – |

@@ -12,31 +12,39 @@ The goal of Phase A is one eonlet so good that the author lives inside it daily,
 
 **Goal:** the author can run an eonlet locally and use it for real work.
 
-- [ ] Repository scaffolding, CI, lint, type-check
-- [ ] Worker process: agent loop, event store, Anthropic + OpenAI calls
-- [ ] CLI: `init`, `create`, `attach`, `ls`, `kill`, `rm`
-- [ ] Runtime IPC: Unix socket + JSON-RPC + event stream
-- [ ] Pause / resume via SIGSTOP / SIGCONT
-- [ ] Builtin tools: `bash`, `file_read`, `file_write`, `file_edit`, `glob`, `grep`, `web_search`, `web_fetch`, `notes_read`, `notes_append`, `send_email`, `sleep`, `load_skill` (13 total)
-- [ ] Default `assistant` agent template
+- [x] Repository scaffolding, CI, lint, type-check
+- [x] Worker process: agent loop, event store, Anthropic + OpenAI calls
+- [x] CLI: `init`, `create`, `attach`, `ls`, `kill`, `rm`
+- [x] Runtime IPC: Unix socket + JSON-RPC + event stream
+- [x] Pause / resume via SIGSTOP / SIGCONT
+- [x] Builtin tools (v0.0.6: **21+ tools**, up from the v0.0.1 plan of 13): `bash`, `file_read`, `file_write`, `file_edit`, `glob`, `grep`, `web_search`, `web_fetch`, `send_email`, `sleep`, `load_skill`, `schedule`, `memory`, `note`, `todo`, `recall`, `remember`, `forget` (legacy `notes_read`/`notes_append` removed in v0.0.6 — superseded by `note`/`todo`/`recall`)
+- [x] Default `assistant` agent template (plus `x-digest` and `portfolio` shipped early in v0.0.2/v0.0.3)
+- [x] LLM streaming (v0.0.4 — `LLMProvider.stream()` + `on_delta` callback)
+- [x] FakeProvider + worker integration tests + mypy strict + ruff strict + ≥70% branch coverage (v0.0.5)
+- [x] Full memory subsystem — STM/LTM/notes/todos/FTS5 recall + three-tier compaction cascade (v0.0.6; see [ADR-0003](docs/adr/0003-memory-system.md))
 
 **Done condition:** author replaces Claude Code with Eonlet for daily research and writing tasks, runs continuously for one week, no P0 blocker.
+
+**Deviation from original v0.0.x plan:** memory was originally a two-tool slice (`notes_read`/`notes_append`) scheduled for v0.1, with vector memory promised for v0.2. The two-tool slice was scrapped in v0.0.6 in favour of a complete hierarchical memory subsystem (working → STM → LTM + notes + todos + FTS5 recall + LLM-driven compaction), absorbing what would have been the v0.2 vector-memory slot's keyword/structural half. Vector/semantic recall remains a v0.2+ item and will live alongside the v0.0.6 system, not replace it.
 
 ### v0.1.0 — MVP, Installable Alpha (Month 2)
 
 **Goal:** anyone can `pip install eonlet` and reach the [MVP user story](docs/SPEC.md#3-personas--mvp-user-story) in five minutes.
 
 - [ ] PyPI release with macOS + Linux wheels
-- [ ] **Scheduled triggers** (cron syntax in `agent.yaml`)
-- [ ] **Custom tools per agent** (Python files in `tools/`)
-- [ ] **Skills** (Markdown files loaded into context on-demand)
-- [ ] **Environment variable handling** (declared in `env.required`, validated at startup)
-- [ ] Permission system: `ask` + `yolo` modes + hardcoded deny list
-- [ ] Three production-quality example agents: `assistant`, `x-digest`, `portfolio`
+- [x] **Scheduled triggers** (cron syntax in `agent.yaml`) — v0.0.2; see [ADR-0002](docs/adr/0002-dynamic-triggers.md)
+- [x] **Custom tools per agent** (Python files in `tools/`) — v0.0.1
+- [x] **Skills** (Markdown files loaded into context on-demand) — v0.0.1
+- [x] **Environment variable handling** (declared in `env.required`, validated at startup) — v0.0.1
+- [x] Permission system: `ask` + `yolo` modes + hardcoded deny list — v0.0.1
+- [x] Three production-quality example agents: `assistant`, `x-digest`, `portfolio` — v0.0.3
+- [ ] **Web tools — serious design** (provider abstraction + structured fetch pipeline) — see [ADR-0004](docs/adr/0004-web-tools.md) and [`plans/web-tools.md`](docs/plans/web-tools.md). Promoted into v0.1 scope on 2026-05-26 because reliable `web_search`/`web_fetch` is the foundation of autonomous research, which is one of v0.1's promised user stories.
 - [ ] Complete `docs/` site (concepts, tutorial, reference)
 - [ ] 30-second demo GIF in README
 
 **Done condition:** five external alpha users active. Author dogfoods two weeks with no P0 bug.
+
+**Engineering surplus already delivered beyond original v0.1 scope:** LLM streaming (v0.0.4), `FakeProvider` + worker integration tests + mypy/ruff strict + ≥72.6% branch coverage (v0.0.5), full memory subsystem (v0.0.6, originally a v0.2 item). Remaining v0.1 work is mostly non-engineering (PyPI release, demo GIF, two-week dogfood) plus the web-tools upgrade.
 
 ### v0.2.0 — Polish (Month 3–4)
 
