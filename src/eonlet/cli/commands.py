@@ -1282,7 +1282,60 @@ def _next_trigger_summary(eonlet_id: str, status: str) -> str:
     return result
 
 
-def cmd_tasks(eonlet_id: str, status: str = "all") -> None:
+def cmd_tasks(
+    eonlet_id: str,
+    action: str = "ls",
+    task_id: str | None = None,
+    priority: int | None = None,
+    status: str = "all",
+) -> None:
+    """Show the task forest, or mutate a task (ADR-0007 M4).
+
+    ``ls`` (default) renders the forest offline from ``state.db``. The mutating
+    actions — ``suspend`` / ``resume`` / ``cancel`` / ``prio`` — go through the
+    running worker over IPC.
+    """
+    if action != "ls":
+        _cmd_tasks_mutate(eonlet_id, action, task_id, priority)
+        return
+    _cmd_tasks_tree(eonlet_id, status)
+
+
+def _cmd_tasks_mutate(
+    eonlet_id: str, action: str, task_id: str | None, priority: int | None
+) -> None:
+    if action not in ("suspend", "resume", "cancel", "prio"):
+        fail(f"unknown task action: {action} (ls|suspend|resume|cancel|prio)", code=2)
+    if not task_id:
+        fail(f"task id required for '{action}'", code=2)
+    eid = resolve_eonlet_id(eonlet_id)
+    sock = paths.runtime_sock(eid)
+    if not sock.exists():
+        fail(f"{eid}: no runtime socket — is it running?", code=2)
+    if action == "prio":
+        if priority is None:
+            fail("prio requires a priority value", code=2)
+        method, params = "task.update", {"id": task_id, "priority": priority}
+    else:
+        method, params = f"task.{action}", {"id": task_id}
+
+    result: dict[str, Any] = {}
+
+    async def go() -> None:
+        async with IPCClient(str(sock)) as client, anyio.create_task_group() as tg:
+            tg.start_soon(client.run)
+            await client.request("session.start", {"client_id": "cli-tasks"})
+            result.update(await client.request(method, params) or {})
+            tg.cancel_scope.cancel()
+
+    anyio.run(go)
+    if result.get("ok"):
+        console.print(f"[green]{action}[/] {task_id}")
+    else:
+        fail(result.get("error", "failed"), code=1)
+
+
+def _cmd_tasks_tree(eonlet_id: str, status: str = "all") -> None:
     """Render the agent's task forest as a tree (read-only, folded from the log).
 
     Reads ``state.db`` directly and replays the task events into a forest

@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from eonlet.runtime.events import Event, task_created, task_transitioned
-from eonlet.tasks import TaskForest, classify_post_run, fold_tasks, next_runnable, preemptor
+from eonlet.tasks import (
+    TaskForest,
+    classify_post_run,
+    creation_guard_error,
+    fold_tasks,
+    next_runnable,
+    preemptor,
+)
 from eonlet.tasks.scheduler import PostRun, synthesis_ready
 
 
@@ -140,6 +147,44 @@ def test_classify_post_run_yielded() -> None:
 def test_classify_post_run_gone() -> None:
     forest = TaskForest()
     assert classify_post_run(forest, "ghost") is PostRun.GONE
+
+
+# ── creation guards (M4) ─────────────────────────────────────────────────────
+
+
+def test_depth_helper() -> None:
+    forest = _forest(
+        task_created(id="a", content="a"),
+        task_created(id="b", content="b", parent_id="a"),
+        task_created(id="c", content="c", parent_id="b"),
+    )
+    assert forest.depth("a") == 1
+    assert forest.depth("b") == 2
+    assert forest.depth("c") == 3
+
+
+def test_guard_depth() -> None:
+    forest = _forest(
+        task_created(id="a", content="a"),
+        task_created(id="b", content="b", parent_id="a"),
+    )
+    # under b → depth 3; cap 2 → rejected. under a → depth 2 → ok.
+    assert creation_guard_error(forest, "b", max_depth=2, max_fanout=0) is not None
+    assert creation_guard_error(forest, "a", max_depth=2, max_fanout=0) is None
+    # A new root is never depth-bounded, and 0 disables the cap.
+    assert creation_guard_error(forest, None, max_depth=2, max_fanout=0) is None
+    assert creation_guard_error(forest, "b", max_depth=0, max_fanout=0) is None
+
+
+def test_guard_fanout() -> None:
+    forest = _forest(
+        task_created(id="p", content="p"),
+        task_created(id="c1", content="c1", parent_id="p"),
+        task_created(id="c2", content="c2", parent_id="p"),
+    )
+    assert creation_guard_error(forest, "p", max_depth=0, max_fanout=2) is not None  # full
+    assert creation_guard_error(forest, "p", max_depth=0, max_fanout=3) is None
+    assert creation_guard_error(forest, "p", max_depth=0, max_fanout=0) is None  # unlimited
 
 
 # ── preemption (M3) ──────────────────────────────────────────────────────────

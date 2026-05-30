@@ -77,6 +77,10 @@ class ToolContext:
     # default to it, so the agent says "done" without restating the id. ``None``
     # for ordinary interactive/cron turns.
     current_task_id: str | None = None
+    # Anti-runaway caps for `task` creation (ADR-0007 M4). 0 = unlimited. Set by
+    # the runtime from tasks.scheduling; bound subtree depth / children-per-node.
+    max_task_depth: int = 0
+    max_task_fanout: int = 0
     cancel_scope: anyio.CancelScope | None = None
     emit_event: EmitEvent | None = None
     # Append a memory/lifecycle event to the agent's store. Tools that mutate

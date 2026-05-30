@@ -217,15 +217,24 @@ def tail(id_: str = typer.Argument(..., metavar="ID")) -> None:
 @app.command()
 def tasks(
     id_: str = typer.Argument(..., metavar="ID"),
+    action: str = typer.Argument(
+        "ls", metavar="ACTION", help="ls | suspend | resume | cancel | prio"
+    ),
+    task_id: str | None = typer.Argument(None, metavar="TASK_ID"),
+    priority: int | None = typer.Argument(None, metavar="PRIORITY"),
     status: str = typer.Option(
         "all",
         "--status",
         "-s",
-        help="Filter: pending|active|suspended|blocked|done|cancelled|all.",
+        help="For 'ls': pending|active|suspended|blocked|done|cancelled|all.",
     ),
 ) -> None:
-    """Show an eonlet's task forest as a tree (read-only, folded from the log)."""
-    commands.cmd_tasks(id_, status)
+    """Show an eonlet's task forest, or suspend/resume/cancel/reprioritize a task.
+
+    Examples: ``eonlet tasks acme.bot`` (tree); ``eonlet tasks acme.bot suspend
+    task-…``; ``eonlet tasks acme.bot prio task-… 9``.
+    """
+    commands.cmd_tasks(id_, action, task_id, priority, status)
 
 
 @app.command()

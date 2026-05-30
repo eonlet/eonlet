@@ -90,6 +90,27 @@ def synthesis_ready(forest: TaskForest, task_id: str) -> bool:
     return bool(children) and all(is_terminal(c.status) for c in children)
 
 
+def creation_guard_error(
+    forest: TaskForest, parent_id: str | None, *, max_depth: int, max_fanout: int
+) -> str | None:
+    """Reject a new task that would breach the tree-depth / fan-out caps.
+
+    Anti-runaway guards (ADR-0007 M4): bound how deep the agent can self-
+    decompose and how many children one node may hold. ``0`` disables a cap.
+    Returns an error string, or ``None`` if the task may be created.
+    """
+    if parent_id is None:
+        return None  # a new root tree is never depth/fanout-bounded
+    parent = forest.get(parent_id)
+    if parent is None:
+        return None  # missing-parent is handled by the caller's own check
+    if max_depth and forest.depth(parent_id) + 1 > max_depth:
+        return f"max task tree depth ({max_depth}) reached under {parent_id}"
+    if max_fanout and len(forest.children(parent_id)) >= max_fanout:
+        return f"max subtasks per task ({max_fanout}) reached under {parent_id}"
+    return None
+
+
 class PostRun(StrEnum):
     """What a task-scoped run did, inferred from the forest afterward."""
 

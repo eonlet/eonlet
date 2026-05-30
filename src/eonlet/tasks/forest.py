@@ -129,6 +129,22 @@ class TaskForest:
     def is_leaf(self, task_id: str) -> bool:
         return not self.children(task_id)
 
+    def depth(self, task_id: str) -> int:
+        """1-based depth of a node (a root is depth 1). 0 if unknown."""
+        node = self.get(task_id)
+        if node is None:
+            return 0
+        d = 1
+        seen: set[str] = set()
+        while node.parent_id is not None and node.parent_id not in seen:
+            parent = self.get(node.parent_id)
+            if parent is None:
+                break
+            seen.add(node.parent_id)
+            d += 1
+            node = parent
+        return d
+
     def _is_root(self, t: Task) -> bool:
         # A node is a root if it has no parent, or its parent has been deleted
         # (orphans surface as roots rather than vanishing).

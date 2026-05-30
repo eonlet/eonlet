@@ -26,7 +26,13 @@ from .forest import (
     reduce_task,
 )
 from .ids import mint_task_id
-from .scheduler import PostRun, classify_post_run, next_runnable, preemptor
+from .scheduler import (
+    PostRun,
+    classify_post_run,
+    creation_guard_error,
+    next_runnable,
+    preemptor,
+)
 
 __all__ = [
     "PostRun",
@@ -38,6 +44,7 @@ __all__ = [
     "TasksConfig",
     "can_transition",
     "classify_post_run",
+    "creation_guard_error",
     "fold_tasks",
     "is_terminal",
     "mint_task_id",

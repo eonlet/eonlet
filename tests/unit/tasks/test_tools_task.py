@@ -88,6 +88,38 @@ def test_task_subtask_tree(tmp_path: Path) -> None:
     assert [t.id for t in forest.pending_leaves()] == [cid]
 
 
+def test_add_enforces_depth_cap(tmp_path: Path) -> None:
+    ctx, _, _ = _ctx(tmp_path)
+    ctx.max_task_depth = 2  # at most 2 levels
+    tool = TaskTool()
+
+    async def go() -> Any:
+        root = await tool(TaskArgs(action="add", content="root"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        child = await tool(TaskArgs(action="add", content="child", parent_id=rid), ctx)
+        cid = child.structured_output["id"]  # type: ignore[index]
+        # A grandchild would be depth 3 → rejected.
+        return await tool(TaskArgs(action="add", content="grandchild", parent_id=cid), ctx)
+
+    out = anyio.run(go)
+    assert out.is_error and "depth" in out.content
+
+
+def test_add_enforces_fanout_cap(tmp_path: Path) -> None:
+    ctx, _, _ = _ctx(tmp_path)
+    ctx.max_task_fanout = 1  # one child per node
+    tool = TaskTool()
+
+    async def go() -> Any:
+        root = await tool(TaskArgs(action="add", content="root"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        await tool(TaskArgs(action="add", content="c1", parent_id=rid), ctx)
+        return await tool(TaskArgs(action="add", content="c2", parent_id=rid), ctx)
+
+    out = anyio.run(go)
+    assert out.is_error and "subtasks per task" in out.content
+
+
 def test_task_add_rejects_unknown_parent(tmp_path: Path) -> None:
     ctx, _, _ = _ctx(tmp_path)
     tool = TaskTool()

@@ -548,3 +548,76 @@ def test_inproc_scheduled_task_hatches_and_runs(isolated_home: Path) -> None:
     assert task["origin"] == "trigger"  # type: ignore[index]
     assert task["content"] == "daily report"  # type: ignore[index]
     assert task["result"] == "ran"  # type: ignore[index]
+
+
+def test_inproc_task_suspend_resume_ipc(isolated_home: Path) -> None:
+    """The M4 CLI ops (suspend/resume) over IPC move a task through its lifecycle.
+
+    Scheduling is OFF so the task sits still instead of auto-running.
+    """
+    paths.ensure_home()
+    d = paths.agents_dir() / "manualbot"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(
+        """apiVersion: eonlet/v1
+kind: Agent
+metadata:
+  name: manualbot
+  description: t
+  version: 0.0.1
+runtime:
+  model: fake-echo
+tools:
+  builtin: [task]
+permissions:
+  mode: yolo
+""",
+        encoding="utf-8",
+    )
+    (d / "system.md").write_text("# manualbot\n", encoding="utf-8")
+    eid = "manualbot.alice"
+    _prep_eonlet(eid, d)
+
+    seen: dict[str, str] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+                    add = await client.request("task.add", {"content": "sits still"})
+                    tid = add["id"]
+
+                    async def status_of() -> str:
+                        listed = await client.request("task.list", {"status": "all"})
+                        return {t["id"]: t for t in listed["tasks"]}[tid]["status"]
+
+                    seen["added"] = await status_of()
+                    assert (await client.request("task.suspend", {"id": tid}))["ok"]
+                    seen["suspended"] = await status_of()
+                    assert (await client.request("task.resume", {"id": tid}))["ok"]
+                    seen["resumed"] = await status_of()
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(15):
+            await go()
+
+    anyio.run(with_timeout)
+
+    assert seen["added"] == "pending"
+    assert seen["suspended"] == "suspended"
+    assert seen["resumed"] == "pending"

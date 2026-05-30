@@ -18,7 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from ...runtime.events import task_created, task_deleted, task_transitioned, task_updated
-from ...tasks import Task, TaskForest, can_transition, mint_task_id
+from ...tasks import Task, TaskForest, can_transition, creation_guard_error, mint_task_id
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
 
@@ -169,6 +169,16 @@ class TaskTool:
                 return ToolResult(
                     content=f"task add: no such parent task: {parent_id}", is_error=True
                 )
+            # Anti-runaway depth / fan-out caps (ADR-0007 M4).
+            if forest is not None:
+                guard = creation_guard_error(
+                    forest,
+                    parent_id,
+                    max_depth=ctx.max_task_depth,
+                    max_fanout=ctx.max_task_fanout,
+                )
+                if guard is not None:
+                    return ToolResult(content=f"task add: {guard}", is_error=True)
             new_id = mint_task_id()
             await ctx.record_event(
                 task_created(

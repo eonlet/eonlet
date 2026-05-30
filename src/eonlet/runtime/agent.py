@@ -417,6 +417,8 @@ class AgentRuntime:
             record_event=self._record,
             read_tasks=lambda: self.task_forest,
             current_task_id=self.current_task_id,
+            max_task_depth=self.definition.config.tasks.scheduling.max_tree_depth,
+            max_task_fanout=self.definition.config.tasks.scheduling.max_fanout,
             http_fetcher=self.http_fetcher,
             extra=extra,
         )

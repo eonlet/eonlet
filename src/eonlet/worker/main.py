@@ -355,8 +355,11 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
     )
     prompt = build_task_prompt(runtime.task_forest, task.id)
     runtime.current_task_id = task.id
+    # Install the turn-boundary hook when preemption is enabled or a per-task
+    # token budget caps the run (ADR-0007 M3/M4).
+    needs_hook = sched.preempt != "off" or sched.per_task_budget_tokens > 0
     runtime.pause_check = (
-        _make_pause_check(runtime, task, sched, preempt_to) if sched.preempt != "off" else None
+        _make_pause_check(runtime, task, sched, preempt_to) if needs_hook else None
     )
     try:
         async for _ in runtime.handle_user_message(prompt):
@@ -389,13 +392,27 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
             )
         )
     elif outcome is PostRun.YIELDED:
-        summary = _checkpoint_summary(runtime, task.id)
-        await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
-        await runtime._record(
-            task_transitioned(
-                id=task.id, from_state="active", to_state="suspended", reason="yielded"
+        # Cap the suspended backlog (ADR-0007 M4): if too many tasks are already
+        # suspended, drop this no-progress task instead of growing the pile.
+        suspended = len(runtime.task_forest.by_status("suspended"))
+        if sched.max_suspended and suspended >= sched.max_suspended:
+            log.warning("suspended backlog full (%d); cancelling %s", suspended, task.id)
+            await runtime._record(
+                task_transitioned(
+                    id=task.id,
+                    from_state="active",
+                    to_state="cancelled",
+                    reason="suspend_backlog_full",
+                )
             )
-        )
+        else:
+            summary = _checkpoint_summary(runtime, task.id)
+            await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+            await runtime._record(
+                task_transitioned(
+                    id=task.id, from_state="active", to_state="suspended", reason="yielded"
+                )
+            )
     # DONE / GONE: the agent already moved the task (or it's gone) — nothing to do.
 
 
@@ -407,15 +424,28 @@ def _task_label(task: Task) -> str:
 def _make_pause_check(
     runtime: AgentRuntime, task: Task, sched: Any, preempt_to: dict[str, str]
 ) -> Callable[[], Awaitable[bool]]:
-    """Build the turn-boundary preemption check for one task-scoped run."""
+    """Build the turn-boundary hook: per-task budget cap + preemption."""
     from ..config import parse_duration
     from ..tasks import preemptor
 
     cooldown = parse_duration(sched.preempt_cooldown)
+    budget = int(sched.per_task_budget_tokens or 0)
+    start_id = runtime.store.latest_id()  # token baseline for this run
 
     async def check() -> bool:
         if preempt_to:  # already decided to pause this run
             return True
+        # Per-task token budget (ADR-0007 M4): end the run if it has spent its
+        # allowance. Leaves preempt_to empty → classified as a yield (suspend).
+        if budget:
+            spent = sum(
+                (e.tokens_in or 0) + (e.tokens_out or 0) for e in runtime.store.read(since=start_id)
+            )
+            if spent >= budget:
+                log.info("task %s hit per-task token budget %d (spent %d)", task.id, budget, spent)
+                return True
+        if sched.preempt == "off":
+            return False
         if time.monotonic() - runtime.last_preempt_monotonic < cooldown:
             return False  # anti-thrash
         cur = runtime.task_forest.get(task.id)
@@ -958,6 +988,17 @@ async def _handle_memory_ipc(
             parent_id = params.get("parent_id")
             if parent_id and forest.get(str(parent_id)) is None:
                 return {"ok": False, "error": f"no such parent task: {parent_id}"}
+            from ..tasks import creation_guard_error
+
+            sched = runtime.definition.config.tasks.scheduling
+            guard = creation_guard_error(
+                forest,
+                str(parent_id) if parent_id else None,
+                max_depth=sched.max_tree_depth,
+                max_fanout=sched.max_fanout,
+            )
+            if guard is not None:
+                return {"ok": False, "error": guard}
             tid = mint_task_id()
             await runtime._record(
                 task_created(
@@ -979,14 +1020,21 @@ async def _handle_memory_ipc(
                 return {"ok": False, "error": f"invalid status: {status_param}"}
             tasks = forest.by_status(status_param)  # type: ignore[arg-type]
             return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
-        if sub in ("done", "cancel"):
+        if sub in ("done", "cancel", "suspend", "resume"):
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
             task = forest.get(tid)
             if task is None:
                 return {"ok": False, "error": f"no such task: {tid}"}
-            dst = "done" if sub == "done" else "cancelled"
+            # resume re-queues a suspended task (→ pending); the others map to
+            # their lifecycle state. ADR-0007 M4 CLI ops.
+            dst = {
+                "done": "done",
+                "cancel": "cancelled",
+                "suspend": "suspended",
+                "resume": "pending",
+            }[sub]
             if not can_transition(task.status, dst):
                 return {"ok": False, "error": f"cannot {sub} task in state {task.status}"}
             await runtime._record(
