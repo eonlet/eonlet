@@ -54,6 +54,11 @@ def can_transition(src: str, dst: str) -> bool:
     return dst in _ALLOWED.get(src, frozenset())
 
 
+def is_terminal(status: str) -> bool:
+    """True for ``done`` / ``cancelled`` — states a task never leaves."""
+    return status in _TERMINAL
+
+
 def _iso(ts_us: int) -> str:
     return datetime.fromtimestamp(ts_us / 1_000_000).astimezone().isoformat(timespec="seconds")
 

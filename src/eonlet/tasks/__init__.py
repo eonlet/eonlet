@@ -14,7 +14,7 @@ injection consume it.
 
 from __future__ import annotations
 
-from .config import TasksConfig
+from .config import SchedulingConfig, TasksConfig
 from .forest import (
     Task,
     TaskForest,
@@ -22,18 +22,25 @@ from .forest import (
     TaskStatus,
     can_transition,
     fold_tasks,
+    is_terminal,
     reduce_task,
 )
 from .ids import mint_task_id
+from .scheduler import PostRun, classify_post_run, next_runnable
 
 __all__ = [
+    "PostRun",
+    "SchedulingConfig",
     "Task",
     "TaskForest",
     "TaskOrigin",
     "TaskStatus",
     "TasksConfig",
     "can_transition",
+    "classify_post_run",
     "fold_tasks",
+    "is_terminal",
     "mint_task_id",
+    "next_runnable",
     "reduce_task",
 ]
