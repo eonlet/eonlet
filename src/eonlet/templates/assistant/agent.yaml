@@ -66,6 +66,9 @@ memory:
 
 tasks:                         # action items — workflow state, not memory
   inject_pending: true
+  scheduling:                  # ADR-0007 — run slightly-complex work as tasks
+    enabled: true
+    preempt: ask               # ask before pausing a task for a higher-priority one
 
 lifecycle:
   on_crash: warn               # MVP: just log; v0.4+ supervisor will auto-restart

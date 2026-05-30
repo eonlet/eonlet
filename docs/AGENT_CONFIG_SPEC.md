@@ -488,21 +488,40 @@ has **no migration path** — rewrite `agent.yaml` to the current schema.
 
 ---
 
-## 8.1. `tasks` — optional (ADR-0005)
+## 8.1. `tasks` — optional (ADR-0005 / ADR-0007)
 
 Action items / workflow state. A top-level block (not under `memory`) because
-tasks are *things the agent will do*, not *things it knows*.
+tasks are *things the agent will do*, not *things it knows*. The forest is
+event-sourced (see [TASK_SPEC](TASK_SPEC.md)).
 
 ```yaml
 tasks:
-  inject_pending: true                   # inject a <tasks> block of pending items each run
+  inject_pending: true                   # inject a <tasks> block of pending leaves each run
   archive_done_after_days: 30            # 0 disables; else sweep done items to an archive
+  scheduling:                            # ADR-0007 — the task scheduler
+    enabled: false                       # run the task forest autonomously when idle
+    preempt: ask                         # off | ask | auto_by_priority
+    max_tree_depth: 5                    # anti-fork-bomb: max subtree depth (0 = unlimited)
+    max_fanout: 12                       # max children per task (0 = unlimited)
+    max_suspended: 8                     # cap the suspended backlog (0 = unlimited)
+    per_task_budget_tokens: 0            # 0 = inherit the run budget; else cap one task run
+    preempt_cooldown: 5m                 # anti-thrash window between preemptions
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `inject_pending` | bool | `true` | Inject pending tasks as a `<tasks>` block (sibling of `<memory>`) |
+| `inject_pending` | bool | `true` | Inject pending leaf tasks as a `<tasks>` block (sibling of `<memory>`) |
 | `archive_done_after_days` | int | `30` | Archive done items older than N days (`0` disables) |
+| `scheduling.enabled` | bool | `false` | Drive the task forest autonomously (one task at a time) |
+| `scheduling.preempt` | enum | `ask` | Preemption policy: `off` / `ask` (consent) / `auto_by_priority` |
+| `scheduling.max_tree_depth` | int | `5` | Reject subtasks beyond this depth (`0` = unlimited) |
+| `scheduling.max_fanout` | int | `12` | Reject subtasks beyond this many children (`0` = unlimited) |
+| `scheduling.max_suspended` | int | `8` | Cancel a no-progress yield when this many are suspended (`0` = unlimited) |
+| `scheduling.per_task_budget_tokens` | int | `0` | Cap one task-scoped run's tokens (`0` = inherit run budget) |
+| `scheduling.preempt_cooldown` | duration | `5m` | Minimum interval between preemptions |
+
+Scheduled (cron/autonomous) agents should set `preempt: off`; interactive agents
+default to `preempt: ask`. See [TASK_SPEC](TASK_SPEC.md) for the full model.
 
 ---
 

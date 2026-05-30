@@ -441,6 +441,22 @@ eonlet tail <id>
 
 Each line is one event with `kind`, `ts`, summary.
 
+### `eonlet tasks <id> [action]`
+
+Show or manage the agent's task forest (ADR-0007 / [TASK_SPEC](TASK_SPEC.md)).
+
+```bash
+eonlet tasks <id>                          # render the forest as a tree (offline)
+eonlet tasks <id> --status=pending         # filter the tree
+eonlet tasks <id> suspend <task_id>        # pause a task (→ suspended)
+eonlet tasks <id> resume  <task_id>        # re-queue a suspended task (→ pending)
+eonlet tasks <id> cancel  <task_id>        # cancel a task
+eonlet tasks <id> prio    <task_id> <n>    # reprioritize
+```
+
+The bare/`--status` form reads `state.db` directly (no worker needed); the
+mutating actions go through the running worker over IPC.
+
 ### `eonlet export <id>`
 
 Export an eonlet's full state to a tar archive (for backup, sharing, or moving between machines).

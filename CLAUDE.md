@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Eonlet** is a local-first runtime for stateful AI agents — described as "the systemd for agents." It lets long-lived, autonomous agents persist state, accumulate memory, run on cron schedules, and be managed from the terminal like OS processes.
 
-**Status: Pre-alpha, v0.0.9 landed.** Memory subsystem complete (v0.0.6); web tools upgraded to ADR-0004 floor (v0.0.7); memory re-architected into the dual-axis model (episodic timeline + curated knowledge base) with tasks moved out of memory (v0.0.8, ADR-0005); compaction reworked into a three-trigger model with a blocking user-consent channel (v0.0.9, ADR-0006). v0.1.0 blocked only on non-engineering work (demo GIF, PyPI release, two weeks of dogfooding without a P0 bug).
+**Status: Pre-alpha, v0.0.10 landed.** Memory subsystem complete (v0.0.6); web tools upgraded to ADR-0004 floor (v0.0.7); memory re-architected into the dual-axis model (episodic timeline + curated knowledge base) with tasks moved out of memory (v0.0.8, ADR-0005); compaction reworked into a three-trigger model with a blocking user-consent channel (v0.0.9, ADR-0006); task scheduling — event-sourced hierarchical forest, priority scheduler, cooperative preemption, schedule→task bridge (v0.0.10, ADR-0007). v0.1.0 blocked only on non-engineering work (demo GIF, PyPI release, two weeks of dogfooding without a P0 bug).
 
 Before writing or modifying code, **read the relevant spec** — the design is authoritative; the code follows it.
 
@@ -60,6 +60,13 @@ Before writing or modifying code, **read the relevant spec** — the design is a
 - **M4** — MEMORY_SPEC §4 trigger-matrix + consent + timestamps; AGENT_CONFIG/TOOL/CLI/SECURITY docs; templates (`assistant` enables `propose_semantic`, scheduled agents disable it, all stamp turns); CHANGELOG + this file.
 - **Test coverage**: new `tests/unit/test_decisions.py` + `test_tools_propose_compact.py`; extended tier-1/events/config/permission/agent-injection tests. Total: 552 tests; ruff + mypy clean.
 
+**v0.0.10** — task scheduling ([ADR-0007](docs/adr/0007-task-scheduling.md), four milestones M1–M4 per [`docs/plans/task-scheduling.md`](docs/plans/task-scheduling.md); the ROADMAP "task-orchestration" / v0.2 feature tier). Normative spec: [`docs/TASK_SPEC.md`](docs/TASK_SPEC.md):
+- **M1** — Event-sourced task forest: `src/eonlet/tasks/forest.py` (`Task`, `TaskForest`, `fold_tasks`/`reduce_task`) replaces the `tasks/todos.jsonl` store; the runtime owns `AgentRuntime.task_forest`. Task event family redone: `TASK_CREATED`/`UPDATED`/`TRANSITIONED`/`CHECKPOINTED`/`DELETED` (**EventKind 39 → 41**). `task` tool gains `parent_id`/`priority`/`goal`; `eonlet tasks` tree view; `ToolContext.read_tasks`.
+- **M2** — TaskScheduler (`tasks/scheduler.py`: `next_runnable`/`classify_post_run`) + worker integration: idle worker runs the next runnable task (pending leaf or synthesis-ready parent); post-run DONE/DECOMPOSED(→blocked)/YIELDED(→checkpoint+suspend). Per-task prompt (`tasks/context.py`); implicit *current task* (`ToolContext.current_task_id`) so `task(done)`/`task(add)` need no id.
+- **M3** — Cooperative preemption (turn-boundary `pause_check` hook; `preemptor` = strictly-higher-priority outside the spine; consent via `DecisionBroker` under `preempt: ask`, auto under `auto_by_priority`/`yolo`; paused task re-queued → pending; `preempt_cooldown`). Schedule→task-template bridge: `task(add, schedule=…)` registers a recurring template that hatches a fresh instance per fire (`task_hatch` `TriggerItem`; persisted in the dynamic store). Reuses `TASK_TRANSITIONED` (no new EventKind).
+- **M4** — Guards enforced (`max_tree_depth`/`max_fanout` at creation, `per_task_budget_tokens` per run, `max_suspended` backlog cap); CLI `eonlet tasks <id> {suspend|resume|cancel|prio}`; `docs/TASK_SPEC.md` + AGENT_CONFIG/CHANGELOG/templates.
+- **Test coverage**: new `tests/unit/tasks/{test_forest,test_scheduler,test_context,test_schedule_bridge}.py` + `test_preemption.py`; worker integration tests for run-to-done, decompose/synthesis, yield, preemption, schedule-hatch, suspend/resume. Total: 605 tests; ruff + mypy clean.
+
 **v0.1.0 still owes** (non-engineering):
 - 30-second README demo GIF.
 - PyPI release (`uv build`/`uv publish`, version tag, changelog).
@@ -77,6 +84,7 @@ Before writing or modifying code, **read the relevant spec** — the design is a
 | `docs/TOOL_SPEC.md` | Tool protocol + builtin tool catalog |
 | `docs/TRIGGER_SPEC.md` | Cron, interactive, and event triggers |
 | `docs/MEMORY_SPEC.md` | Memory subsystem: storage, tiers, compaction, FTS5 recall |
+| `docs/TASK_SPEC.md` | Task subsystem: event-sourced forest, scheduler, lifecycle, preemption, schedule bridge, guards (ADR-0007) |
 | `docs/DIRECTORY_LAYOUT.md` | Runtime filesystem layout (`~/.eonlet/`) |
 | `docs/SECURITY.md` | Permission model + threat model |
 | `docs/CLI_REFERENCE.md` | All CLI commands including memory subcommands |

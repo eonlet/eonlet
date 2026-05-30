@@ -7,5 +7,5 @@ most code lives inside subpackages (``runtime``, ``tools``, ``llm``, ``worker``,
 
 from __future__ import annotations
 
-__version__ = "0.0.9"
+__version__ = "0.0.10"
 __spec_version__ = "eonlet/v1"

@@ -14,6 +14,26 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+## [0.0.10] — 2026-05-31 — Task scheduling (ADR-0007)
+
+Implements [ADR-0007](docs/adr/0007-task-scheduling.md) (milestones M1–M4 per [`docs/plans/task-scheduling.md`](docs/plans/task-scheduling.md)) — the ROADMAP "task-orchestration" feature tier. An eonlet becomes a single human-like worker that runs a hierarchical task forest one task at a time, by priority, with cooperative preemption. Normative spec: [`docs/TASK_SPEC.md`](docs/TASK_SPEC.md).
+
+### Added
+
+- **Event-sourced task forest** — tasks are now a `fold` of the task event family (`TASK_CREATED` / `UPDATED` / `TRANSITIONED` / `CHECKPOINTED` / `DELETED`), like `AgentState`. The runtime owns `AgentRuntime.task_forest`; the old `tasks/todos.jsonl` store is retired. `EventKind` → **41 variants**.
+- **Hierarchical tasks** — `task add` takes `parent_id`/`priority`/`goal`; tasks form a tree (forest across roots), traversed depth-first. `eonlet tasks <id>` renders the forest as a tree.
+- **TaskScheduler** — when `tasks.scheduling.enabled`, the worker runs the next runnable task (highest-priority pending leaf, or a blocked parent ready to synthesize) when idle; queued user/cron triggers take precedence. Post-run the task is classified DONE / DECOMPOSED (→ block on children) / YIELDED (→ checkpoint + suspend). A task-scoped run sets an implicit *current task* so the agent says `task(done)` / `task(add …)` without restating the id.
+- **Cooperative preemption** — at a turn boundary, a strictly-higher-priority runnable task pauses the current one (consent via the decision channel under `preempt: ask`, auto under `auto_by_priority`/`yolo`); the paused task is checkpointed and re-queued as pending to resume later. `preempt_cooldown` guards against thrash.
+- **Schedule → task-template bridge** — `task add` with a `schedule` (cron + `timezone`) registers a recurring template; each fire hatches a fresh task instance (`origin=trigger`) with its own history. Templates persist across restarts. The low-level `schedule` tool is unchanged.
+- **Anti-runaway guards** (`tasks.scheduling`) — `max_tree_depth` / `max_fanout` (reject at creation), `per_task_budget_tokens` (cap a run), `max_suspended` (cancel a no-progress yield when the backlog is full).
+- **CLI ops** — `eonlet tasks <id> {suspend|resume|cancel|prio}` over the running worker.
+- **FakeProvider variants** — `fake-task-done` / `fake-task-tree` / `fake-task-busy` / `fake-schedule` drive the scheduler paths deterministically.
+
+### Changed
+
+- `task` tool: event-only mutation (no JSONL double-write); lifecycle states `pending/active/suspended/blocked/done/cancelled`; `done` accepts a `result`.
+- `assistant` template enables `tasks.scheduling` (`preempt: ask`) with prompt guidance on trivial-inline vs. task work; scheduled templates leave scheduling off.
+
 ## [0.0.9] — 2026-05-30 — Compaction triggers (ADR-0006)
 
 Implements [ADR-0006](docs/adr/0006-compaction-triggers.md) (milestones M1–M4 per [`docs/plans/compaction-triggers.md`](docs/plans/compaction-triggers.md)). One tier-1 mechanism, **three triggers**, each with its own boundary policy: bounded-auto (keeps a ~30% tail), user-forced full `/compact` (empties the working window), and agent-proposed semantic compaction (consent-gated). Also lands the long-deferred interactive permission confirm.

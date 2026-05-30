@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted |
 | Proposed | 2026-05-30 |
-| Accepted | – |
+| Accepted | 2026-05-31 |
 | Deciders | Ziyu |
 | Supersedes | – (extends the task storage of [ADR-0005](0005-dual-axis-memory.md) §M3; realizes the "task-orchestration layer" foreshadowed by [ADR-0006](0006-compaction-triggers.md)) |
 | Superseded by | – |
@@ -323,3 +323,11 @@ defaults (§8 values) are provisional and may be tuned during M4 dogfooding.
   (event-sourced projection; template-hatches-instances recurrence; `ask`-prompt
   / `yolo`-audit preemption; keep low-level `schedule`). Status → Proposed,
   pending acceptance.
+- 2026-05-31: Implemented M1–M4 (see [`docs/plans/task-scheduling.md`](../plans/task-scheduling.md)
+  and [`docs/TASK_SPEC.md`](../TASK_SPEC.md)). Two design refinements during
+  build: (a) preemption re-queues the paused task as **pending** (not suspended)
+  so it resumes naturally once the preemptor outranks-then-finishes; (b) the M2
+  checkpoint resume brief is **structural** (LLM enrichment via the compactor
+  deferred). A prompt task-pickup poke (`task_wake`) was added so out-of-band
+  task creation isn't delayed by the idle poll. Status → Accepted. Shipped in
+  v0.0.10 (the ROADMAP v0.2 task-orchestration tier).

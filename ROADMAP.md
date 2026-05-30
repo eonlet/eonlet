@@ -51,6 +51,7 @@ The goal of Phase A is one eonlet so good that the author lives inside it daily,
 **Goal:** close the "this runtime is plumbing" loop. After v0.2, adding a
 capability to an eonlet should never require patching the runtime.
 
+- [x] **Task orchestration** — event-sourced hierarchical task forest, priority scheduler, cooperative preemption, schedule→task-template bridge ([ADR-0007](docs/adr/0007-task-scheduling.md), [`TASK_SPEC`](docs/TASK_SPEC.md); landed early in v0.0.10, ahead of the v0.1.0 release gate)
 - [ ] MCP integration (client mode — connect to external MCP servers)
 - [ ] Hooks (`pre_tool_use`, `post_tool_use`, `on_error`)
 - [ ] Permission allow/deny patterns + `read_only` and `plan` modes

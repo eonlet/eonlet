@@ -421,17 +421,32 @@ Paths are confined to the knowledge tree: `..`, absolute paths, and the reserved
 
 ### 6.12 `task`
 
-Action-item tracker — workflow state, not memory (ADR-0005). Stored in `tasks/todos.jsonl`; pending tasks inject as a `<tasks>` block each run.
+Hierarchical, event-sourced workflow state — not memory (ADR-0005/0007). The
+forest is a fold of the task event log (no `todos.jsonl`); pending **leaves**
+inject as a `<tasks>` block each run. Full model: [TASK_SPEC](TASK_SPEC.md).
 
 ```yaml
 input:
   action: "add" | "list" | "done" | "cancel" | "update" | "delete"
   content: string | null                  # for add/update
-  id: string | null                       # for done/cancel/update/delete
+  id: string | null                       # for done/cancel/update/delete (defaults to
+                                          #   the current task inside a scheduled run)
+  goal: string | null                     # durable objective (used on resume)
+  parent_id: string | null               # for add → create a subtask (tree)
+  priority: int | null                    # higher runs first (default 0)
+  result: string | null                   # for done → outcome summary
+  schedule: string | null                 # for add → cron; hatches a fresh instance per fire
+  timezone: string | null                 # required with schedule (IANA)
   due: string | null                      # optional ISO-8601
-  status: "pending" | "done" | "cancelled" | "all" = "pending"   # for list
+  tags: [string]
+  status: "pending"|"active"|"suspended"|"blocked"|"done"|"cancelled"|"all" = "pending"  # list
 annotations: destructive
 ```
+
+Inside a scheduled task-run the agent calls `task(done)` / `task(add …)` without
+restating the id (they default to the *current task*); `add` without a parent is
+a subtask of it (the decomposition signal). Creation respects the
+`tasks.scheduling` depth/fan-out caps.
 
 ### 6.13 `send_email`
 

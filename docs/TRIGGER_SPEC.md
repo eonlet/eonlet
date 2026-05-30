@@ -99,6 +99,15 @@ The `message` field can use template variables (resolved at injection time):
 | `{{trigger_id}}` | The trigger's id |
 | `{{eonlet_id}}` | The eonlet's id |
 
+### 2.4 Task-template triggers (ADR-0007)
+
+A recurring trigger may instead carry a **task template** (registered by
+`task(add, schedule=…)`, not by the `schedule` tool). When it fires it does not
+run a conversation turn — it **hatches a fresh task instance** (`origin=trigger`,
+new id) that the task scheduler then runs. Each fire is its own task with its own
+result and history. The template persists in the dynamic-trigger store across
+restarts. See [TASK_SPEC §6](TASK_SPEC.md).
+
 ## 3. Lifecycle: From Cron to Completion
 
 ```
