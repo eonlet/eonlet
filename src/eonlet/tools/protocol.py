@@ -72,6 +72,11 @@ class ToolContext:
     # Read-only accessor for the live task forest (ADR-0007). Set by the runtime;
     # ``None`` outside the agent loop (the `task` tool then can't list/transition).
     read_tasks: ReadTasks | None = None
+    # The task this run is scoped to (ADR-0007 M2). Set by the scheduler while a
+    # task-scoped run is in flight; the `task` tool's done/cancel/update/add then
+    # default to it, so the agent says "done" without restating the id. ``None``
+    # for ordinary interactive/cron turns.
+    current_task_id: str | None = None
     cancel_scope: anyio.CancelScope | None = None
     emit_event: EmitEvent | None = None
     # Append a memory/lifecycle event to the agent's store. Tools that mutate

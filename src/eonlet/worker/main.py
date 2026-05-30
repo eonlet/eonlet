@@ -33,6 +33,7 @@ from ..runtime.agent import AgentRuntime
 from ..runtime.definition import import_custom_tool_module, load_definition
 from ..runtime.events import Event
 from ..runtime.store import EventStore
+from ..tasks import Task, next_runnable
 from ..tools import builtin as _builtin  # noqa: F401 — side-effect: register builtin tools
 from ..triggers.scheduler import (
     CronScheduler,
@@ -229,26 +230,76 @@ async def _signal_watcher(shutdown: anyio.Event, on_signal: Callable[[], None]) 
             return
 
 
+SCHED_POLL_S = 1.0  # idle re-check cadence when the task scheduler is enabled
+_CLOSED = object()  # sentinel: the trigger stream was closed
+
+
+def _try_receive(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | None:
+    """Non-blocking peek at the trigger queue. ``None`` if empty (or closed)."""
+    try:
+        return recv.receive_nowait()
+    except (anyio.WouldBlock, anyio.EndOfStream, anyio.ClosedResourceError):
+        return None
+
+
+async def _recv_one(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | object:
+    """Block for one trigger; ``_CLOSED`` if the stream closed. Caller bounds the wait."""
+    try:
+        return await recv.receive()
+    except (anyio.EndOfStream, anyio.ClosedResourceError):
+        return _CLOSED
+
+
 async def _main_loop(
     runtime: AgentRuntime,
     recv: MemoryObjectReceiveStream[TriggerItem],
     scheduler: CronScheduler,
     shutdown: anyio.Event,
 ) -> None:
-    """Drain trigger items one at a time, dispatch to the agent runtime.
+    """Drive triggers and autonomous task work, one beat at a time.
 
-    A cron-fired item carries trigger_id; we report success/failure back to
-    the scheduler so it can update consecutive_failures + backoff counters.
-    After each run we check the tier-1 compaction trigger (MEMORY_SPEC §4.1)
-    and run it inline before pulling the next item — keeping the model's
-    context bounded between turns.
+    Each beat: a queued trigger (user/cron input) takes precedence; otherwise,
+    when ``tasks.scheduling.enabled``, the task scheduler picks the next runnable
+    task and the agent runs it task-scoped (ADR-0007 M2). When fully idle the
+    loop blocks — with a poll timeout under scheduling so a task created
+    out-of-band (e.g. via the `task` IPC) is noticed. The worker's single
+    consumer keeps execution strictly serial (the "one human-like worker"
+    invariant). After every run the compaction cascade runs inline.
     """
     async with recv:
         while not shutdown.is_set():
-            try:
-                item = await recv.receive()
-            except (anyio.EndOfStream, anyio.ClosedResourceError):
-                return
+            sched = runtime.definition.config.tasks.scheduling
+
+            # 1. A queued trigger always wins over autonomous task work.
+            item = _try_receive(recv)
+
+            # 2. Otherwise, run the next scheduler-selected task.
+            if item is None and sched.enabled:
+                task = next_runnable(runtime.task_forest)
+                if task is not None:
+                    try:
+                        await _run_task(runtime, task)
+                    except Exception:
+                        log.exception("main_loop: task run failed")
+                    await _run_cascade(runtime)
+                    continue
+
+            # 3. Block for the next trigger. Under scheduling, bound the wait so
+            #    a task created out-of-band (e.g. via the `task` IPC) is noticed.
+            if item is None:
+                got: TriggerItem | object | None = None
+                if sched.enabled:
+                    with anyio.move_on_after(SCHED_POLL_S):
+                        got = await _recv_one(recv)
+                else:
+                    got = await _recv_one(recv)
+                if got is _CLOSED:
+                    return
+                if got is None:
+                    continue  # timed out → re-check the scheduler
+                assert isinstance(got, TriggerItem)
+                item = got
+
             ok = True
             try:
                 async for _ in runtime.handle_user_message(item.content):
@@ -259,11 +310,77 @@ async def _main_loop(
             if item.kind == "cron" and item.trigger_id:
                 scheduler.record_outcome(item.trigger_id, success=ok)
 
-            # Post-run compaction cascade (MEMORY_SPEC §4.1 / §4.4 / §4.5).
-            tier1_ran = await _maybe_run_tier1(runtime)
-            if tier1_ran:
-                await _maybe_run_tier2(runtime)
-            await _maybe_run_tier3(runtime)
+            await _run_cascade(runtime)
+
+
+async def _run_task(runtime: AgentRuntime, task: Task) -> None:
+    """Run one scheduler-selected task to a yield point, then apply its outcome.
+
+    The task is activated, run with its assembled prompt, then classified: the
+    agent marks it done via the `task` tool (DONE), adds subtasks (DECOMPOSED →
+    block on them), or yields without finishing (checkpoint a resume brief +
+    suspend). Cooperative — preemption is M3.
+    """
+    from ..runtime.events import task_checkpointed, task_transitioned
+    from ..tasks import PostRun, classify_post_run
+    from ..tasks.context import build_task_prompt
+
+    await runtime._record(
+        task_transitioned(id=task.id, from_state=task.status, to_state="active", reason="scheduled")
+    )
+    prompt = build_task_prompt(runtime.task_forest, task.id)
+    runtime.current_task_id = task.id
+    try:
+        async for _ in runtime.handle_user_message(prompt):
+            pass
+    finally:
+        runtime.current_task_id = None
+
+    outcome = classify_post_run(runtime.task_forest, task.id)
+    if outcome is PostRun.DECOMPOSED:
+        await runtime._record(
+            task_transitioned(
+                id=task.id, from_state="active", to_state="blocked", reason="decomposed"
+            )
+        )
+    elif outcome is PostRun.YIELDED:
+        summary = _checkpoint_summary(runtime, task.id)
+        await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+        await runtime._record(
+            task_transitioned(
+                id=task.id, from_state="active", to_state="suspended", reason="yielded"
+            )
+        )
+    # DONE / GONE: the agent already moved the task (or it's gone) — nothing to do.
+
+
+def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> str:
+    """A minimal, deterministic resume brief from the run's last assistant turn.
+
+    M2 keeps this structural; enriching it with an LLM summary (compactor reuse)
+    is a later refinement. The contract is only that it is non-empty so a resumed
+    task has something to pick up from.
+    """
+    last = next(
+        (
+            m.content
+            for m in reversed(runtime.state.messages)
+            if m.role == "assistant" and m.content.strip()
+        ),
+        "",
+    )
+    t = runtime.task_forest.get(task_id)
+    goal = (t.goal or t.content) if t is not None else task_id
+    note = (last[:500] + " …") if len(last) > 500 else (last or "(no output)")
+    return f"In progress: {goal}\nLast: {note}"
+
+
+async def _run_cascade(runtime: AgentRuntime) -> None:
+    """Post-run compaction cascade (MEMORY_SPEC §4.1 / §4.4 / §4.5)."""
+    tier1_ran = await _maybe_run_tier1(runtime)
+    if tier1_ran:
+        await _maybe_run_tier2(runtime)
+    await _maybe_run_tier3(runtime)
 
 
 async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:

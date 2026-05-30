@@ -90,6 +90,10 @@ class AgentRuntime:
     # ``handle_user_message`` only; reset in a finally.
     is_running: bool = False
     current_activity: str = ""  # human-readable hint: "thinking" / "tool: bash" / ""
+    # Task this run is scoped to (ADR-0007 M2). Set by the worker's scheduler
+    # path around a task-scoped run; threaded into ToolContext so the `task`
+    # tool's done/add default to it. ``None`` for ordinary turns.
+    current_task_id: str | None = None
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -398,6 +402,7 @@ class AgentRuntime:
             scheduler=self.scheduler,
             record_event=self._record,
             read_tasks=lambda: self.task_forest,
+            current_task_id=self.current_task_id,
             http_fetcher=self.http_fetcher,
             extra=extra,
         )

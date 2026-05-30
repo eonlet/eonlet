@@ -10,6 +10,9 @@ Available variants:
   streamed text chunks.
 - ``fake-tool-then-text`` — two-turn. First turn requests ``sleep(0)``; second
   turn replies ``"done"``. Useful for exercising tool dispatch.
+- ``fake-task-done`` — two-turn. First turn calls ``task(action="done")`` (no id
+  → completes the current task via ToolContext.current_task_id); second turn
+  replies ``"task complete"``. Drives the M2 scheduler happy path.
 
 The variant name is also stored on the instance as ``model``, so it shows up
 in event payloads / inspect output exactly like a real model.
@@ -37,7 +40,7 @@ class FakeProvider:
 
     def __init__(self, model: str) -> None:
         self.model = model
-        if model not in {"fake-echo", "fake-tool-then-text"}:
+        if model not in {"fake-echo", "fake-tool-then-text", "fake-task-done"}:
             raise ValueError(f"unknown fake variant: {model!r}")
         # ``fake-tool-then-text`` is stateful across turns within one run; we
         # count how many ``stream()``s have happened.
@@ -73,6 +76,10 @@ class FakeProvider:
             return
         if self.model == "fake-tool-then-text":
             async for c in self._tool_then_text_stream():
+                yield c
+            return
+        if self.model == "fake-task-done":
+            async for c in self._task_done_stream():
                 yield c
             return
         raise AssertionError(f"unhandled fake variant: {self.model}")  # pragma: no cover
@@ -118,4 +125,30 @@ class FakeProvider:
         yield DoneChunk(
             type="done",
             response=LLMResponse(content="done", tool_calls=[], stop_reason="end_turn"),
+        )
+
+    async def _task_done_stream(self) -> AsyncIterator[StreamChunk]:
+        self._turn += 1
+        if self._turn == 1:
+            # Complete the current task — no id, resolved from current_task_id.
+            yield DoneChunk(
+                type="done",
+                response=LLMResponse(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call_1",
+                            name="task",
+                            arguments={"action": "done", "result": "completed"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                ),
+            )
+            return
+        for piece in ("task ", "complete"):
+            yield TextChunk(type="text", text=piece)
+        yield DoneChunk(
+            type="done",
+            response=LLMResponse(content="task complete", tool_calls=[], stop_reason="end_turn"),
         )

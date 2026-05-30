@@ -179,6 +179,42 @@ def test_task_done_missing_id(tmp_path: Path) -> None:
     anyio.run(go)
 
 
+def test_done_uses_current_task_id_when_omitted(tmp_path: Path) -> None:
+    ctx, captured, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> str:
+        out = await tool(TaskArgs(action="add", content="the task"), ctx)
+        tid = out.structured_output["id"]  # type: ignore[index]
+        # Simulate a task-scoped run: the scheduler sets the current task id.
+        ctx.current_task_id = tid
+        done = await tool(TaskArgs(action="done", result="all good"), ctx)  # no explicit id
+        assert not done.is_error and "done" in done.content
+        return tid
+
+    tid = anyio.run(go)
+    t = forest.get(tid)
+    assert t is not None and t.status == "done"
+    tr = next(e for e in captured if e.kind == EventKind.TASK_TRANSITIONED)
+    assert tr.payload.get("result") == "all good"
+
+
+def test_add_defaults_parent_to_current_task(tmp_path: Path) -> None:
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> tuple[str, str]:
+        root = await tool(TaskArgs(action="add", content="parent"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        ctx.current_task_id = rid  # inside the parent's run
+        child = await tool(TaskArgs(action="add", content="subtask"), ctx)  # no parent_id
+        cid = child.structured_output["id"]  # type: ignore[index]
+        return rid, cid
+
+    rid, cid = anyio.run(go)
+    assert forest.get(cid).parent_id == rid  # type: ignore[union-attr]
+
+
 def test_task_no_event_sink_errors(tmp_path: Path) -> None:
     ctx = ToolContext(
         eonlet_id="t.x",

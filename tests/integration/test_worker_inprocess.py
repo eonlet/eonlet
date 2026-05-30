@@ -194,3 +194,78 @@ permissions:
     # The fake-echo provider echoes back the trigger envelope, which is fine —
     # we just want to confirm the trigger fired and produced a response.
     assert fired_message[0]["content"].startswith("echo:")
+
+
+def test_inproc_scheduler_runs_task_to_done(isolated_home: Path) -> None:
+    """With scheduling enabled, a task added via IPC is picked up and run to done."""
+    paths.ensure_home()
+    d = paths.agents_dir() / "taskbot"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(
+        """apiVersion: eonlet/v1
+kind: Agent
+metadata:
+  name: taskbot
+  description: scheduler test
+  version: 0.0.1
+runtime:
+  model: fake-task-done
+  max_steps_per_run: 5
+tools:
+  builtin: [task]
+permissions:
+  mode: yolo
+tasks:
+  scheduling:
+    enabled: true
+""",
+        encoding="utf-8",
+    )
+    (d / "system.md").write_text("# taskbot\nrun tasks.\n", encoding="utf-8")
+    eid = "taskbot.alice"
+    _prep_eonlet(eid, d)
+
+    final: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    add = await client.request("task.add", {"content": "do the thing"})
+                    assert add["ok"]
+                    tid = add["id"]
+
+                    # The scheduler picks it up within the poll interval and the
+                    # fake provider completes it. Poll until it lands as done.
+                    for _ in range(60):
+                        listed = await client.request("task.list", {"status": "done"})
+                        done = {t["id"]: t for t in listed["tasks"]}
+                        if tid in done:
+                            final.update(done[tid])
+                            break
+                        await anyio.sleep(0.2)
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(20):
+            await go()
+
+    anyio.run(with_timeout)
+
+    assert final.get("status") == "done"
+    assert final.get("result") == "completed"

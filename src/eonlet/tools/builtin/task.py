@@ -31,6 +31,9 @@ class TaskArgs(BaseModel):
     goal: str | None = Field(
         default=None, description="Durable objective (used to rebuild context on resume)."
     )
+    result: str | None = Field(
+        default=None, description="For action='done': a short result/outcome summary."
+    )
     parent_id: str | None = Field(
         default=None, description="For action='add': attach as a subtask of this task id."
     )
@@ -108,24 +111,27 @@ class TaskTool:
         if args.action == "add":
             if not args.content:
                 return ToolResult(content="task add: 'content' is required", is_error=True)
-            if args.parent_id and forest is not None and forest.get(args.parent_id) is None:
+            # Inside a task-scoped run, a new task without an explicit parent is a
+            # subtask of the task being worked on (the decomposition signal).
+            parent_id = args.parent_id or ctx.current_task_id
+            if parent_id and forest is not None and forest.get(parent_id) is None:
                 return ToolResult(
-                    content=f"task add: no such parent task: {args.parent_id}", is_error=True
+                    content=f"task add: no such parent task: {parent_id}", is_error=True
                 )
-            tid = mint_task_id()
+            new_id = mint_task_id()
             await ctx.record_event(
                 task_created(
-                    id=tid,
+                    id=new_id,
                     content=args.content,
                     goal=args.goal or "",
                     priority=args.priority or 0,
-                    parent_id=args.parent_id,
+                    parent_id=parent_id,
                     origin="agent",
                     due=args.due,
                     tags=args.tags,
                 )
             )
-            return ToolResult(content=f"added {tid}", structured_output={"id": tid})
+            return ToolResult(content=f"added {new_id}", structured_output={"id": new_id})
 
         if args.action == "list":
             if forest is None:
@@ -136,29 +142,34 @@ class TaskTool:
             return ToolResult(content=rendered)
 
         if args.action in ("done", "cancel"):
-            if not args.id:
+            tid = args.id or ctx.current_task_id
+            if not tid:
                 return ToolResult(content=f"task {args.action}: 'id' is required", is_error=True)
-            task = forest.get(args.id) if forest is not None else None
+            task = forest.get(tid) if forest is not None else None
             if task is None:
-                return ToolResult(content=f"no such task: {args.id}", is_error=True)
+                return ToolResult(content=f"no such task: {tid}", is_error=True)
             dst = "done" if args.action == "done" else "cancelled"
             if task.status == dst:
-                return ToolResult(content=f"{args.id} already {dst}")
+                return ToolResult(content=f"{tid} already {dst}")
             if not can_transition(task.status, dst):
                 return ToolResult(
-                    content=f"task {args.action}: cannot move {args.id} from "
-                    f"{task.status} to {dst}",
+                    content=f"task {args.action}: cannot move {tid} from {task.status} to {dst}",
                     is_error=True,
                 )
             await ctx.record_event(
                 task_transitioned(
-                    id=task.id, from_state=task.status, to_state=dst, reason=f"tool:{args.action}"
+                    id=task.id,
+                    from_state=task.status,
+                    to_state=dst,
+                    reason=f"tool:{args.action}",
+                    result=args.result if args.action == "done" else None,
                 )
             )
             return ToolResult(content=f"{args.action} {task.id}")
 
         if args.action == "update":
-            if not args.id:
+            tid = args.id or ctx.current_task_id
+            if not tid:
                 return ToolResult(content="task update: 'id' is required", is_error=True)
             if (
                 args.content is None
@@ -171,11 +182,11 @@ class TaskTool:
                     content="task update: provide at least one of content/goal/priority/due/tags",
                     is_error=True,
                 )
-            if forest is not None and forest.get(args.id) is None:
-                return ToolResult(content=f"no such task: {args.id}", is_error=True)
+            if forest is not None and forest.get(tid) is None:
+                return ToolResult(content=f"no such task: {tid}", is_error=True)
             await ctx.record_event(
                 task_updated(
-                    id=args.id,
+                    id=tid,
                     content=args.content,
                     goal=args.goal,
                     priority=args.priority,
@@ -183,7 +194,7 @@ class TaskTool:
                     tags=args.tags or None,
                 )
             )
-            return ToolResult(content=f"updated {args.id}")
+            return ToolResult(content=f"updated {tid}")
 
         if args.action == "delete":
             if not args.id:
