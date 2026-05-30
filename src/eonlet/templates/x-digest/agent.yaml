@@ -44,14 +44,15 @@ tools:
   builtin:
     - file_read
     - file_write
-    - note
-    - todo
+    - knowledge
+    - task
     - recall
     - memory
     - send_email
     - sleep
   custom:
     - ./tools/x_timeline.py
+    - ./tools/feed_read.py   # optional: requires `pip install feedparser`
 
 env:
   required:
@@ -74,13 +75,15 @@ permissions:
 
 memory:
   enabled: true
-  compaction_model: claude-haiku-4.5@anthropic
-  conversation:
+  compaction_model: claude-haiku-4-5-20251001@anthropic
+  inject_turn_timestamps: true
+  episodic:
     working_memory_tokens: 6000     # mostly scheduled runs, short context
     keep_recent_messages_min: 4
     short_term_tokens: 3000
     long_term_tokens: 6000
     auto_compact: true
+    propose_semantic: false         # scheduled agent: no interactive session to approve
 
 lifecycle:
   on_crash: warn

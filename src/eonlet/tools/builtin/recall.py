@@ -1,9 +1,10 @@
-"""recall: search the event log and memory documents (MEMORY_SPEC §5.1).
+"""recall: search the event log and memory stores (MEMORY_SPEC §5.1 / ADR-0005).
 
 Recall is an **explicit tool**: when the agent's compressed memory isn't
-enough, it calls this to "leaf through the chat history." The tool reads
-from the SQLite FTS5 index (events) and the in-memory document stores
-(notes/todos). Memory documents (STM/LTM) are wired in P4/P5.
+enough, it calls this to "leaf through the chat history." The tool reads from
+the SQLite FTS5 index (events) and scans the knowledge tree / tasks directly.
+When a knowledge file matches, recall returns its path so the agent can
+``knowledge.open`` the full body.
 """
 
 from __future__ import annotations
@@ -12,13 +13,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from ...memory.notes import NotesStore
+from ...memory.knowledge import KnowledgeStore
 from ...memory.recall import IndexedMsg, RecallIndex
-from ...memory.todos import TodosStore
 from ...runtime.events import mem_recall_invoked
+from ...tasks import TaskStore
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
-RecallScope = Literal["events", "notes", "todos", "memory"]
+RecallScope = Literal["events", "knowledge", "tasks"]
 
 
 def _default_include() -> list[RecallScope]:
@@ -67,8 +68,8 @@ class RecallTool:
         "text; requires query), 'by_date' (events on YYYY-MM-DD UTC; requires date), "
         "'by_date_range' (between two ISO datetimes; requires date_range), "
         "'around_event' (radius of events around an id; requires around_event_id). "
-        "Use 'include' to also search notes/todos. Memory documents (STM/LTM) "
-        "land in a later release."
+        "Use 'include' to also search the knowledge base / tasks; knowledge hits "
+        "return file paths you can open with the knowledge tool."
     )
     input_schema = RecallArgs
     annotations = ToolAnnotations(read_only=True)
@@ -129,33 +130,40 @@ class RecallTool:
                 return ToolResult(content=f"recall: {e}", is_error=True)
             total_hits += len(event_hits)
 
-        if "notes" in args.include and args.mode == "by_keyword" and args.query:
-            notes = await NotesStore(ctx.memory_dir).list_notes()
+        if "knowledge" in args.include and args.mode == "by_keyword" and args.query:
+            store = KnowledgeStore(ctx.memory_dir)
             q = args.query.lower()
-            matches = [n for n in notes if q in (n.title or "").lower() or q in n.body.lower()]
-            if matches:
-                lines = ["## notes hits"]
-                for n in matches[: args.limit]:
-                    head = f"### [{n.id}] {n.title or '(untitled)'}"
-                    if n.tags:
-                        head += "  (tags: " + ", ".join(n.tags) + ")"
-                    lines.append(head + "\n" + n.body)
-                sections.append("\n\n".join(lines) + "\n")
+            k_matches: list[tuple[str, str]] = []  # (path, snippet)
+            for entry in await store.list_entries():
+                body = await store.open(entry.path) or ""
+                hay = f"{entry.title}\n{entry.hook}\n{body}".lower()
+                if q in hay:
+                    snippet = entry.hook or body.strip().splitlines()[0] if body.strip() else ""
+                    k_matches.append((entry.path, snippet))
+            if k_matches:
+                lines = ["## knowledge hits"]
+                for path, snippet in k_matches[: args.limit]:
+                    lines.append(f"- {path} — {snippet}" if snippet else f"- {path}")
+                lines.append("\nOpen any of these with the knowledge tool to read the full body.")
+                sections.append("\n".join(lines) + "\n")
             else:
-                sections.append("## notes hits — 0\n")
-            total_hits += len(matches)
+                sections.append("## knowledge hits — 0\n")
+            total_hits += len(k_matches)
 
-        if "todos" in args.include and args.mode == "by_keyword" and args.query:
-            todos = await TodosStore(ctx.memory_dir).list_todos(status="all")
+        if "tasks" in args.include and args.mode == "by_keyword" and args.query:
+            tasks_dir = (
+                ctx.tasks_dir if ctx.tasks_dir is not None else ctx.memory_dir.parent / "tasks"
+            )
+            tasks = await TaskStore(tasks_dir).list_tasks(status="all")
             q = args.query.lower()
-            matches_t = [t for t in todos if q in t.content.lower()]
+            matches_t = [t for t in tasks if q in t.content.lower()]
             if matches_t:
-                lines = ["## todos hits"]
+                lines = ["## tasks hits"]
                 for t in matches_t[: args.limit]:
                     lines.append(f"- [{t.status}] {t.id} — {t.content}")
                 sections.append("\n".join(lines) + "\n")
             else:
-                sections.append("## todos hits — 0\n")
+                sections.append("## tasks hits — 0\n")
             total_hits += len(matches_t)
 
         if ctx.record_event is not None:

@@ -7,12 +7,11 @@ from pathlib import Path
 
 from eonlet.memory.paths import (
     index_db_path,
+    knowledge_index_path,
+    knowledge_root,
     long_term_path,
     memory_root,
-    notes_path,
     short_term_path,
-    todos_archive_path,
-    todos_path,
     watermark_path,
 )
 
@@ -33,8 +32,7 @@ def test_memory_root_honors_eonlet_home(tmp_path: Path) -> None:
 def test_relative_paths_resolve_under_dir(tmp_path: Path) -> None:
     assert short_term_path(tmp_path) == tmp_path / "short_term.md"
     assert long_term_path(tmp_path) == tmp_path / "long_term.md"
-    assert notes_path(tmp_path) == tmp_path / "notes.md"
-    assert todos_path(tmp_path) == tmp_path / "todos.jsonl"
-    assert todos_archive_path(tmp_path) == tmp_path / "todos.archive.jsonl"
+    assert knowledge_root(tmp_path) == tmp_path / "knowledge"
+    assert knowledge_index_path(tmp_path) == tmp_path / "knowledge" / "index.md"
     assert index_db_path(tmp_path) == tmp_path / "index.sqlite"
     assert watermark_path(tmp_path) == tmp_path / "watermark"

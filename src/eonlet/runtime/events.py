@@ -41,18 +41,26 @@ class EventKind(StrEnum):
     LOG = "log"
     # ── Memory subsystem (MEMORY_SPEC §7) ────────────────────────────────────
     MEM_COMPACTED = "mem_compacted"  # tier-1 working → STM
-    MEM_LTM_PROMOTED = "mem_ltm_promoted"  # tier-2 STM → LTM
-    MEM_LTM_FORGOTTEN = "mem_ltm_forgotten"  # tier-3 LTM compaction or forget tool
-    MEM_NOTE_ADDED = "mem_note_added"
-    MEM_NOTE_UPDATED = "mem_note_updated"
-    MEM_NOTE_DELETED = "mem_note_deleted"
-    MEM_TODO_ADDED = "mem_todo_added"
-    MEM_TODO_UPDATED = "mem_todo_updated"
-    MEM_TODO_DELETED = "mem_todo_deleted"
-    MEM_REMEMBER = "mem_remember"  # explicit LTM write via `remember` tool
+    MEM_LTM_PROMOTED = "mem_ltm_promoted"  # tier-2 STM → LTM (episodic)
+    MEM_LTM_FORGOTTEN = "mem_ltm_forgotten"  # tier-3 episodic forgetting
     MEM_RECALL_INVOKED = "mem_recall_invoked"
     MEM_PAUSED = "mem_paused"  # /compact off
     MEM_RESUMED = "mem_resumed"  # /compact on
+    # Agent-proposed semantic compaction (ADR-0006, M3).
+    MEM_COMPACT_PROPOSED = "mem_compact_proposed"
+    MEM_COMPACT_APPROVED = "mem_compact_approved"
+    MEM_COMPACT_DECLINED = "mem_compact_declined"
+    # ── Web subsystem (ADR-0004) ─────────────────────────────────────────────
+    WEB_SEARCH_PERFORMED = "web_search_performed"
+    WEB_FETCH_PERFORMED = "web_fetch_performed"
+    # ── Knowledge axis (ADR-0005) ────────────────────────────────────────────
+    KB_WRITTEN = "kb_written"  # knowledge.write / knowledge.edit
+    KB_DELETED = "kb_deleted"  # knowledge.delete
+    KB_MOVED = "kb_moved"  # knowledge.move
+    # ── Tasks (ADR-0005 — moved out of memory) ───────────────────────────────
+    TASK_ADDED = "task_added"
+    TASK_UPDATED = "task_updated"  # done / cancel / edit
+    TASK_DELETED = "task_deleted"
 
 
 def now_us() -> int:
@@ -122,6 +130,30 @@ def tool_result(call_id: str, tool_name: str, output: str, *, is_error: bool = F
     )
 
 
+# ── Session helpers ──────────────────────────────────────────────────────────
+
+
+def session_started(*, reason: str | None = None) -> Event:
+    """Mark the start of a conversation episode.
+
+    Emitted (with ``reason="compact"``) right after a user-forced full
+    compaction empties the working window (ADR-0006), so the next user message
+    begins a fresh episode carrying only the injected memory preamble.
+    """
+    payload: dict[str, Any] = {}
+    if reason is not None:
+        payload["reason"] = reason
+    return Event(kind=EventKind.SESSION_STARTED, payload=payload)
+
+
+def session_ended(*, reason: str | None = None) -> Event:
+    """Mark the end of a conversation episode (ADR-0006)."""
+    payload: dict[str, Any] = {}
+    if reason is not None:
+        payload["reason"] = reason
+    return Event(kind=EventKind.SESSION_ENDED, payload=payload)
+
+
 # ── Memory helpers (MEMORY_SPEC §7) ──────────────────────────────────────────
 
 
@@ -173,17 +205,18 @@ def mem_ltm_forgotten(
     kept_count: int,
     dropped_count: int,
     dropped_digest: list[dict[str, Any]],
-    cause: str,
+    cause: str = "tier3",
     snapshot_id: int | None = None,
     model: str | None = None,
 ) -> Event:
-    """Tier-3 LTM compaction success, or user/agent ``forget`` action.
+    """Tier-3 episodic-LTM forgetting success.
 
-    ``cause`` is ``"tier3"`` or ``"forget"``. ``model`` is set on tier-3
-    runs and omitted for ``forget``.
+    ``cause`` is always ``"tier3"`` as of ADR-0005 — the explicit ``forget``
+    tool (and its ``cause="forget"`` variant) was retired when LTM narrowed to
+    a single uniformly-forgettable episodic population.
     """
-    if cause not in ("tier3", "forget"):
-        raise ValueError(f"mem_ltm_forgotten cause must be tier3|forget, got {cause!r}")
+    if cause != "tier3":
+        raise ValueError(f"mem_ltm_forgotten cause must be 'tier3', got {cause!r}")
     payload: dict[str, Any] = {
         "cause": cause,
         "kept_count": kept_count,
@@ -197,51 +230,24 @@ def mem_ltm_forgotten(
     return Event(kind=EventKind.MEM_LTM_FORGOTTEN, payload=payload)
 
 
-def mem_note_added(*, id: str, title: str | None, tags: list[str]) -> Event:
-    return Event(
-        kind=EventKind.MEM_NOTE_ADDED,
-        payload={"id": id, "title": title, "tags": tags},
-    )
-
-
-def mem_note_updated(*, id: str) -> Event:
-    return Event(kind=EventKind.MEM_NOTE_UPDATED, payload={"id": id})
-
-
-def mem_note_deleted(*, id: str) -> Event:
-    return Event(kind=EventKind.MEM_NOTE_DELETED, payload={"id": id})
-
-
-def mem_todo_added(
+def task_added(
     *, id: str, content: str, due: str | None = None, tags: list[str] | None = None
 ) -> Event:
     return Event(
-        kind=EventKind.MEM_TODO_ADDED,
+        kind=EventKind.TASK_ADDED,
         payload={"id": id, "content": content, "due": due, "tags": tags or []},
     )
 
 
-def mem_todo_updated(*, id: str, status: str, done_at: str | None = None) -> Event:
+def task_updated(*, id: str, status: str, done_at: str | None = None) -> Event:
     return Event(
-        kind=EventKind.MEM_TODO_UPDATED,
+        kind=EventKind.TASK_UPDATED,
         payload={"id": id, "status": status, "done_at": done_at},
     )
 
 
-def mem_todo_deleted(*, id: str) -> Event:
-    return Event(kind=EventKind.MEM_TODO_DELETED, payload={"id": id})
-
-
-def mem_remember(*, section: str, content_preview: str, ts: str) -> Event:
-    """Explicit LTM write (``remember`` tool / ``/remember``).
-
-    ``content_preview`` is the first ~120 chars of the bullet, not the full
-    content — full content is on disk, the event is a pointer.
-    """
-    return Event(
-        kind=EventKind.MEM_REMEMBER,
-        payload={"section": section, "src": "explicit", "ts": ts, "preview": content_preview},
-    )
+def task_deleted(*, id: str) -> Event:
+    return Event(kind=EventKind.TASK_DELETED, payload={"id": id})
 
 
 def mem_recall_invoked(
@@ -265,3 +271,112 @@ def mem_paused() -> Event:
 
 def mem_resumed() -> Event:
     return Event(kind=EventKind.MEM_RESUMED, payload={})
+
+
+def mem_compact_proposed(*, boundary_event_id: int, reason: str, working_tokens: int) -> Event:
+    """Agent proposed folding away context older than ``boundary_event_id`` (ADR-0006)."""
+    return Event(
+        kind=EventKind.MEM_COMPACT_PROPOSED,
+        payload={
+            "boundary_event_id": boundary_event_id,
+            "reason": reason,
+            "working_tokens": working_tokens,
+        },
+    )
+
+
+def mem_compact_approved(*, boundary_event_id: int, rule: str = "user") -> Event:
+    """A proposed compaction was approved. ``rule`` is ``"user"`` or ``"yolo"``."""
+    return Event(
+        kind=EventKind.MEM_COMPACT_APPROVED,
+        payload={"boundary_event_id": boundary_event_id, "rule": rule},
+    )
+
+
+def mem_compact_declined(*, boundary_event_id: int, rule: str = "user") -> Event:
+    """A proposed compaction was declined (``"user"`` or ``"no_listener"``)."""
+    return Event(
+        kind=EventKind.MEM_COMPACT_DECLINED,
+        payload={"boundary_event_id": boundary_event_id, "rule": rule},
+    )
+
+
+# ── Knowledge-axis helpers (ADR-0005) ────────────────────────────────────────
+
+
+def kb_written(*, path: str, size: int, action: str = "write") -> Event:
+    """A knowledge file was created or edited.
+
+    Summary-only: the event records the path and resulting size, not the body
+    (the body lives on disk; the event is just a pointer to it).
+    ``action`` is ``"write"`` (full-body replace) or ``"edit"`` (string-replace).
+    """
+    return Event(
+        kind=EventKind.KB_WRITTEN,
+        payload={"path": path, "size": size, "action": action},
+    )
+
+
+def kb_deleted(*, path: str) -> Event:
+    return Event(kind=EventKind.KB_DELETED, payload={"path": path})
+
+
+def kb_moved(*, src: str, dst: str) -> Event:
+    return Event(kind=EventKind.KB_MOVED, payload={"src": src, "dst": dst})
+
+
+# ── Web helpers (ADR-0004) ───────────────────────────────────────────────────
+
+
+def web_search_performed(
+    *,
+    provider: str,
+    query: str,
+    max_results: int,
+    hit_count: int,
+    error: str | None = None,
+) -> Event:
+    """Summary-only record of a ``web_search`` call.
+
+    Full hit list lives in the corresponding ``TOOL_RESULT`` event; this
+    one exists so ``eonlet replay`` can surface fragile-fallback usage and
+    long-tail provider failures at a glance.
+    """
+    payload: dict[str, Any] = {
+        "provider": provider,
+        "query": query,
+        "max_results": max_results,
+        "hit_count": hit_count,
+    }
+    if error is not None:
+        payload["error"] = error
+    return Event(kind=EventKind.WEB_SEARCH_PERFORMED, payload=payload)
+
+
+def web_fetch_performed(
+    *,
+    url: str,
+    content_type: str,
+    bytes_in: int,
+    offset_tokens: int,
+    total_tokens: int,
+    truncated: bool,
+    error: str | None = None,
+) -> Event:
+    """Summary-only record of a ``web_fetch`` call.
+
+    Full body lives in the corresponding ``TOOL_RESULT`` event. The extra
+    summary fields make truncation/pagination debugging tractable without
+    pulling the body out of msgpack.
+    """
+    payload: dict[str, Any] = {
+        "url": url,
+        "content_type": content_type,
+        "bytes_in": bytes_in,
+        "offset_tokens": offset_tokens,
+        "total_tokens": total_tokens,
+        "truncated": truncated,
+    }
+    if error is not None:
+        payload["error"] = error
+    return Event(kind=EventKind.WEB_FETCH_PERFORMED, payload=payload)

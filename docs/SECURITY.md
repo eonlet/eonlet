@@ -84,8 +84,14 @@ These are version-pinned to the runtime. Future versions may expand the list; th
 
 | Mode | Destructive call → |
 |---|---|
-| `ask` (default) | Prompts attached session; denied if no session attached |
+| `ask` (default) | **Blocks the turn and prompts the attached session for approval** (ADR-0006); denied if no session is attached, or if the last session detaches while waiting |
 | `yolo` | Auto-allowed (subject to deny list) |
+
+The `ask`-mode prompt rides the generic **decision channel** (`worker/decisions.py`):
+the worker pushes a `decision/request` notification, blocks, and resumes on the
+CLI's `decision.respond` reply. The same channel carries agent-proposed
+compaction confirmations (MEMORY_SPEC §4.6.1). First responder wins; a headless
+worker auto-declines rather than hanging.
 
 Scheduled agents typically run `yolo` — they have no session to ask. They compensate by:
 - Tighter `extra_deny` patterns specific to their tools (e.g., `broker_place_order(*)` for the portfolio agent)
@@ -98,12 +104,55 @@ File-writing tools (`file_write`, `file_edit`, `bash` with output redirection) c
 
 This is enforced at the tool-implementation level, not by OS sandboxing. Determined adversaries with `bash` can defeat it.
 
+**Knowledge-tree confinement (ADR-0005).** The `knowledge` tool resolves every
+`path` against `memory/knowledge/` and rejects absolute paths, any `..`
+traversal, and the reserved `index.md` (raising `KnowledgePathError`). A
+crafted path therefore cannot read or write outside the knowledge tree. Like
+the workspace boundary, this is a tool-level check, not OS sandboxing.
+
 ### 2.4 Network isolation
 
 Tools with `annotations.network: true` are visibly marked. There is no network firewall — they make outbound HTTPS like any process. Defenses are:
 
 - `web_fetch` / `web_search`: output marked untrusted in prompt
 - `send_email`: in `ask` mode, always prompts; in `yolo`, allowed (relies on `extra_deny` for restrictions)
+
+#### SSRF guard on `web_fetch` and `web_search` (ADR-0004)
+
+All outbound HTTP from the runtime's `web_fetch` / `web_search` builtins
+goes through a single `HTTPFetcher` that pre-resolves the target host
+and refuses these destinations *before opening a connection*:
+
+| Category | Examples | Always blocked |
+|---|---|---|
+| Loopback | `127.0.0.0/8`, `::1` | ✅ |
+| Link-local | `169.254.0.0/16`, `fe80::/10` | ✅ |
+| Cloud metadata | `169.254.169.254` (AWS / GCP / Azure / OCI), `100.100.100.200` (Alibaba), `fd00:ec2::254`, hostnames like `metadata.google.internal` | ✅ |
+| Multicast / unspecified / reserved | `224.0.0.0/4`, `0.0.0.0`, IPv4 reserved | ✅ |
+| Private networks | `10/8`, `172.16/12`, `192.168/16`, ULA `fc00::/7` | Default; opt out via `web.fetch.allow_private_networks: true` |
+| Carrier-grade NAT | `100.64.0.0/10` | Default; opt out via `web.fetch.allow_private_networks: true` |
+
+The `allow_private_networks` escape hatch is for agents that need to
+reach a local development server or internal HTTP service. **Even when
+it's set, metadata endpoints and link-local addresses remain blocked** —
+those are load-bearing for SSRF defence and have no legitimate "I meant
+to hit this" use case in a local-first runtime.
+
+Other transport policies that ship by default and have no opt-out:
+
+- Scheme allow-list: `http`, `https` only. `file://`, `ftp://`,
+  `javascript:` are refused at parse time.
+- Size cap: streamed body aborts past `web.fetch.max_bytes` (default
+  10 MB).
+- Stable, identifiable `User-Agent` header. Overridable, but not
+  removable.
+
+Known residual risk: a name-server that returns different addresses on
+two consecutive queries (DNS rebinding) could slip past the check
+because httpx re-resolves on connect. Closing that fully needs a custom
+transport-level resolver and is out of scope for v0.1. For threat models
+that include DNS rebinding, run Eonlet behind a network filter that
+enforces the same policy.
 
 ### 2.5 Tool output marking
 

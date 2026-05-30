@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .errors import ConfigError
 from .memory.config import MemoryConfig
+from .tasks.config import TasksConfig
 
 # ── Duration parsing ──────────────────────────────────────────────────────────
 
@@ -176,6 +177,37 @@ class Lifecycle(BaseModel):
     on_crash: Literal["warn", "exit"] = "exit"
 
 
+class WebFetchConfig(BaseModel):
+    """Per-agent overrides for the ``web_fetch`` tool (ADR-0004)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Cap on raw response size. 10 MB is high enough for typical news/blog
+    # pages with images stripped; lower it for budget-sensitive agents.
+    max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    # Default token budget per call before pagination kicks in.
+    max_tokens_per_call: int = Field(default=4000, ge=200, le=20000)
+    # Per-request HTTP timeout in seconds.
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    # SSRF escape hatch — accept loopback/RFC1918 targets. Off by default;
+    # required for agents that legitimately need to hit a local service.
+    allow_private_networks: bool = False
+    # User-Agent override. None → default Eonlet UA built from the
+    # installed version.
+    user_agent: str | None = None
+
+
+class WebConfig(BaseModel):
+    """Web subsystem configuration. Search backend is selected by env-var
+    presence (TAVILY_API_KEY) per ADR-0004 §"Configuration", so only the
+    fetch path has a config block today.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
+
+
 # ── Top-level ─────────────────────────────────────────────────────────────────
 
 
@@ -192,6 +224,8 @@ class AgentConfig(BaseModel):
     tools: Tools
     permissions: Permissions = Field(default_factory=Permissions)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    tasks: TasksConfig = Field(default_factory=TasksConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     env: Env = Field(default_factory=Env)
     lifecycle: Lifecycle = Field(default_factory=Lifecycle)
 
@@ -231,6 +265,8 @@ def load_agent_config(path: Path) -> AgentConfig:
         "tools",
         "permissions",
         "memory",
+        "tasks",
+        "web",
         "env",
         "lifecycle",
         "outputs",

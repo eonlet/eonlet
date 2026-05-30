@@ -173,7 +173,9 @@ The framework discovers the tool by scanning `tools/` directory in the agent def
 
 ---
 
-## 6. Builtin Tool Catalog (MVP — 13 tools)
+## 6. Builtin Tool Catalog
+
+Plus `schedule` (one-off future trigger) — see TRIGGER_SPEC. The memory-suite tools (`recall` / `memory` / `knowledge` / `task`) reflect the dual-axis model (ADR-0005): the retired `notes_read` / `notes_append` / `remember` / `note` / `forget` / `todo` tools no longer exist.
 
 ### 6.1 `bash`
 
@@ -268,59 +270,170 @@ annotations: read_only
 
 ### 6.7 `web_search`
 
-Search the web. Backend configurable (Tavily by default; can swap for DuckDuckGo, Serper, etc.).
+Search the web. **Tavily** when `TAVILY_API_KEY` is set; otherwise a
+**DuckDuckGo HTML** scrape (fragile zero-config fallback). Two paths,
+no abstraction — see [ADR-0004](adr/0004-web-tools.md).
 
 ```yaml
 input:
   query: string
-  max_results: int = 5
-output: { results: list[{ title, url, snippet }] }
+  max_results: int = 5                       # 1–20
+  include_raw_content: bool = false          # Tavily only; ignored on DDG
+output:
+  provider: "tavily" | "ddg"
+  query: string
+  answer: string | null                      # Tavily AI summary if any
+  warnings: list[str]                        # e.g. "raw_content_unavailable_on_ddg"
+  results: list[{ title, url, snippet, raw_content?, published_at? }]
 annotations: read_only, network
 ```
 
-Configured via env vars: `TAVILY_API_KEY` (or alternative).
+Provider selection is by env-var presence — there is no `provider="…"`
+argument. To force one backend, unset / set `TAVILY_API_KEY` accordingly.
+
+Emits `WEB_SEARCH_PERFORMED` event (summary only; full hits in the
+normal `TOOL_RESULT`).
+
+**When the built-in isn't enough.**
+
+- **Brave / Google CSE / Serper** — write a ~60-line custom tool under
+  your agent's `tools/` directory that calls the relevant SDK and
+  returns the same `{ results: list[...] }` shape.
+- **More providers, smarter fallback chains** — wait for v0.2 MCP, or
+  mount an MCP search server. `TODO(v0.2): link to mcp-server-fetch /
+  search MCP servers once they ship.`
 
 ### 6.8 `web_fetch`
 
-Fetch a URL, return as Markdown.
+Fetch a URL and return its main content as **markdown**. HTML pages are
+extracted via `trafilatura`; plain text / JSON pass through. PDFs, RSS,
+JavaScript-rendered pages, anti-bot evasion are **out of scope** — see
+the extensibility note below.
 
 ```yaml
 input:
-  url: string
-  prompt: string = ""                     # optional summarization hint
-output: { content: string, title: string }
+  url: string                                # http or https only
+  max_tokens: int = 4000                     # 200–20000; output window per call
+  offset_tokens: int = 0                     # chain pages with next_offset
+output:
+  content: string                            # markdown body
+  structured_output:
+    url: string                              # final URL after redirects
+    title: string | null
+    content_type: string
+    metadata: { author?, date?, language?, sitename?, hostname?, … }
+    offset_tokens: int
+    total_tokens: int
+    truncated: bool
+    next_offset: int | null
 annotations: read_only, network
 ```
 
-Uses `httpx` + `readability-lxml` for cleanup. Strips ads / navigation when possible.
+The shared `HTTPFetcher` enforces:
 
-### 6.9 `notes_read`
+- **SSRF guard** — refuses loopback, link-local, RFC1918, CGNAT,
+  multicast, and cloud-metadata endpoints (AWS / GCP / Azure / OCI /
+  Alibaba IMDS, including 169.254.169.254). Escape hatch:
+  `agent.yaml: web.fetch.allow_private_networks: true`.
+- **Scheme allow-list** — `http`, `https` only.
+- **Retry** — 3 attempts on transport errors and 5xx, backoff 0.5/1/2s.
+  No retry on 4xx.
+- **Size cap** — streaming response aborts when raw bytes exceed
+  `web.fetch.max_bytes` (default 10 MB).
+- **Stable User-Agent** — `Eonlet/<version> (+https://eonlet.dev)`,
+  overridable via `web.fetch.user_agent`.
 
-Read from the eonlet's memory markdown files.
+Pagination is token-based (≈ 4 chars / token) — feed `next_offset` back
+in as `offset_tokens` to read the next slice.
+
+Emits `WEB_FETCH_PERFORMED` event (summary only; full body in the
+normal `TOOL_RESULT`).
+
+**When the built-in isn't enough.**
+
+- **PDFs.** The tool returns `is_error=true` with a "use a custom tool
+  or MCP server" message. Drop a `pypdf`-based extractor into your
+  agent's `tools/` directory, or wait for v0.2 MCP. `TODO(v0.2): link
+  to mcp-server-pdf once MCP integration lands.`
+- **RSS / Atom / JSON Feed.** Feed parsing is a polling concern, not a
+  fetch concern; it belongs in a per-agent custom tool. The bundled
+  `x-digest` template ships
+  [`tools/feed_read.py`](../src/eonlet/templates/x-digest/tools/feed_read.py)
+  as the canonical extensibility example (~30 LOC `feedparser` wrapper).
+- **JavaScript-rendered pages, headless rendering, anti-bot evasion.**
+  Out of scope for v0.1. Mount a hosted scraper via MCP at v0.2, or
+  write a custom tool calling Playwright / Crawl4AI / FireCrawl.
+- **Brave / Google CSE / specialist scrapers in general.** Same pattern
+  — Eonlet is a *runtime*, not a competitor to Tavily / Crawl4AI /
+  FireCrawl. The 60-LOC custom-tool route is the supported path.
+
+### 6.9 `recall`
+
+Search the event log and memory stores when the compressed context isn't enough (MEMORY_SPEC §5.1). FTS5 over the event log plus direct scans of the knowledge tree / tasks.
 
 ```yaml
 input:
-  file: string = "notes.md"               # restricted to memory_dir
-output: { content: string }
+  mode: "by_keyword" | "by_date" | "by_date_range" | "around_event"
+  query: string | null                    # for by_keyword
+  date: string | null                     # YYYY-MM-DD (UTC), for by_date
+  include: ["events" | "knowledge" | "tasks"] = ["events"]
+output: { rendered hits; knowledge hits return file paths to open }
 annotations: read_only
 ```
 
-Only files declared in `agent.yaml.memory.notes_files` are accessible.
+### 6.10 `memory`
 
-### 6.10 `notes_append`
-
-Append to a memory markdown file.
+Inspect and control the episodic memory subsystem (MEMORY_SPEC §4, §5.5).
 
 ```yaml
 input:
-  file: string
-  content: string
-  with_timestamp: bool = true             # prefixes "## YYYY-MM-DD HH:MM"
-output: { bytes_appended: int }
-annotations: destructive (but bounded to memory/)
+  action: "show" | "compact" | "compact_ltm" | "propose_compact" | "pause" | "resume"
+  store: "stm" | "ltm" | "all" = "all"    # for action=show
+  boundary_event_id: int | null            # for action=propose_compact
+  reason: string | null                    # for action=propose_compact
+annotations: not destructive (compaction is bounded to memory/)
 ```
 
-### 6.11 `send_email`
+`propose_compact` is the agent's only path to compaction (ADR-0006): it proposes
+folding the conversation up to `boundary_event_id` into STM and **blocks for the
+user's consent** before acting (auto-approved under `yolo`). It is gated by the
+`episodic.propose_*` floor/cooldown config and is a no-op in headless/cron runs.
+`compact` (full, clean-slate) is reachable only from the user's `/compact`, not
+as an agent action.
+
+### 6.11 `knowledge`
+
+The single durable-write surface — the curated, hierarchical knowledge base (ADR-0005). Its `index.md` map is always in context; bodies are opened on demand. Never auto-deleted.
+
+```yaml
+input:
+  action: "open" | "list" | "write" | "edit" | "delete" | "move"
+  path: string | null                     # relative under knowledge/, e.g. "rules/testing.md"
+  content: string | null                  # full body for write
+  index_line: string | null               # one-line map hook for write/move
+  old_string / new_string: string | null  # for edit (string-replace)
+  new_path: string | null                 # for move
+output: { path / list / body depending on action }
+annotations: destructive (write/edit/delete/move); open/list are read_only-equivalent
+```
+
+Paths are confined to the knowledge tree: `..`, absolute paths, and the reserved `index.md` are rejected (`KnowledgePathError`).
+
+### 6.12 `task`
+
+Action-item tracker — workflow state, not memory (ADR-0005). Stored in `tasks/todos.jsonl`; pending tasks inject as a `<tasks>` block each run.
+
+```yaml
+input:
+  action: "add" | "list" | "done" | "cancel" | "update" | "delete"
+  content: string | null                  # for add/update
+  id: string | null                       # for done/cancel/update/delete
+  due: string | null                      # optional ISO-8601
+  status: "pending" | "done" | "cancelled" | "all" = "pending"   # for list
+annotations: destructive
+```
+
+### 6.13 `send_email`
 
 Send an email via configured SMTP.
 
@@ -338,7 +451,7 @@ permission: in `ask` mode, always asks; in `yolo`, allowed
 Requires env vars: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_TO`.
 Body Markdown is rendered to HTML with a fallback plaintext part.
 
-### 6.12 `sleep`
+### 6.14 `sleep`
 
 Pause execution (useful for retry backoffs in scheduled agents).
 
@@ -351,7 +464,7 @@ annotations: read_only (no side effects)
 
 Capped at 5 minutes per call to prevent runaway. For longer waits, use the trigger system.
 
-### 6.13 `load_skill`
+### 6.15 `load_skill`
 
 Load a skill's full content into the conversation.
 

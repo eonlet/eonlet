@@ -17,10 +17,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..llm import LLMMessage, LLMProvider, LLMResponse, LLMToolCall, resolve_model
-from ..memory.injection import build_memory_preamble, current_watermark
+from ..memory.injection import build_memory_preamble, build_tasks_block, current_watermark
 from ..memory.recall import RecallIndex
 from ..permissions import PermissionGate
 from ..tools import ToolContext, ToolResult, get_registry
+from ..web import HTTPFetcher
 from .definition import Definition
 from .events import (
     Event,
@@ -61,12 +62,24 @@ class AgentRuntime:
     # worker; ``None`` skips indexing (used by tests that don't care about
     # recall).
     recall_index: RecallIndex | None = None
+    # Outbound HTTP client — owned by the worker, threaded into every
+    # ToolContext so web_fetch / web_search share one connection pool and
+    # one SSRF policy. ``None`` in tests that don't exercise the web tools.
+    http_fetcher: HTTPFetcher | None = None
+    # Blocking user-decision channel (ADR-0006) — set by the worker to a
+    # DecisionBroker. Used to confirm ask-mode destructive tools interactively
+    # (and, in M3, compaction proposals). ``None`` in tests / headless contexts,
+    # where ``needs_prompt`` decisions fall back to their non-interactive
+    # default (deny). Typed loosely to avoid a runtime→worker import cycle.
+    decision_broker: Any | None = None
     # Session-scoped auto-compaction switch (MEMORY_SPEC §4.6). Init from
     # config; ``/compact off`` flips to False; reset on worker restart.
     auto_compact_enabled: bool = True
     # Memory preamble cached for the lifetime of one ``handle_user_message``
     # call — built once at run start and re-used across the loop's turns.
     _cached_preamble: str = ""
+    # Sibling <tasks> block (ADR-0005), cached the same way as the preamble.
+    _cached_tasks: str = ""
     # Run-state — used by session.start so re-attaching clients can tell whether
     # a run is currently in flight (e.g. "agent is mid-tool-call"). Set inside
     # ``handle_user_message`` only; reset in a finally.
@@ -105,8 +118,13 @@ class AgentRuntime:
             provider=prov,
             gate=gate,
             state=state,
-            auto_compact_enabled=definition.config.memory.conversation.auto_compact,
+            auto_compact_enabled=definition.config.memory.episodic.auto_compact,
         )
+
+    @property
+    def tasks_dir(self) -> Path:
+        """Workflow-state dir — sibling of ``memory/`` (ADR-0005)."""
+        return self.memory_dir.parent / "tasks"
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -125,6 +143,13 @@ class AgentRuntime:
             log.exception("memory preamble build failed; injecting nothing")
             self._cached_preamble = ""
         try:
+            self._cached_tasks = await build_tasks_block(
+                self.tasks_dir, self.definition.config.tasks
+            )
+        except Exception:
+            log.exception("tasks block build failed; injecting nothing")
+            self._cached_tasks = ""
+        try:
             ev = await self._record(user_message(content))
             yield ev
             async for out in self._run_until_end():
@@ -133,6 +158,7 @@ class AgentRuntime:
             self.is_running = False
             self.current_activity = ""
             self._cached_preamble = ""
+            self._cached_tasks = ""
 
     # ── internal ─────────────────────────────────────────────────────────────
 
@@ -323,24 +349,33 @@ class AgentRuntime:
 
         # Permission gate.
         decision = self.gate.evaluate(tool_instance, args_model)
+        allowed, rule, reason = decision.allowed, decision.rule, decision.reason
+        # Interactive confirm (ADR-0006): a tentative decision is upgraded by
+        # asking the attached user. With no broker the tentative deny stands.
+        if decision.needs_prompt and self.decision_broker is not None:
+            choice = await self.decision_broker.ask(
+                kind="permission",
+                prompt=f"Allow {call.name}? {_args_preview(args_model)}",
+                options=["approve", "deny"],
+                payload={"tool_name": call.name, "call_id": call.id},
+                decline="deny",
+            )
+            allowed = choice == "approve"
+            reason = f"user {'approved' if allowed else 'declined'} (ask mode)"
         await self._record(
             Event(
-                kind=EventKind.PERMISSION_GRANTED
-                if decision.allowed
-                else EventKind.PERMISSION_DENIED,
+                kind=EventKind.PERMISSION_GRANTED if allowed else EventKind.PERMISSION_DENIED,
                 payload={
                     "tool_name": call.name,
                     "call_id": call.id,
-                    "rule": decision.rule,
-                    "reason": decision.reason,
+                    "rule": rule,
+                    "reason": reason,
                 },
             )
         )
-        if not decision.allowed:
+        if not allowed:
             ev_err = await self._record(
-                tool_result(
-                    call.id, call.name, f"permission denied: {decision.reason}", is_error=True
-                )
+                tool_result(call.id, call.name, f"permission denied: {reason}", is_error=True)
             )
             yield ev_err
             return
@@ -352,10 +387,12 @@ class AgentRuntime:
             eonlet_id=self.eonlet_id,
             workspace=self.workspace,
             memory_dir=self.memory_dir,
+            tasks_dir=self.tasks_dir,
             skills=self.definition.skills,
             env=dict(self.definition.config.env.defaults),
             scheduler=self.scheduler,
             record_event=self._record,
+            http_fetcher=self.http_fetcher,
             extra=extra,
         )
         try:
@@ -386,8 +423,8 @@ class AgentRuntime:
 
         cfg = self.definition.config.memory
         watermark = current_watermark(self.memory_dir) if cfg.enabled else 0
-        budget = cfg.conversation.working_memory_tokens
-        min_keep = cfg.conversation.keep_recent_messages_min
+        budget = cfg.episodic.working_memory_tokens
+        min_keep = cfg.episodic.keep_recent_messages_min
 
         # Filter messages older than the watermark first — they are STM now.
         eligible = [m for m in self.state.messages if m.event_id is None or m.event_id > watermark]
@@ -408,12 +445,18 @@ class AgentRuntime:
         while selected and selected[0].role == "tool":
             selected.pop(0)
 
+        from ..memory.injection import prefix_user_timestamp
+
+        stamp = cfg.enabled and cfg.inject_turn_timestamps
         out: list[LLMMessage] = []
         for m in selected:
+            content = (
+                prefix_user_timestamp(m.content, m.ts) if stamp and m.role == "user" else m.content
+            )
             out.append(
                 LLMMessage(
                     role=m.role,
-                    content=m.content,
+                    content=content,
                     tool_calls=[
                         LLMToolCall(id=tc["id"], name=tc["name"], arguments=tc.get("args", {}))
                         for tc in m.tool_calls
@@ -434,6 +477,8 @@ class AgentRuntime:
             parts.append("\n".join(lines))
         if self._cached_preamble:
             parts.append(self._cached_preamble)
+        if self._cached_tasks:
+            parts.append(self._cached_tasks)
         return "\n\n".join(parts)
 
     # ── event recording ──────────────────────────────────────────────────────
@@ -458,3 +503,16 @@ class AgentRuntime:
             except Exception:
                 log.exception("event listener raised; continuing")
         return stored
+
+
+# ── module helpers ───────────────────────────────────────────────────────────
+
+
+def _args_preview(args: Any, limit: int = 120) -> str:
+    """Short one-line rendering of validated tool args for a confirm prompt."""
+    try:
+        data = args.model_dump() if hasattr(args, "model_dump") else dict(args)
+    except Exception:
+        return ""
+    s = ", ".join(f"{k}={v!r}" for k, v in data.items())
+    return s if len(s) <= limit else s[: limit - 1] + "…"

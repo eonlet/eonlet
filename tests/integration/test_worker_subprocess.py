@@ -161,10 +161,14 @@ def test_worker_boots_and_echoes_via_streaming(
     anyio.run(with_timeout)
 
     # Fake provider chunks into 3 pieces; check 1+ deltas arrived and concat matches.
+    # The user turn is prefixed with a local-datetime tag (ADR-0006) before the
+    # fake provider echoes it, so assert structure rather than the exact string.
     assert len(deltas) >= 1
-    assert "".join(deltas) == "echo: hi"
+    joined = "".join(deltas)
+    assert joined.startswith("echo:")
+    assert joined.endswith("hi")
     assert final_msg is not None
-    assert final_msg["payload"]["content"] == "echo: hi"
+    assert final_msg["payload"]["content"] == joined
     assert final_msg["payload"]["tool_calls"] == []
 
 

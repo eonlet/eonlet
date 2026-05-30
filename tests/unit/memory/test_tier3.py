@@ -83,7 +83,7 @@ def _seed_ltm(store: LTMStore, n: int = 5) -> None:
     for i in range(n):
         anyio.run(
             lambda i=i: store.append_bullet(
-                "fact", f"fact number {i} " + "x" * 50, "implicit", "2026-05-22"
+                "episodic", f"fact number {i} " + "x" * 50, "implicit", "2026-05-22"
             )
         )
 
@@ -91,13 +91,13 @@ def _seed_ltm(store: LTMStore, n: int = 5) -> None:
 def _over_budget_cfg() -> MemoryConfig:
     # long_term_tokens=64 (minimum) ensures a moderately sized LTM is over budget.
     return MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 64, "long_term_tokens": 64}}
+        {"episodic": {"working_memory_tokens": 64, "long_term_tokens": 64}}
     )
 
 
 def _under_budget_cfg() -> MemoryConfig:
     return MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 64, "long_term_tokens": 99999}}
+        {"episodic": {"working_memory_tokens": 64, "long_term_tokens": 99999}}
     )
 
 
@@ -116,9 +116,9 @@ def test_prompt_includes_ltm_text() -> None:
 
 _GOOD_RESP: dict[str, Any] = {
     "kept_bullets": [
-        {"section": "fact", "content": "kept fact", "src": "implicit", "ts": "2026-05-22"}
+        {"section": "episodic", "content": "kept fact", "src": "implicit", "ts": "2026-05-22"}
     ],
-    "dropped_bullets": [{"section": "fact", "preview": "dropped fact", "reason": "stale"}],
+    "dropped_bullets": [{"section": "episodic", "preview": "dropped fact", "reason": "stale"}],
 }
 
 
@@ -158,7 +158,7 @@ def test_run_tier3_no_op_when_ltm_empty(tmp_path: Path) -> None:
 
 def test_run_tier3_no_op_when_under_budget(tmp_path: Path) -> None:
     store = LTMStore(tmp_path)
-    anyio.run(lambda: store.append_bullet("fact", "something", "implicit", "2026-05-22"))
+    anyio.run(lambda: store.append_bullet("episodic", "something", "implicit", "2026-05-22"))
     cfg = _under_budget_cfg()
     out = anyio.run(
         lambda: run_tier3(memory_dir=tmp_path, cfg=cfg, provider=_StaticProvider(_GOOD_RESP))
@@ -173,13 +173,13 @@ def test_run_tier3_rewrites_ltm(tmp_path: Path) -> None:
     good_resp: dict[str, Any] = {
         "kept_bullets": [
             {
-                "section": "fact",
+                "section": "episodic",
                 "content": "consolidated fact",
                 "src": "implicit",
                 "ts": "2026-05-22",
             }
         ],
-        "dropped_bullets": [{"section": "fact", "preview": "dropped", "reason": "stale"}],
+        "dropped_bullets": [{"section": "episodic", "preview": "dropped", "reason": "stale"}],
     }
     cfg = _over_budget_cfg()
     out = anyio.run(
@@ -271,7 +271,9 @@ def test_run_tier3_dropped_digest_in_event(tmp_path: Path) -> None:
 
     good_resp: dict[str, Any] = {
         "kept_bullets": [],
-        "dropped_bullets": [{"section": "fact", "preview": "DROPPED-PREVIEW", "reason": "stale"}],
+        "dropped_bullets": [
+            {"section": "episodic", "preview": "DROPPED-PREVIEW", "reason": "stale"}
+        ],
     }
     captured: list[Event] = []
 

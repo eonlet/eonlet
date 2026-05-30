@@ -7,17 +7,20 @@ provider received via a side-channel.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import anyio
+from pydantic import BaseModel
 
 from eonlet.config import load_agent_config
 from eonlet.llm.protocol import (
     DoneChunk,
     LLMMessage,
     LLMResponse,
+    LLMToolCall,
     StreamChunk,
     TextChunk,
 )
@@ -25,8 +28,51 @@ from eonlet.memory.watermark import write_watermark
 from eonlet.permissions import PermissionGate
 from eonlet.runtime.agent import AgentRuntime
 from eonlet.runtime.definition import Definition
+from eonlet.runtime.events import EventKind
 from eonlet.runtime.store import EventStore
 from eonlet.tools import builtin as _builtin  # noqa: F401  (register builtin tools)
+from eonlet.tools.protocol import ToolAnnotations, ToolContext, ToolResult
+from eonlet.tools.registry import get_registry
+
+
+class _DestructiveArgs(BaseModel):
+    x: str = "y"
+
+
+class _FakeDestructiveTool:
+    name = "_test_destructive"
+    description = "a destructive no-op tool for permission tests"
+    input_schema = _DestructiveArgs
+    annotations = ToolAnnotations(destructive=True)
+
+    async def __call__(self, args: _DestructiveArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult(content="ran")
+
+
+def _ensure_destructive_tool() -> None:
+    reg = get_registry()
+    if not reg.has("_test_destructive"):
+        reg.register(_FakeDestructiveTool())
+
+
+class _FakeBroker:
+    """Stand-in decision broker that returns a canned answer."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.asked: list[tuple[str, str]] = []
+
+    async def ask(
+        self,
+        *,
+        kind: str,
+        prompt: str,
+        options: list[str],
+        payload: dict[str, Any] | None = None,
+        decline: str = "deny",
+    ) -> str:
+        self.asked.append((kind, prompt))
+        return self.answer
 
 
 class _Recorder:
@@ -92,7 +138,7 @@ def _build_runtime(tmp_path: Path) -> tuple[AgentRuntime, _Recorder]:
         "    - sleep\n"
         "memory:\n"
         "  enabled: true\n"
-        "  conversation:\n"
+        "  episodic:\n"
         "    working_memory_tokens: 1024\n"
         "    keep_recent_messages_min: 1\n"
     )
@@ -131,6 +177,34 @@ def test_system_prompt_contains_memory_preamble(tmp_path: Path) -> None:
     anyio.run(go)
     assert "<memory>" in rec.last_system
     assert "LTM-MARKER" in rec.last_system
+
+
+def test_user_turn_timestamped_by_default(tmp_path: Path) -> None:
+    runtime, rec = _build_runtime(tmp_path)
+
+    async def go() -> None:
+        async for _ in runtime.handle_user_message("hello world"):
+            pass
+
+    anyio.run(go)
+    users = [m for m in rec.last_messages if m.role == "user"]
+    assert users
+    assert users[-1].content.endswith(" hello world")
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} [+-]\d{2}:\d{2}\] ", users[-1].content)
+
+
+def test_user_turn_not_timestamped_when_disabled(tmp_path: Path) -> None:
+    runtime, rec = _build_runtime(tmp_path)
+    runtime.definition.config.memory.inject_turn_timestamps = False
+
+    async def go() -> None:
+        async for _ in runtime.handle_user_message("hello world"):
+            pass
+
+    anyio.run(go)
+    users = [m for m in rec.last_messages if m.role == "user"]
+    assert users
+    assert users[-1].content == "hello world"
 
 
 def test_no_preamble_when_subsystem_disabled(tmp_path: Path) -> None:
@@ -215,3 +289,70 @@ def test_recent_window_filters_out_messages_below_watermark(tmp_path: Path) -> N
     user_msgs = [m for m in rec.last_messages if m.role == "user"]
     assert all("ping" not in m.content for m in user_msgs)
     assert any("new-pivot" in m.content for m in user_msgs)
+
+
+# ── interactive permission confirm (ADR-0006 M2) ────────────────────────────
+
+
+def test_destructive_tool_prompts_then_approves(tmp_path: Path) -> None:
+    _ensure_destructive_tool()
+    runtime, _ = _build_runtime(tmp_path)  # gate is ask-mode + session_attached
+    broker = _FakeBroker("approve")
+    runtime.decision_broker = broker
+    call = LLMToolCall(id="c1", name="_test_destructive", arguments={"x": "y"})
+
+    events: list[Any] = []
+
+    async def go() -> None:
+        async for ev in runtime._execute_tool_call(call):
+            events.append(ev)
+
+    anyio.run(go)
+    assert broker.asked and broker.asked[0][0] == "permission"
+    # Permission events are recorded (not yielded) — inspect the store.
+    stored = [e.kind for e in runtime.store.read()]
+    assert EventKind.PERMISSION_GRANTED in stored
+    # Approved → the tool ran (its TOOL_RESULT is yielded).
+    results = [e for e in events if e.kind == EventKind.TOOL_RESULT]
+    assert results and results[-1].payload.get("output") == "ran"
+
+
+def test_destructive_tool_prompts_then_denies(tmp_path: Path) -> None:
+    _ensure_destructive_tool()
+    runtime, _ = _build_runtime(tmp_path)
+    broker = _FakeBroker("deny")
+    runtime.decision_broker = broker
+    call = LLMToolCall(id="c1", name="_test_destructive", arguments={"x": "y"})
+
+    events: list[Any] = []
+
+    async def go() -> None:
+        async for ev in runtime._execute_tool_call(call):
+            events.append(ev)
+
+    anyio.run(go)
+    assert broker.asked  # user was still asked
+    stored = [e.kind for e in runtime.store.read()]
+    assert EventKind.PERMISSION_DENIED in stored
+    # Declined → the tool did NOT run; the yielded result is the denial error.
+    errs = [e for e in events if e.kind == EventKind.TOOL_ERROR]
+    assert errs and "permission denied" in (errs[-1].payload.get("output") or "")
+
+
+def test_destructive_tool_denied_without_broker(tmp_path: Path) -> None:
+    # No broker (headless/test) → a needs_prompt decision falls back to deny.
+    _ensure_destructive_tool()
+    runtime, _ = _build_runtime(tmp_path)
+    runtime.decision_broker = None
+    call = LLMToolCall(id="c1", name="_test_destructive", arguments={"x": "y"})
+
+    events: list[Any] = []
+
+    async def go() -> None:
+        async for ev in runtime._execute_tool_call(call):
+            events.append(ev)
+
+    anyio.run(go)
+    assert EventKind.PERMISSION_DENIED in [e.kind for e in runtime.store.read()]
+    errs = [e for e in events if e.kind == EventKind.TOOL_ERROR]
+    assert errs and "permission denied" in (errs[-1].payload.get("output") or "")

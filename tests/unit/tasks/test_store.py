@@ -1,4 +1,4 @@
-"""TodosStore round-trip + JSONL persistence (MEMORY_SPEC §2.4 / §5.4)."""
+"""TaskStore round-trip + JSONL persistence (ADR-0005; was TodosStore)."""
 
 from __future__ import annotations
 
@@ -8,16 +8,16 @@ from pathlib import Path
 import anyio
 import pytest
 
-from eonlet.memory.todos import TodosStore
+from eonlet.tasks import TaskStore
 
 
 def test_add_then_list_pending(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
-        await store.add(id="todo-1", content="do a thing")
-        pending = await store.list_todos(status="pending")
-        assert [t.id for t in pending] == ["todo-1"]
+        await store.add(id="task-1", content="do a thing")
+        pending = await store.list_tasks(status="pending")
+        assert [t.id for t in pending] == ["task-1"]
         assert pending[0].status == "pending"
         assert pending[0].created_at  # ISO timestamp present
 
@@ -25,7 +25,7 @@ def test_add_then_list_pending(tmp_path: Path) -> None:
 
 
 def test_done_transitions_status_and_records_time(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="t", content="x")
@@ -36,22 +36,33 @@ def test_done_transitions_status_and_records_time(tmp_path: Path) -> None:
     anyio.run(go)
 
 
+def test_cancel_transitions_status(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path)
+
+    async def go() -> None:
+        await store.add(id="t", content="x")
+        cancelled = await store.mark_cancelled(id="t")
+        assert cancelled.status == "cancelled"
+
+    anyio.run(go)
+
+
 def test_list_status_filter(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="a", content="A")
         await store.add(id="b", content="B")
         await store.mark_done(id="b")
-        assert {t.id for t in await store.list_todos(status="pending")} == {"a"}
-        assert {t.id for t in await store.list_todos(status="done")} == {"b"}
-        assert {t.id for t in await store.list_todos(status="all")} == {"a", "b"}
+        assert {t.id for t in await store.list_tasks(status="pending")} == {"a"}
+        assert {t.id for t in await store.list_tasks(status="done")} == {"b"}
+        assert {t.id for t in await store.list_tasks(status="all")} == {"a", "b"}
 
     anyio.run(go)
 
 
 def test_update_fields(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="t", content="old", tags=["a"])
@@ -66,7 +77,7 @@ def test_update_fields(tmp_path: Path) -> None:
 
 
 def test_delete(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="t", content="x")
@@ -77,7 +88,7 @@ def test_delete(tmp_path: Path) -> None:
 
 
 def test_jsonl_format_on_disk(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="t1", content="a")
@@ -101,17 +112,17 @@ def test_corrupt_lines_skipped_on_read(tmp_path: Path) -> None:
         '{"id":"good2","content":"y","status":"pending"}\n',
         encoding="utf-8",
     )
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
-        todos = await store.list_todos(status="all")
-        assert {t.id for t in todos} == {"good", "good2"}
+        tasks = await store.list_tasks(status="all")
+        assert {t.id for t in tasks} == {"good", "good2"}
 
     anyio.run(go)
 
 
 def test_add_rejects_duplicate_id(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         await store.add(id="dup", content="x")
@@ -122,7 +133,7 @@ def test_add_rejects_duplicate_id(tmp_path: Path) -> None:
 
 
 def test_mark_done_missing_raises(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
         with pytest.raises(KeyError):
@@ -135,10 +146,10 @@ def test_unknown_status_in_file_falls_back_to_pending(tmp_path: Path) -> None:
     (tmp_path / "todos.jsonl").write_text(
         '{"id":"t","content":"x","status":"???"}\n', encoding="utf-8"
     )
-    store = TodosStore(tmp_path)
+    store = TaskStore(tmp_path)
 
     async def go() -> None:
-        todos = await store.list_todos(status="pending")
-        assert [t.id for t in todos] == ["t"]
+        tasks = await store.list_tasks(status="pending")
+        assert [t.id for t in tasks] == ["t"]
 
     anyio.run(go)

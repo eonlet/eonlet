@@ -33,6 +33,7 @@ def _ctx(tmp_path: Path, idx: RecallIndex) -> tuple[ToolContext, list[Event]]:
         eonlet_id="t.x",
         workspace=tmp_path,
         memory_dir=tmp_path,
+        tasks_dir=tmp_path,
         skills={},
         env={},
         record_event=record,
@@ -121,41 +122,45 @@ def test_around_event_missing_id_errors(tmp_path: Path) -> None:
     idx.close()
 
 
-def test_includes_notes_in_keyword_mode(tmp_path: Path) -> None:
-    from eonlet.memory.notes import NotesStore
+def test_includes_knowledge_in_keyword_mode(tmp_path: Path) -> None:
+    from eonlet.memory.knowledge import KnowledgeStore
 
     idx = RecallIndex(tmp_path)
-    # No events match, but a note does.
-    store = NotesStore(tmp_path)
-    anyio.run(lambda: store.add(id="n1", content="reminder about AAPL"))
+    # No events match, but a knowledge file does.
+    store = KnowledgeStore(tmp_path)
+    anyio.run(
+        lambda: store.write(
+            path="reminders.md", content="reminder about AAPL", index_line="ticker reminders"
+        )
+    )
     ctx, _ = _ctx(tmp_path, idx)
 
     async def go() -> None:
         out = await RecallTool()(
-            RecallArgs(mode="by_keyword", query="AAPL", include=["events", "notes"]),
+            RecallArgs(mode="by_keyword", query="AAPL", include=["events", "knowledge"]),
             ctx,
         )
-        assert "notes hits" in out.content
-        assert "reminder about AAPL" in out.content
+        assert "knowledge hits" in out.content
+        assert "reminders.md" in out.content
 
     anyio.run(go)
     idx.close()
 
 
-def test_includes_todos_in_keyword_mode(tmp_path: Path) -> None:
-    from eonlet.memory.todos import TodosStore
+def test_includes_tasks_in_keyword_mode(tmp_path: Path) -> None:
+    from eonlet.tasks import TaskStore
 
     idx = RecallIndex(tmp_path)
-    tstore = TodosStore(tmp_path)
+    tstore = TaskStore(tmp_path)
     anyio.run(lambda: tstore.add(id="t1", content="check the AAPL filing"))
     ctx, _ = _ctx(tmp_path, idx)
 
     async def go() -> None:
         out = await RecallTool()(
-            RecallArgs(mode="by_keyword", query="AAPL", include=["events", "todos"]),
+            RecallArgs(mode="by_keyword", query="AAPL", include=["events", "tasks"]),
             ctx,
         )
-        assert "todos hits" in out.content
+        assert "tasks hits" in out.content
         assert "AAPL filing" in out.content
 
     anyio.run(go)

@@ -9,7 +9,7 @@
 | Owner | Ziyu |
 | Started | 2026-05-26 |
 | Target | v0.1.0 |
-| Status | Not started — ADR-0004 just landed |
+| Status | **Shipped 2026-05-28 (v0.0.7).** M1–M3 merged; ADR-0004 Accepted. 48h canary dogfood is owner-handled outside the implementation window. |
 | Estimated effort | 2–3 working days, single committer |
 
 ## Why this plan exists
@@ -43,7 +43,32 @@ M2  Tavily + DDG + tool rewrites + config + events (≈ 1 day)
 M3  x-digest feed tool + docs + legacy removal     (≈ 0.5 day + dogfood)
 ```
 
-Three milestones, three PRs (or three commit groups).
+Three milestones, three PRs.
+
+### Suggested PR shape
+
+```
+PR1 (M1) — feat(web): HTTPFetcher + SSRF + extract_html + pagination
+  - New: src/eonlet/web/{ssrf,transport,fetch,pagination}.py
+  - New dep: trafilatura (kept as its own commit for rollback)
+  - Tests + fixtures under tests/unit/web/ and tests/fixtures/web/html/
+  - Coverage ≥80% on src/eonlet/web/
+  - No call sites changed; tools/builtin/web.py untouched
+
+PR2 (M2) — feat(web): rewrite web_search + web_fetch tool bodies
+  - ToolContext gains `http_fetcher: HTTPFetcher | None`
+  - Worker startup constructs the singleton and threads it through
+  - Two new EventKind variants: WEB_SEARCH_PERFORMED, WEB_FETCH_PERFORMED
+  - WebFetchConfig added to AgentConfig (`agent.yaml: web.fetch`)
+  - Three bundled templates pass their smoke tests unchanged
+
+PR3 (M3) — feat(x-digest): feed_read.py + docs + ADR-0004 → Accepted
+  - templates/x-digest/tools/feed_read.py (new file)
+  - Docs: TOOL_SPEC.md, AGENT_CONFIG_SPEC.md, SECURITY.md, CLAUDE.md,
+    CHANGELOG.md
+  - ADR-0004 status: Proposed → Accepted (shipped in v0.1.0)
+  - 48h canary dogfood with three real feeds
+```
 
 ---
 
@@ -69,8 +94,13 @@ Three milestones, three PRs (or three commit groups).
   Plus `extract_text(raw, ctype, url)` for `text/*` and `application/json`.
 - `src/eonlet/web/pagination.py` — `paginate(text, offset_tokens, max_tokens)`
   returning `PaginatedSlice`. Uses the existing `memory/tokens.py` counter.
-- Add `trafilatura` to `pyproject.toml`. (Only new runtime dep in this whole
-  upgrade.)
+- Add `trafilatura` to `pyproject.toml`. (Only new *direct* runtime dep in
+  this whole upgrade. Verified 2026-05-28: pulls 10 transitive packages
+  totalling ~17 MB of wheels — lxml 5 MB and babel 10 MB dominate; all
+  others combined are ~2 MB. All licenses compatible — Apache 2.0 / BSD /
+  MIT, with `tld` offering MPL-1.1 OR GPL-2.0 OR LGPL-2.1+ which we use
+  under the LGPL or MPL terms. No source compilation required: lxml ships
+  manylinux2014 wheels for cp311–cp313.)
 
 ### Tests (`tests/unit/web/`)
 
@@ -156,10 +186,12 @@ Three milestones, three PRs (or three commit groups).
 
 ### Scope
 
-- **`x-digest` template gains a per-agent custom tool.**
+- **`x-digest` template gains a new per-agent custom tool** (addition, not
+  migration — see clarification A above).
   `src/eonlet/templates/x-digest/tools/feed_read.py` (~30 LOC `feedparser`
   wrapper). Returns top-N entries as `[{title, url, summary, published_at}]`.
-  Update `templates/x-digest/agent.yaml` to declare it.
+  Update `templates/x-digest/agent.yaml` to declare it (kept alongside the
+  existing `x_timeline.py`; the user can pick which to schedule against).
   - This becomes the canonical example of "how to extend Eonlet's web
     capabilities with a custom tool." Documented as such in `TOOL_SPEC.md`.
 - **Documentation:**
@@ -223,21 +255,106 @@ src/eonlet/templates/x-digest/tests/fixtures/
 This co-location matters: it reinforces that feed parsing is **a template
 concern, not a runtime concern**.
 
-## Open questions (resolve as implementation proceeds)
+## Resolved decisions (closed 2026-05-28)
 
-1. **SSRF policy location.** Currently `web/ssrf.py`. If a generic network-
-   egress policy emerges for `send_email` recipient whitelisting or future
-   MCP transports, promote into `permissions/`. Not before.
-2. **Should DDG fallback emit a warning event when used?** Lean yes — emit
-   a `WEB_SEARCH_FALLBACK` event so `eonlet replay` makes the fragile path
-   visible. Decide during M2.
-3. **`include_raw_content=True` with DDG.** DDG can't provide raw content.
-   Current draft: silently ignore. Consider returning a typed warning in
-   `structured_output`. Decide during M2.
-4. **PDF / MCP guidance docs.** When v0.2 MCP lands, the "use an MCP server"
-   subsection in `TOOL_SPEC.md` needs concrete pointers (e.g.
-   `mcp-server-fetch`, `mcp-server-pdf`). Out of scope here; tracked for
-   v0.2.
+The four "open questions" from the original draft are now resolved. Captured
+here so the implementation PRs don't relitigate them.
+
+1. **SSRF policy location — keep in `web/ssrf.py`.**
+   Only one egress caller exists (`HTTPFetcher`). Per CLAUDE.md
+   ("three similar lines is better than a premature abstraction"), promotion
+   into `permissions/` waits for a second caller (likely v0.2 MCP transport
+   or `send_email` recipient policy). The helpers are pure functions over
+   `ipaddress.ip_address` and trivially re-exportable when that day comes.
+
+2. **DDG fallback signalling — provider field, no new event.**
+   The `WEB_SEARCH_PERFORMED` event's `provider` field (`"tavily"` |
+   `"ddg"`) already makes the fragile path visible to `eonlet replay`.
+   Do **not** add a separate `WEB_SEARCH_FALLBACK` variant — `EventKind` is
+   already 37 members and the information is recoverable from one filter.
+
+3. **`include_raw_content=True` with DDG — silent + structured warning.**
+   The flag is silently honoured as best-effort (DDG never populates
+   `raw_content`). The tool surfaces this via
+   `structured_output["warnings"] = ["raw_content_unavailable_on_ddg"]` so
+   the LLM can decide whether to chain a follow-up `web_fetch`. No
+   exception, no `is_error=True` — DDG fallback already implies degraded
+   quality.
+
+4. **PDF / MCP guidance docs — placeholder in M3, expand at v0.2.**
+   M3's `TOOL_SPEC.md` rewrite includes the "When the built-in isn't
+   enough" subsection with a `> TODO(v0.2): link to mcp-server-fetch /
+   mcp-server-pdf once MCP integration lands` line. Concrete pointers wait
+   until MCP ships and we know which servers are battle-tested.
+
+## Implementation deviations from ADR-0004 (clarifications)
+
+These are not changes to the design — they're places where the ADR's prose
+was slightly ahead of the code. Each is a small correction that makes the
+PRs easier to write and review.
+
+### A. x-digest's `feed_read.py` is an **addition**, not a migration
+
+ADR-0004 and the earlier draft of this plan implied that `x-digest`
+currently has runtime-level RSS handling that the v0.1 upgrade pushes into
+the template. **Not true.** The shipped `x-digest` template fetches its
+content via a per-template `x_timeline.py` (X/Twitter API v2 endpoint) and
+has no RSS path. Therefore M3's deliverable is reframed as:
+
+> Add `templates/x-digest/tools/feed_read.py` as the canonical example of
+> "how to extend Eonlet's web capabilities with a custom tool." It is not
+> required for the existing `x-digest` schedule to keep working.
+
+This matters because the M3 acceptance criterion "x-digest runs against a
+real RSS feed" is then an *opt-in demo path*, not a regression check on the
+template's primary behaviour.
+
+### B. `HTTPFetcher` injection — extend `ToolContext`, do not use `extra`
+
+The ADR says "Inject `HTTPFetcher` as a worker-level singleton via
+`ToolContext.deps`." `ToolContext` has no `deps` attribute today (see
+`src/eonlet/tools/protocol.py` — there is only `extra: dict[str, Any]`).
+
+**Decision:** add a typed field, do not piggyback on `extra`.
+
+```python
+# src/eonlet/tools/protocol.py
+@dataclass(slots=True)
+class ToolContext:
+    ...
+    http_fetcher: HTTPFetcher | None = None  # set by worker startup
+```
+
+Rationale: this is a long-lived dependency, not transient runtime state. A
+typed field keeps mypy strict happy and makes the wiring discoverable. The
+`None` default preserves backwards compatibility for the few test sites
+that construct `ToolContext` directly without a worker.
+
+Tools that need it call `assert ctx.http_fetcher is not None` at the top
+and raise the project's `RuntimeError` subclass on the `None` path. (Tools
+in the agent loop will always have it; standalone unit tests for tools
+that don't exercise HTTP can leave it `None`.)
+
+### C. `WEB_FETCH_PERFORMED` payload — add `bytes_in` and `offset_tokens`
+
+ADR-0004 specifies `{url, content_type, total_tokens, truncated, error?}`.
+For dogfood-period debugging (especially "why did this page truncate at N
+tokens?") add two summary fields:
+
+```python
+{
+    "url": str,
+    "content_type": str,
+    "bytes_in": int,         # raw response size before extraction
+    "offset_tokens": int,    # caller-supplied pagination offset
+    "total_tokens": int,
+    "truncated": bool,
+    "error": str | None,
+}
+```
+
+Still summary-only; the full markdown body stays in the `TOOL_RESULT`
+event.
 
 ## What this plan deliberately does **not** include
 
@@ -260,14 +377,17 @@ The first three are user-facing capability cuts and must be reflected in
 the README's "what's included / what's not" table. The rest are internal
 abstractions we don't need yet.
 
-## Acceptance — plan complete when
+## Acceptance — status as of 2026-05-28
 
-- All three milestones merged.
-- ADR-0004 status updated to Accepted.
-- All three templates pass a manual smoke: search → fetch → summarize.
-- `x-digest` template runs successfully against a real RSS feed using its
-  per-template `feed_read.py`.
-- `docs/TOOL_SPEC.md` includes the "When the built-in isn't enough"
-  subsections under both tool entries.
-- README quickstart still works on a fresh machine with only
-  `TAVILY_API_KEY` set.
+| Criterion | Status |
+|---|---|
+| All three milestones merged | ✅ M1 + M2 + M3 landed in v0.0.7 |
+| ADR-0004 status flipped to Accepted | ✅ |
+| Three templates pass manual smoke (search → fetch → summarize) | ⏳ owner-handled dogfood |
+| `x-digest` runs against a real RSS feed via `feed_read.py` | ⏳ owner-handled dogfood |
+| `docs/TOOL_SPEC.md` has the "When the built-in isn't enough" subsections | ✅ §6.7 + §6.8 |
+| README quickstart works on a fresh machine with only `TAVILY_API_KEY` | ⏳ owner-handled dogfood |
+| 48 h `x-digest` feed canary | ⏳ owner-handled dogfood |
+
+The remaining ⏳ items are dogfood activities owned by the maintainer
+outside the engineering window. Engineering completion: **done.**

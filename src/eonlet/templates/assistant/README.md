@@ -5,9 +5,9 @@ The default agent template that ships with Eonlet. A persistent, conversational 
 ## What it does
 
 - Conversational, like a colleague
-- Keeps a free-form journal (`memory/notes.md`) and active task list (`memory/todo.md`)
+- Curates a knowledge base (the `knowledge` tool) and tracks follow-ups (the `task` tool)
 - Has access to filesystem, web, and shell tools (with permission prompts)
-- Builds up context over time — remembers what you've discussed before
+- Builds up context over time — its conversation timeline is auto-summarized into long-term memory
 
 ## What it's good for
 

@@ -38,7 +38,7 @@ The goal of Phase A is one eonlet so good that the author lives inside it daily,
 - [x] **Environment variable handling** (declared in `env.required`, validated at startup) — v0.0.1
 - [x] Permission system: `ask` + `yolo` modes + hardcoded deny list — v0.0.1
 - [x] Three production-quality example agents: `assistant`, `x-digest`, `portfolio` — v0.0.3
-- [ ] **Web tools — serious design** (provider abstraction + structured fetch pipeline) — see [ADR-0004](docs/adr/0004-web-tools.md) and [`plans/web-tools.md`](docs/plans/web-tools.md). Promoted into v0.1 scope on 2026-05-26 because reliable `web_search`/`web_fetch` is the foundation of autonomous research, which is one of v0.1's promised user stories.
+- [x] **Web tools — serious design** (SSRF-guarded fetch, trafilatura HTML→markdown, Tavily/DDG search, token pagination) — shipped in v0.0.7 per [ADR-0004](docs/adr/0004-web-tools.md). Scope was reduced from the original "provider abstraction + full extractor pipeline" to a deliberately minimal floor; see [`plans/web-tools.md`](docs/plans/web-tools.md) and the ADR for the rationale.
 - [ ] Complete `docs/` site (concepts, tutorial, reference)
 - [ ] 30-second demo GIF in README
 
@@ -46,54 +46,81 @@ The goal of Phase A is one eonlet so good that the author lives inside it daily,
 
 **Engineering surplus already delivered beyond original v0.1 scope:** LLM streaming (v0.0.4), `FakeProvider` + worker integration tests + mypy/ruff strict + ≥72.6% branch coverage (v0.0.5), full memory subsystem (v0.0.6, originally a v0.2 item). Remaining v0.1 work is mostly non-engineering (PyPI release, demo GIF, two-week dogfood) plus the web-tools upgrade.
 
-### v0.2.0 — Polish (Month 3–4)
+### v0.2.0 — Extensibility closure (Month 3–4)
 
-**Goal:** make v0.1 not just usable but pleasant.
+**Goal:** close the "this runtime is plumbing" loop. After v0.2, adding a
+capability to an eonlet should never require patching the runtime.
 
 - [ ] MCP integration (client mode — connect to external MCP servers)
-- [ ] sqlite-vec semantic memory + `memory_save` / `memory_search` tools
 - [ ] Hooks (`pre_tool_use`, `post_tool_use`, `on_error`)
 - [ ] Permission allow/deny patterns + `read_only` and `plan` modes
+
+**Why these three together:** MCP gives external tool reach, hooks give
+in-process interception, permission patterns give the safety surface that
+makes both safe to ship. Without one, the other two are awkward to use.
+
+**Done condition:** at least one external MCP server (e.g.,
+`mcp-server-pdf`) is documented as the *recommended* path for a capability
+that used to require a runtime PR.
+
+### v0.3.0 — UX & memory v2 (Month 5–6)
+
+**Goal:** the daily-driver experience that turns one-week trials into
+permanent users.
+
+- [ ] sqlite-vec semantic memory + `memory_save` / `memory_search` tools
+      (lives alongside the v0.0.6 keyword recall, not as a replacement —
+      see [ADR-0003](docs/adr/0003-memory-system.md) §"Forward-compat
+      for vector memory")
 - [ ] textual TUI for `eonlet attach` (split panes, progress bars, notes preview)
 - [ ] Multi-session attach (one master, multiple read-only followers)
 - [ ] Hibernate / resume (serialize state, free RAM)
 - [ ] OpenTelemetry tracing (default: Logfire)
 
-**Done condition:** v0.2 ships when v0.1 has stabilized — typically 4–6 weeks after v0.1.
+**Done condition:** v0.3 ships when v0.2 has stabilized — typically 4–6
+weeks after v0.2.
 
-### v0.3.0 — Public Launch (Month 5–6)
+### v0.4.0 — Public Launch (Month 7–8)
 
 **Goal:** Hacker News front page, ~3000 stars, ~10 external contributors.
 
 - [ ] 5-layer compaction (Claude Code style)
 - [ ] Skill marketplace / registry conventions
 - [ ] Framework adapter for smolagents (run smolagents inside eonlet)
-- [ ] Performance: 100 concurrent eonlets on one machine
+- [ ] Performance baseline: documented numbers for 10 / 50 / 100 concurrent eonlets
+      on one machine (raise the floor only after a real measurement;
+      "100 concurrent" stays as the stretch target, not a hard gate)
 - [ ] Polished documentation site (mkdocs-material on `eonlet.dev`)
 - [ ] 5+ technical blog posts published
 - [ ] Public launch on HN / Reddit / Twitter / lobste.rs
 
 **Done condition:** post-launch 30 days: stars > 2000, ≥10 contributor PRs merged.
 
-### v0.3.x — Stabilize (Month 7–8)
+### v0.4.x — Stabilize (Month 9–10)
 
-Bug fixes, performance, polish. No new features. Goal is to make v0.3 rock-solid before Phase B.
+Bug fixes, performance, polish. No new features. Goal is to make v0.4 rock-solid before Phase B.
 
-**Phase A → Phase B gate** (end of Month 8): unless v0.3 is widely used and stable, *do not* start Phase B. Continue polishing Phase A.
+**Phase A → Phase B gate** (end of Month 10): unless v0.4 is widely used and stable, *do not* start Phase B. Continue polishing Phase A.
+
+> **Note on Phase B+ timing.** The month markers from v0.5 onward are
+> *direction, not commitment.* Single-committer pace through supervisor +
+> RPC + teams + orgs + federation is empirically slower than the table
+> below suggests; treat the ordering as load-bearing and the dates as
+> rough.
 
 ## Phase B — Multi-Eonlet Runtime
 
 Only begin Phase B after Phase A is unambiguously successful (≥ 3000 stars, active community, no major instability).
 
-### v0.4.0 — Multi-Eonlet Basics (Month 9–10)
+### v0.5.0 — Multi-Eonlet Basics (Month 11–12)
 
 - [ ] Introduce `eonletd` supervisor daemon
 - [ ] Local eonlet discovery (registry maintained by supervisor)
 - [ ] Synchronous inter-eonlet RPC
 - [ ] `discover` and `topology` CLI commands
-- [ ] Migration path: v0.3 deployments work without changes; supervisor is opt-in
+- [ ] Migration path: v0.4 deployments work without changes; supervisor is opt-in
 
-### v0.5.0 — Inter-Eonlet Messaging (Month 11)
+### v0.6.0 — Inter-Eonlet Messaging (Month 13)
 
 - [ ] Asynchronous message mailbox
 - [ ] A2A protocol compatibility (agent card, JSON-RPC endpoints)
@@ -107,7 +134,7 @@ Only begin Phase B after Phase A is unambiguously successful (≥ 3000 stars, ac
 
 The first structural primitive above the individual eonlet. See [`docs/concepts/teams-and-organizations.md`](docs/concepts/teams-and-organizations.md) for the full vision.
 
-### v0.6.0 — Team Primitive (Month 12–13)
+### v0.7.0 — Team Primitive (Month 14–15)
 
 - [ ] `~/.eonlet/teams/<name>/team.yaml` schema
 - [ ] `eonlet team create / list / status / send / disband` commands
@@ -116,7 +143,7 @@ The first structural primitive above the individual eonlet. See [`docs/concepts/
 - [ ] Capability-based discovery within a team
 - [ ] Two bundled example teams (e.g., `research-and-write`, `news-curation`)
 
-### v0.7.0 — Team Patterns and Polish (Month 14)
+### v0.8.0 — Team Patterns and Polish (Month 16)
 
 - [ ] Lead-Worker pattern primitives (parallel delegation)
 - [ ] Pipeline pattern primitives (sequential handoff)
@@ -126,7 +153,7 @@ The first structural primitive above the individual eonlet. See [`docs/concepts/
 
 ## Phase D — Organizations (Trees of Teams)
 
-### v0.8.0 — Organization Primitive (Month 15–16)
+### v0.9.0 — Organization Primitive (Month 17–18)
 
 - [ ] `~/.eonlet/orgs/<name>/org.yaml` schema (tree of teams)
 - [ ] `eonlet org create / list / topology / send` commands
@@ -134,14 +161,14 @@ The first structural primitive above the individual eonlet. See [`docs/concepts/
 - [ ] Org-level resource arbitration
 - [ ] One bundled example org (e.g., `investment-office`)
 
-### v0.9.0 — Federation and Remote (Month 16–17)
+### v0.9.x — Federation and Remote (Month 19+)
 
 - [ ] Cross-machine peer list
 - [ ] Federated team discovery
 - [ ] Remote attach over TLS
 - [ ] Optional mDNS for LAN auto-discovery
 
-## 1.0.0 — Stable (Month 18+)
+## 1.0.0 — Stable (Month 20+)
 
 - [ ] API freeze; SemVer strict from here on
 - [ ] Third-party security audit

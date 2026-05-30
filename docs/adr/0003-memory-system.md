@@ -491,3 +491,50 @@ A conversation isn't a clean boundary. Time-and-topic-based STM sections
   config loader rather than warned-and-accepted. Project is pre-1.0 and the
   author owns all in-flight agents; backwards-compat warnings add cost
   without benefit.
+
+## Forward-compat for vector memory (v0.2)
+
+Added 2026-05-28. ROADMAP v0.3 commits to "sqlite-vec semantic memory
+that lives **alongside** the v0.0.6 keyword recall, not as a replacement."
+This section records the contract that future-vector-memory must respect,
+so the v0.3 implementer is not forced to redesign LTM or the recall API.
+
+### Invariants the LTM schema preserves for vector memory
+
+1. **Stable bullet IDs.** Every LTM bullet has an `id:` field. Vector
+   embeddings will key off this ID, not text content. Renaming or
+   restructuring LTM lines is allowed; *replacing* an ID is not.
+2. **`src:` field reflects provenance.** `src:explicit`, `src:tier2:<ev_id>`,
+   `src:migrate:claude-code` already differentiate write paths. Vector
+   memory adds `src:embed:<model>` *as a sibling*, not by mutating
+   existing entries.
+3. **Recall returns IDs the caller can dereference.** The `recall` tool's
+   structured output already includes the matched bullet/note/todo IDs.
+   The v0.3 `memory_search` tool will use the same ID schema so a
+   semantic hit can be passed directly to `forget` or `remember` without
+   re-resolving.
+4. **Tier-3 forgetting is text-only.** The v0.0.6 tier-3 LTM compaction
+   deletes bullets by ID. The vector store is responsible for honoring
+   `mem_ltm_forgotten` events and dropping the corresponding embeddings.
+   Tier-3 does *not* need to know vector embeddings exist.
+
+### What v0.3 may add, what it may not
+
+May add:
+
+- A `~/.eonlet/eonlets/<id>/memory/embeddings.db` (sqlite-vec) keyed by
+  the LTM bullet ID and note ID.
+- A `memory_search` tool that returns the same ID/snippet structure as
+  `recall`, with `provider: "vector"` in the structured output.
+- A `embedding_model:` field under the `memory:` block in `agent.yaml`
+  (already reserved per AGENT_CONFIG_SPEC §8 line 424).
+- A new `EventKind.MEM_EMBED_PROMOTED` / `MEM_EMBED_FORGOTTEN` pair so
+  the recall index and the vector index stay in sync.
+
+May NOT add (would break this ADR; needs a new ADR superseding it):
+
+- A change to the LTM bullet line format that drops or renames the `id:`
+  or `src:` fields.
+- A merged-by-default fusion that hides whether a hit came from
+  keyword or vector recall — the caller decides which surface to use.
+- Coupling tier-3 compaction to embedding similarity scoring.

@@ -39,6 +39,8 @@ from ..triggers.scheduler import (
     TriggerItem,
     build_trigger_message,
 )
+from ..web import HTTPFetcher
+from .decisions import DecisionBroker
 from .ipc import IPCServer
 from .lifecycle import (
     cleanup,
@@ -143,6 +145,8 @@ async def run_worker(
     )
     runtime.recall_index = recall_index
 
+    http_fetcher: HTTPFetcher | None = None
+
     write_pid(eonlet_id)
     write_status(eonlet_id, "running")
     write_heartbeat(eonlet_id)
@@ -163,6 +167,11 @@ async def run_worker(
         str(paths.runtime_sock(eonlet_id)),
         _make_handler(runtime, eonlet_id, send, scheduler),
     )
+    # Blocking user-decision channel (ADR-0006): shared by the interactive
+    # permission confirm and (M3) compaction proposals.
+    broker = DecisionBroker(server)
+    server.on_disconnect = broker.on_session_closed
+    runtime.decision_broker = broker
     runtime.event_listener = _make_event_broadcaster(server)
     runtime.on_delta = _make_delta_broadcaster(server)
 
@@ -171,6 +180,19 @@ async def run_worker(
         shutdown.set()
 
     try:
+        # Outbound HTTP client — shared by web_fetch / web_search and any
+        # future tool that needs SSRF-guarded egress. Built from the
+        # agent's web.fetch config block (ADR-0004). Constructed inside
+        # the try so a bad config still tears down via the finally.
+        web_cfg = definition.config.web.fetch
+        http_fetcher = HTTPFetcher(
+            max_bytes=web_cfg.max_bytes,
+            timeout=web_cfg.timeout_seconds,
+            allow_private_networks=web_cfg.allow_private_networks,
+            user_agent=web_cfg.user_agent,
+        )
+        runtime.http_fetcher = http_fetcher
+
         await scheduler.catch_up_missed()
         async with anyio.create_task_group() as tg:
             tg.start_soon(server.serve)
@@ -186,6 +208,8 @@ async def run_worker(
         cleanup(eonlet_id)
         store.close()
         recall_index.close()
+        if http_fetcher is not None:
+            await http_fetcher.aclose()
 
 
 # ── tasks ────────────────────────────────────────────────────────────────────
@@ -256,7 +280,7 @@ async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:
     if not events:
         return False
     tokens = working_window_token_estimate(events, watermark=0)
-    if tokens < cfg.conversation.working_memory_tokens:
+    if tokens < cfg.episodic.working_memory_tokens:
         return False
     from ..memory.compactor import LLMCompactor
 
@@ -291,7 +315,7 @@ async def _maybe_run_tier2(runtime: AgentRuntime) -> None:
     if not stm_path.exists():
         return
     stm_tokens = estimate(stm_path.read_text(encoding="utf-8"))
-    if stm_tokens < cfg.conversation.short_term_tokens:
+    if stm_tokens < cfg.episodic.short_term_tokens:
         return
 
     provider = _resolve_compaction_provider(runtime, cfg.compaction_model)
@@ -322,7 +346,7 @@ async def _maybe_run_tier3(runtime: AgentRuntime) -> None:
     if not ltm_path.exists():
         return
     ltm_tokens = estimate(ltm_path.read_text(encoding="utf-8"))
-    if ltm_tokens < cfg.conversation.long_term_tokens:
+    if ltm_tokens < cfg.episodic.long_term_tokens:
         return
 
     provider = _resolve_compaction_provider(runtime, cfg.compaction_model)
@@ -381,6 +405,14 @@ def _make_handler(
             }
         if method == "session.end":
             return {"ok": True}
+        if method == "decision.respond":
+            # User answered a blocking decision prompt (ADR-0006). First
+            # responder wins; an unknown/stale id is a no-op.
+            did = str(params.get("id") or "")
+            choice = str(params.get("choice") or "")
+            broker = runtime.decision_broker
+            applied = broker.resolve(did, choice) if broker is not None else False
+            return {"ok": applied}
         if method == "message.send":
             content = params.get("content", "")
             try:
@@ -495,7 +527,7 @@ def _make_handler(
         if method == "triggers.clear":
             n = await scheduler.clear_dynamic()
             return {"ok": True, "cleared": n}
-        if method.startswith("memory."):
+        if method.startswith(("memory.", "task.")):
             return await _handle_memory_ipc(method, params, runtime)
         return {"error": f"unknown method: {method}"}
 
@@ -507,26 +539,26 @@ async def _handle_memory_ipc(
     params: dict[str, Any],
     runtime: AgentRuntime,
 ) -> dict[str, Any]:
-    """Dispatch ``memory.note.*`` / ``memory.todo.*`` / ``memory.{compact,show,...}``
+    """Dispatch ``memory.knowledge.*`` / ``task.*`` / ``memory.{compact,show,...}``
     IPC methods.
 
     Events are appended through ``runtime._record`` so they flow into the
     IPC broadcaster the same way tool-driven calls do.
     """
-    from ..memory.ids import mint_note_id, mint_todo_id
-    from ..memory.notes import NotesStore
+    from ..errors import KnowledgeError, KnowledgePathError
+    from ..memory.knowledge import KnowledgeStore
     from ..memory.paths import long_term_path, short_term_path
-    from ..memory.todos import TodosStore
     from ..runtime.events import (
-        mem_note_added,
-        mem_note_deleted,
-        mem_note_updated,
+        kb_deleted,
+        kb_moved,
+        kb_written,
         mem_paused,
         mem_resumed,
-        mem_todo_added,
-        mem_todo_deleted,
-        mem_todo_updated,
+        task_added,
+        task_deleted,
+        task_updated,
     )
+    from ..tasks import TaskStore, mint_task_id
 
     # ── compact / pause / resume / show ──────────────────────────────────
     if method == "memory.compact":
@@ -543,13 +575,23 @@ async def _handle_memory_ipc(
                 "error": f"failed to build compaction provider: {cfg.compaction_model!r}",
             }
         compactor = LLMCompactor(prov)
+        # User-forced /compact is the "clean slate" full compaction (ADR-0006):
+        # the whole working window is summarized into STM and emptied.
         outcome = await run_tier1(
             memory_dir=runtime.memory_dir,
             store=runtime.store,
             cfg=cfg,
             compactor=compactor,
             record_event=runtime._record,
+            full=True,
         )
+        if outcome.ran and outcome.error is None:
+            # Emptying the working window ends the current episode and starts a
+            # fresh one carrying only the injected memory preamble.
+            from ..runtime.events import session_ended, session_started
+
+            await runtime._record(session_ended(reason="compact"))
+            await runtime._record(session_started(reason="compact"))
         return {
             "ok": outcome.error is None,
             "ran": outcome.ran,
@@ -577,109 +619,81 @@ async def _handle_memory_ipc(
         if store_name in ("ltm", "all"):
             p = long_term_path(md)
             out["ltm"] = p.read_text(encoding="utf-8") if p.exists() else ""
-        if store_name in ("notes", "all"):
-            notes_list = await NotesStore(md).list_notes()
-            out["notes"] = [
-                {
-                    "id": n.id,
-                    "title": n.title,
-                    "tags": n.tags,
-                    "body": n.body,
-                    "created_at": n.created_at,
-                }
-                for n in notes_list
+        if store_name in ("knowledge", "all"):
+            out["knowledge"] = [
+                {"path": e.path, "title": e.title, "hook": e.hook}
+                for e in await KnowledgeStore(md).list_entries()
             ]
-        if store_name in ("todos", "all"):
-            todos = await TodosStore(md).list_todos(status="all")
-            out["todos"] = [t.to_json() for t in todos]
         out["auto_compact_enabled"] = runtime.auto_compact_enabled
         return out
 
-    # ── notes ────────────────────────────────────────────────────────────
-    if method.startswith("memory.note."):
-        store = NotesStore(runtime.memory_dir)
-        sub = method.removeprefix("memory.note.")
-        if sub == "add":
-            content = str(params.get("content", "")).strip()
-            if not content:
-                return {"ok": False, "error": "content required"}
-            note_id = mint_note_id()
-            try:
-                note = await store.add(
-                    id=note_id,
-                    content=content,
-                    title=params.get("title"),
-                    tags=list(params.get("tags") or []),
-                )
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
-            await runtime._record(mem_note_added(id=note.id, title=note.title, tags=note.tags))
-            return {"ok": True, "id": note.id}
+    # ── knowledge (curated knowledge axis, ADR-0005) ──────────────────────
+    if method.startswith("memory.knowledge."):
+        kstore = KnowledgeStore(runtime.memory_dir)
+        sub = method.removeprefix("memory.knowledge.")
         if sub == "list":
-            tags = list(params.get("tags") or [])
-            notes = await store.list_notes(tags=tags or None)
+            entries = await kstore.list_entries()
             return {
                 "ok": True,
-                "notes": [
-                    {
-                        "id": n.id,
-                        "title": n.title,
-                        "tags": n.tags,
-                        "created_at": n.created_at,
-                        "body": n.body,
-                    }
-                    for n in notes
-                ],
+                "knowledge": [{"path": e.path, "title": e.title, "hook": e.hook} for e in entries],
             }
-        if sub == "get":
-            nid = str(params.get("id", ""))
-            got = await store.get(id=nid) if nid else None
-            if got is None:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            return {
-                "ok": True,
-                "note": {
-                    "id": got.id,
-                    "title": got.title,
-                    "tags": got.tags,
-                    "created_at": got.created_at,
-                    "body": got.body,
-                },
-            }
-        if sub == "update":
-            nid = str(params.get("id", ""))
-            content = str(params.get("content", ""))
-            if not nid or not content:
-                return {"ok": False, "error": "id and content required"}
+        if sub == "open":
+            path = str(params.get("path", ""))
+            body = await kstore.open(path) if path else None
+            if body is None:
+                return {"ok": False, "error": f"no such knowledge file: {path}"}
+            return {"ok": True, "path": path, "body": body}
+        if sub == "write":
+            path = str(params.get("path", "")).strip()
+            content = params.get("content")
+            if not path or content is None:
+                return {"ok": False, "error": "path and content required"}
             try:
-                await store.update(id=nid, content=content)
-            except KeyError:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            await runtime._record(mem_note_updated(id=nid))
-            return {"ok": True}
+                rel = await kstore.write(
+                    path=path, content=str(content), index_line=params.get("index_line")
+                )
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            await runtime._record(kb_written(path=rel, size=len(str(content)), action="write"))
+            return {"ok": True, "path": rel}
         if sub == "delete":
-            nid = str(params.get("id", ""))
-            if not nid:
-                return {"ok": False, "error": "id required"}
-            removed = await store.delete(id=nid)
-            if not removed:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            await runtime._record(mem_note_deleted(id=nid))
+            path = str(params.get("path", ""))
+            if not path:
+                return {"ok": False, "error": "path required"}
+            try:
+                existed = await kstore.delete(path=path)
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            if not existed:
+                return {"ok": False, "error": f"no such knowledge file: {path}"}
+            await runtime._record(kb_deleted(path=path))
             return {"ok": True}
+        if sub == "move":
+            src = str(params.get("path", ""))
+            dst = str(params.get("new_path", ""))
+            if not src or not dst:
+                return {"ok": False, "error": "path and new_path required"}
+            try:
+                src_rel, dst_rel = await kstore.move(
+                    src=src, dst=dst, index_line=params.get("index_line")
+                )
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            await runtime._record(kb_moved(src=src_rel, dst=dst_rel))
+            return {"ok": True, "src": src_rel, "dst": dst_rel}
         return {"ok": False, "error": f"unknown method: {method}"}
 
-    # ── todos ────────────────────────────────────────────────────────────
-    if method.startswith("memory.todo."):
-        store_t = TodosStore(runtime.memory_dir)
-        sub = method.removeprefix("memory.todo.")
+    # ── tasks (workflow state, ADR-0005 — moved out of memory) ─────────────
+    if method.startswith("task."):
+        store_t = TaskStore(runtime.tasks_dir)
+        sub = method.removeprefix("task.")
         if sub == "add":
             content = str(params.get("content", "")).strip()
             if not content:
                 return {"ok": False, "error": "content required"}
-            todo_id = mint_todo_id()
             try:
-                todo = await store_t.add(
-                    id=todo_id,
+                task = await store_t.add(
+                    id=mint_task_id(),
                     content=content,
                     due=params.get("due"),
                     tags=list(params.get("tags") or []),
@@ -687,28 +701,29 @@ async def _handle_memory_ipc(
             except ValueError as e:
                 return {"ok": False, "error": str(e)}
             await runtime._record(
-                mem_todo_added(id=todo.id, content=todo.content, due=todo.due, tags=todo.tags)
+                task_added(id=task.id, content=task.content, due=task.due, tags=task.tags)
             )
-            return {"ok": True, "id": todo.id}
+            return {"ok": True, "id": task.id}
         if sub == "list":
             status_param = str(params.get("status", "pending"))
             if status_param not in ("pending", "done", "cancelled", "all"):
                 return {"ok": False, "error": f"invalid status: {status_param}"}
-            todos = await store_t.list_todos(status=status_param)  # type: ignore[arg-type]
-            return {
-                "ok": True,
-                "todos": [t.to_json() for t in todos],
-            }
-        if sub == "done":
+            tasks = await store_t.list_tasks(status=status_param)  # type: ignore[arg-type]
+            return {"ok": True, "tasks": [t.to_json() for t in tasks]}
+        if sub in ("done", "cancel"):
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
             try:
-                todo = await store_t.mark_done(id=tid)
+                task = (
+                    await store_t.mark_done(id=tid)
+                    if sub == "done"
+                    else await store_t.mark_cancelled(id=tid)
+                )
             except KeyError:
-                return {"ok": False, "error": f"no such todo: {tid}"}
+                return {"ok": False, "error": f"no such task: {tid}"}
             await runtime._record(
-                mem_todo_updated(id=todo.id, status=todo.status, done_at=todo.done_at)
+                task_updated(id=task.id, status=task.status, done_at=task.done_at)
             )
             return {"ok": True}
         if sub == "update":
@@ -716,15 +731,15 @@ async def _handle_memory_ipc(
             if not tid:
                 return {"ok": False, "error": "id required"}
             try:
-                todo = await store_t.update(
+                task = await store_t.update(
                     id=tid,
                     content=params.get("content"),
                     due=params.get("due"),
                     tags=list(params["tags"]) if "tags" in params else None,
                 )
             except KeyError:
-                return {"ok": False, "error": f"no such todo: {tid}"}
-            await runtime._record(mem_todo_updated(id=todo.id, status=todo.status))
+                return {"ok": False, "error": f"no such task: {tid}"}
+            await runtime._record(task_updated(id=task.id, status=task.status))
             return {"ok": True}
         if sub == "delete":
             tid = str(params.get("id", ""))
@@ -732,8 +747,8 @@ async def _handle_memory_ipc(
                 return {"ok": False, "error": "id required"}
             removed = await store_t.delete(id=tid)
             if not removed:
-                return {"ok": False, "error": f"no such todo: {tid}"}
-            await runtime._record(mem_todo_deleted(id=tid))
+                return {"ok": False, "error": f"no such task: {tid}"}
+            await runtime._record(task_deleted(id=tid))
             return {"ok": True}
         return {"ok": False, "error": f"unknown method: {method}"}
 

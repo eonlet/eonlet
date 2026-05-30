@@ -103,8 +103,12 @@ def test_inproc_streams_back(isolated_home: Path) -> None:
 
     anyio.run(with_timeout)
 
-    assert "".join(deltas) == "echo: hi"
-    assert final_content == ["echo: hi"]
+    # The user turn is prefixed with a local-datetime tag (ADR-0006) before the
+    # fake provider echoes it, so assert structure rather than the exact string.
+    joined = "".join(deltas)
+    assert joined.startswith("echo:")
+    assert joined.endswith("hi")
+    assert final_content == [joined]
 
 
 def test_inproc_trigger_fire(isolated_home: Path) -> None:

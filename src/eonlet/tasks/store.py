@@ -1,8 +1,10 @@
-"""TODOs store — line-delimited JSON in ``memory/todos.jsonl``.
+"""Task store — line-delimited JSON in ``tasks/todos.jsonl`` (ADR-0005).
 
-Per MEMORY_SPEC §2.4 / §5.4. Each TODO is one JSON object per line. Writes
-rewrite the whole file atomically — the file is small (typically a few
-dozen items) and rewriting keeps the data-model simple.
+Moved verbatim from the old ``memory/todos.py``: the storage format and state
+machine (pending/done/cancelled, due, tags) are unchanged — only the home
+directory (``tasks/`` instead of ``memory/``) and the type names (Task/
+TaskStore) changed. Each task is one JSON object per line; writes rewrite the
+whole file atomically (the file is small).
 """
 
 from __future__ import annotations
@@ -13,24 +15,31 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .paths import todos_path
-from .storage import atomic_write_text, file_lock
+from ..memory.storage import atomic_write_text, file_lock
 
-TodoStatus = Literal["pending", "done", "cancelled"]
+TaskStatus = Literal["pending", "done", "cancelled"]
+
+
+def todos_path(tasks_dir: Path) -> Path:
+    return tasks_dir / "todos.jsonl"
+
+
+def todos_archive_path(tasks_dir: Path) -> Path:
+    return tasks_dir / "todos.archive.jsonl"
 
 
 @dataclass(slots=True)
-class Todo:
+class Task:
     id: str
     content: str
-    status: TodoStatus = "pending"
+    status: TaskStatus = "pending"
     created_at: str = ""
     due: str | None = None
     done_at: str | None = None
     tags: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_json(cls, raw: dict[str, Any]) -> Todo:
+    def from_json(cls, raw: dict[str, Any]) -> Task:
         # Defensive about unknown fields — accept any future schema additions
         # without crashing existing records.
         status = str(raw.get("status", "pending"))
@@ -74,16 +83,16 @@ def _now_iso() -> str:
 # ── Store ──────────────────────────────────────────────────────────────────
 
 
-class TodosStore:
-    """File-backed todo store rooted at one eonlet's ``memory/`` directory."""
+class TaskStore:
+    """File-backed task store rooted at one eonlet's ``tasks/`` directory."""
 
-    def __init__(self, memory_dir: Path) -> None:
-        self._path = todos_path(memory_dir)
+    def __init__(self, tasks_dir: Path) -> None:
+        self._path = todos_path(tasks_dir)
 
-    def _read_all(self) -> list[Todo]:
+    def _read_all(self) -> list[Task]:
         if not self._path.exists():
             return []
-        out: list[Todo] = []
+        out: list[Task] = []
         for raw_line in self._path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line:
@@ -91,23 +100,21 @@ class TodosStore:
             try:
                 obj: Any = json.loads(line)
             except json.JSONDecodeError:
-                # Corrupt line — skip rather than crash. The original line is
-                # still on disk (this code path only reads); a write will drop
-                # it. Logging here is out of scope for the storage layer.
+                # Corrupt line — skip rather than crash. A later write drops it.
                 continue
             if not isinstance(obj, dict):
                 continue
             try:
-                out.append(Todo.from_json(obj))
+                out.append(Task.from_json(obj))
             except (KeyError, ValueError):
                 continue
         return out
 
-    def _write_all(self, todos: list[Todo]) -> None:
-        if not todos:
+    def _write_all(self, tasks: list[Task]) -> None:
+        if not tasks:
             atomic_write_text(self._path, "")
             return
-        text = "\n".join(json.dumps(t.to_json(), ensure_ascii=False) for t in todos) + "\n"
+        text = "\n".join(json.dumps(t.to_json(), ensure_ascii=False) for t in tasks) + "\n"
         atomic_write_text(self._path, text)
 
     async def add(
@@ -117,12 +124,12 @@ class TodosStore:
         content: str,
         due: str | None = None,
         tags: list[str] | None = None,
-    ) -> Todo:
+    ) -> Task:
         async with file_lock(self._path):
-            todos = self._read_all()
-            if any(t.id == id for t in todos):
-                raise ValueError(f"todo id already exists: {id}")
-            todo = Todo(
+            tasks = self._read_all()
+            if any(t.id == id for t in tasks):
+                raise ValueError(f"task id already exists: {id}")
+            task = Task(
                 id=id,
                 content=content,
                 status="pending",
@@ -130,36 +137,46 @@ class TodosStore:
                 due=due,
                 tags=list(tags or []),
             )
-            todos.append(todo)
-            self._write_all(todos)
-            return todo
+            tasks.append(task)
+            self._write_all(tasks)
+            return task
 
-    async def list_todos(
+    async def list_tasks(
         self, *, status: Literal["pending", "done", "cancelled", "all"] = "pending"
-    ) -> list[Todo]:
+    ) -> list[Task]:
         async with file_lock(self._path):
-            todos = self._read_all()
+            tasks = self._read_all()
             if status == "all":
-                return todos
-            return [t for t in todos if t.status == status]
+                return tasks
+            return [t for t in tasks if t.status == status]
 
-    async def get(self, *, id: str) -> Todo | None:
+    async def get(self, *, id: str) -> Task | None:
         async with file_lock(self._path):
             for t in self._read_all():
                 if t.id == id:
                     return t
             return None
 
-    async def mark_done(self, *, id: str) -> Todo:
+    async def mark_done(self, *, id: str) -> Task:
         async with file_lock(self._path):
-            todos = self._read_all()
-            for t in todos:
+            tasks = self._read_all()
+            for t in tasks:
                 if t.id == id:
                     t.status = "done"
                     t.done_at = _now_iso()
-                    self._write_all(todos)
+                    self._write_all(tasks)
                     return t
-            raise KeyError(f"no such todo: {id}")
+            raise KeyError(f"no such task: {id}")
+
+    async def mark_cancelled(self, *, id: str) -> Task:
+        async with file_lock(self._path):
+            tasks = self._read_all()
+            for t in tasks:
+                if t.id == id:
+                    t.status = "cancelled"
+                    self._write_all(tasks)
+                    return t
+            raise KeyError(f"no such task: {id}")
 
     async def update(
         self,
@@ -168,10 +185,10 @@ class TodosStore:
         content: str | None = None,
         due: str | None = None,
         tags: list[str] | None = None,
-    ) -> Todo:
+    ) -> Task:
         async with file_lock(self._path):
-            todos = self._read_all()
-            for t in todos:
+            tasks = self._read_all()
+            for t in tasks:
                 if t.id == id:
                     if content is not None:
                         t.content = content
@@ -179,15 +196,15 @@ class TodosStore:
                         t.due = due or None
                     if tags is not None:
                         t.tags = list(tags)
-                    self._write_all(todos)
+                    self._write_all(tasks)
                     return t
-            raise KeyError(f"no such todo: {id}")
+            raise KeyError(f"no such task: {id}")
 
     async def delete(self, *, id: str) -> bool:
         async with file_lock(self._path):
-            todos = self._read_all()
-            new = [t for t in todos if t.id != id]
-            if len(new) == len(todos):
+            tasks = self._read_all()
+            new = [t for t in tasks if t.id != id]
+            if len(new) == len(tasks):
                 return False
             self._write_all(new)
             return True

@@ -3,9 +3,11 @@
 Builds two artifacts per LLM call:
 
 1. **Memory preamble** — appended to the system prompt as a single
-   ``<memory>...</memory>`` block containing ``<long_term>``, ``<notes>``,
-   ``<todos>``, and ``<short_term>`` sub-elements (empty stores are
-   omitted; the outer ``<memory>`` is omitted when all sub-stores are empty).
+   ``<memory>...</memory>`` block containing ``<knowledge_index>``,
+   ``<long_term>``, ``<todos>``, and ``<short_term>`` sub-elements (empty
+   stores are omitted; the outer ``<memory>`` is omitted when all sub-stores
+   are empty). The knowledge index is the always-injected map of the curated
+   knowledge tree (ADR-0005); file bodies are opened on demand, never injected.
 2. **Recent-messages window** — the suffix of the event log with
    ``id > compaction_watermark`` accumulated until ``working_memory_tokens``
    is reached, snapped to a tool_call/tool_result-safe boundary.
@@ -18,16 +20,22 @@ in ``compactor.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+import structlog
+
 from ..runtime.events import Event, EventKind
+from ..tasks import TaskStore
+from ..tasks.config import TasksConfig
 from .config import MemoryConfig
-from .notes import NotesStore
-from .paths import long_term_path, notes_path, short_term_path, todos_path
+from .knowledge import KnowledgeStore
+from .paths import long_term_path, short_term_path
 from .stm import STMStore
-from .todos import TodosStore
-from .tokens import estimate_message
+from .tokens import estimate, estimate_message
 from .watermark import read_watermark
+
+log = structlog.get_logger(__name__)
 
 # Sentinel returned by ``build_memory_preamble`` when nothing should be
 # injected. Callers append the preamble to the system prompt only if
@@ -50,40 +58,38 @@ class WindowSlice:
 async def build_memory_preamble(memory_dir: Path, cfg: MemoryConfig) -> str:
     """Return the ``<memory>...</memory>`` block, or ``""`` when empty.
 
-    Per MEMORY_SPEC §3.1, sub-blocks are emitted in the order
-    long_term → notes → todos → short_term. Each block is omitted when its
-    source is empty (or ``inject: false`` for notes/todos).
+    Sub-blocks are emitted in the order knowledge_index → long_term →
+    short_term. The knowledge index (ADR-0005) is the always-injected map of
+    the curated knowledge tree; its file bodies are never injected. Each block
+    is omitted when its source is empty (or its ``inject*`` flag is false).
+
+    Tasks are **not** part of memory anymore (ADR-0005) — the runtime injects a
+    sibling ``<tasks>`` block via :func:`build_tasks_block`.
     """
     if not cfg.enabled:
         return EMPTY_PREAMBLE
 
     blocks: list[str] = []
 
-    # ── long-term ──────────────────────────────────────────────────────
+    # ── knowledge index (the always-injected map; bodies stay on disk) ──
+    if cfg.knowledge.inject_index:
+        index_text = KnowledgeStore(memory_dir).index_text()
+        if index_text:
+            tokens = estimate(index_text)
+            if tokens > cfg.knowledge.index_max_tokens:
+                log.warning(
+                    "knowledge index exceeds index_max_tokens",
+                    tokens=tokens,
+                    limit=cfg.knowledge.index_max_tokens,
+                )
+            blocks.append(f"<knowledge_index>\n{index_text}\n</knowledge_index>")
+
+    # ── long-term (episodic timeline) ──────────────────────────────────
     ltm_path = long_term_path(memory_dir)
     if ltm_path.exists():
         ltm_text = ltm_path.read_text(encoding="utf-8").strip()
         if ltm_text:
             blocks.append(f"<long_term>\n{ltm_text}\n</long_term>")
-
-    # ── notes ──────────────────────────────────────────────────────────
-    if cfg.notes.inject:
-        notes_p = notes_path(memory_dir)
-        if notes_p.exists():
-            notes_text = notes_p.read_text(encoding="utf-8").strip()
-            if notes_text:
-                blocks.append(f"<notes>\n{notes_text}\n</notes>")
-
-    # ── todos (pending only by default) ────────────────────────────────
-    if cfg.todos.inject_active and todos_path(memory_dir).exists():
-        todos = await TodosStore(memory_dir).list_todos(status="pending")
-        if todos:
-            lines = []
-            for t in todos:
-                due = f" (due: {t.due})" if t.due else ""
-                tags = "  (tags: " + ", ".join(t.tags) + ")" if t.tags else ""
-                lines.append(f"- [{t.id}] {t.content}{due}{tags}")
-            blocks.append("<todos>\n" + "\n".join(lines) + "\n</todos>")
 
     # ── short-term ─────────────────────────────────────────────────────
     stm_p = short_term_path(memory_dir)
@@ -95,6 +101,53 @@ async def build_memory_preamble(memory_dir: Path, cfg: MemoryConfig) -> str:
     if not blocks:
         return EMPTY_PREAMBLE
     return "<memory>\n" + "\n\n".join(blocks) + "\n</memory>"
+
+
+# ── Tasks block (sibling of <memory>, ADR-0005) ─────────────────────────────
+
+
+async def build_tasks_block(tasks_dir: Path, cfg: TasksConfig) -> str:
+    """Return the ``<tasks>...</tasks>`` block of pending tasks, or ``""``.
+
+    Tasks are workflow state, not memory, so this block is injected as a
+    sibling of ``<memory>`` — not nested inside it. Pending only, by default.
+    """
+    if not cfg.inject_pending:
+        return EMPTY_PREAMBLE
+    pending = await TaskStore(tasks_dir).list_tasks(status="pending")
+    if not pending:
+        return EMPTY_PREAMBLE
+    lines = []
+    for t in pending:
+        due = f" (due: {t.due})" if t.due else ""
+        tags = "  (tags: " + ", ".join(t.tags) + ")" if t.tags else ""
+        lines.append(f"- [{t.id}] {t.content}{due}{tags}")
+    return "<tasks>\n" + "\n".join(lines) + "\n</tasks>"
+
+
+# ── Per-turn timestamp rendering (ADR-0006) ─────────────────────────────────
+
+
+def format_turn_timestamp(ts: int) -> str:
+    """Render an event ``ts`` (unix microseconds) as a local ``[date time ±zz]``
+    tag, e.g. ``[2026-05-30 14:23 +08:00]``.
+    """
+    dt = datetime.fromtimestamp(ts / 1_000_000).astimezone()
+    raw = dt.strftime("%z")  # e.g. "+0800"
+    offset = f"{raw[:3]}:{raw[3:]}" if len(raw) == 5 else (raw or "+00:00")
+    return f"[{dt.strftime('%Y-%m-%d %H:%M')} {offset}]"
+
+
+def prefix_user_timestamp(content: str, ts: int | None) -> str:
+    """Prefix a user message with its local datetime tag (ADR-0006).
+
+    Render-time only: the returned string is what the LLM sees; the stored
+    ``USER_MESSAGE`` payload is never modified (invariant 1 / events immutable).
+    A ``None`` timestamp (e.g. an unpersisted message) is passed through as-is.
+    """
+    if ts is None:
+        return content
+    return f"{format_turn_timestamp(ts)} {content}"
 
 
 # ── Recent-window selection ─────────────────────────────────────────────────
@@ -111,8 +164,8 @@ def select_recent_window(events: list[Event], cfg: MemoryConfig, watermark: int)
     if not eligible:
         return WindowSlice(events=[], estimated_tokens=0, over_threshold=False)
 
-    budget = cfg.conversation.working_memory_tokens
-    min_keep = cfg.conversation.keep_recent_messages_min
+    budget = cfg.episodic.working_memory_tokens
+    min_keep = cfg.episodic.keep_recent_messages_min
 
     # Walk back from newest, accumulating tokens. Hard cap at 1000 to bound DB
     # work (MEMORY_SPEC §3.2 step 2).
@@ -178,11 +231,13 @@ def current_watermark(memory_dir: Path) -> int:
 # Re-exports for the runtime/tools layer
 __all__ = [
     "EMPTY_PREAMBLE",
-    "NotesStore",
     "STMStore",
     "WindowSlice",
     "build_memory_preamble",
+    "build_tasks_block",
     "current_watermark",
+    "format_turn_timestamp",
+    "prefix_user_timestamp",
     "select_recent_window",
     "working_window_token_estimate",
 ]

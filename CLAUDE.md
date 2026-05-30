@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Eonlet** is a local-first runtime for stateful AI agents — described as "the systemd for agents." It lets long-lived, autonomous agents persist state, accumulate memory, run on cron schedules, and be managed from the terminal like OS processes.
 
-**Status: Pre-alpha, v0.0.6 landed.** Memory subsystem complete. v0.1.0 blocked only on non-engineering work (demo GIF, PyPI release, two weeks of dogfooding without a P0 bug).
+**Status: Pre-alpha, v0.0.9 landed.** Memory subsystem complete (v0.0.6); web tools upgraded to ADR-0004 floor (v0.0.7); memory re-architected into the dual-axis model (episodic timeline + curated knowledge base) with tasks moved out of memory (v0.0.8, ADR-0005); compaction reworked into a three-trigger model with a blocking user-consent channel (v0.0.9, ADR-0006). v0.1.0 blocked only on non-engineering work (demo GIF, PyPI release, two weeks of dogfooding without a P0 bug).
 
 Before writing or modifying code, **read the relevant spec** — the design is authoritative; the code follows it.
 
@@ -38,6 +38,27 @@ Before writing or modifying code, **read the relevant spec** — the design is a
 - **P5** — Tier-2 (STM→LTM promotion) + Tier-3 (LTM forgetting); `remember` tool (`src:explicit` bullets); `forget` tool (dry-run + confirmed delete); `memory compact_ltm` action; full cascade: tier1 → tier2 → tier3.
 - **P6** — `eonlet memory migrate <legacy_dir>` CLI command migrates Claude Code MEMORY.md files into LTM; `AGENT_CONFIG_SPEC.md` §8 rewritten; `CLI_REFERENCE.md` updated.
 - **Test coverage**: 56 new unit tests across `tests/unit/memory/` (21 test files). Total: 145+ tests.
+
+**v0.0.7** — web tools upgrade ([ADR-0004](docs/adr/0004-web-tools.md), three milestones M1–M3):
+- **M1** — `src/eonlet/web/` package: `HTTPFetcher` (SSRF guard + 3-attempt retry on 5xx/transport + size cap + stable User-Agent), `ssrf.py` (IPv4/IPv6 classification, cloud-metadata host/IP block-list), `fetch.py` (`trafilatura`-based HTML→markdown + text/JSON passthrough), token-based `paginate`. New errors: `WebError` / `SSRFRejectedError` / `UnsupportedSchemeError` / `ResponseTooLargeError` / `HTTPFetchError`.
+- **M2** — `web/search/{tavily,ddg}.py` (two backends, no abstraction; provider dispatch on `TAVILY_API_KEY` env presence). `tools/builtin/web.py` rewritten as a thin shim. `ToolContext.http_fetcher` injected by the worker; `AgentRuntime.http_fetcher` mirrors. New `EventKind` variants `WEB_SEARCH_PERFORMED` / `WEB_FETCH_PERFORMED` (summary-only — full body in `TOOL_RESULT`). `agent.yaml: web.fetch` config block (`max_bytes`, `max_tokens_per_call`, `timeout_seconds`, `allow_private_networks`, `user_agent`).
+- **M3** — `templates/x-digest/tools/feed_read.py` as the canonical "extend Eonlet" example (lazy `feedparser` import, ~80 LOC). `TOOL_SPEC.md`, `AGENT_CONFIG_SPEC.md` §8.5, `SECURITY.md` §2.4 SSRF guard updated. ADR-0004 status flipped to Accepted.
+- **New runtime dep**: `trafilatura>=2.0` (pulls 10 transitive packages ~17 MB; all permissive licenses; no native compilation required on cp311–cp313 thanks to lxml's manylinux wheels).
+- **Test coverage**: 80 new tests across `tests/unit/web/` and a rewritten `tests/unit/test_web_tools.py`. `src/eonlet/web/` covered at 94%; `tools/builtin/web.py` at 91%. Total: 520+ tests.
+
+**v0.0.8** — dual-axis memory ([ADR-0005](docs/adr/0005-dual-axis-memory.md), four milestones M1–M4; supersedes the ADR-0003 memory model):
+- **M1** — Knowledge axis: `src/eonlet/memory/knowledge.py` (`KnowledgeStore`), the `knowledge` tool (`open`/`list`/`write`/`edit`/`delete`/`move`), `memory.knowledge` config block, `<knowledge_index>` injection (the curated `knowledge/index.md` map injected whole; bodies opened on demand), new `KB_WRITTEN`/`KB_DELETED`/`KB_MOVED` events + `KnowledgeError`/`KnowledgePathError`.
+- **M2** — Episodic narrowing: LTM holds only the `episodic` category; tier-2 emits episodic-only; **tier-3 drops the `src:explicit` "never drop" exemption** (uniform recency/salience). Retired the `remember`/`note`/`forget` tools, `NotesStore`, the `mem_remember`/`mem_note_*` events, and the `memory.notes` block. `recall`'s notes scope → knowledge scope.
+- **M3** — Tasks out of memory: new top-level `src/eonlet/tasks/` package (`TaskStore`, `TasksConfig`, `mint_task_id`, `tasks/todos.jsonl`). `todo` tool → `task` tool (+`cancel`); `mem_todo_*` → `task_added`/`task_updated`/`task_deleted`; pending tasks inject as a sibling `<tasks>` block **outside** `<memory>`. Top-level `tasks` config block; `ToolContext`/`AgentRuntime` gain `tasks_dir`.
+- **M4** — `memory.conversation` → `memory.episodic` rename; bundled templates + specs + CHANGELOG updated; **`eonlet memory migrate` and `memory/migrate.py` removed** (pre-alpha needs no cross-version migration). `EventKind` settles at **36 variants**.
+- **Test coverage**: new `tests/unit/memory/test_knowledge_store.py` + `test_tools_knowledge.py`, new `tests/unit/tasks/` package. Total: 521 tests; ruff + mypy clean.
+
+**v0.0.9** — compaction triggers ([ADR-0006](docs/adr/0006-compaction-triggers.md), four milestones M1–M4; one tier-1 mechanism, three triggers, each with its own boundary policy):
+- **M1** — Boundary modes + clean-slate `/compact`: `run_tier1` gains a `full` mode (empties the working window) wired to the user-forced `/compact`, which now also emits `session_ended`+`session_started` to mark an episode boundary. Per-turn timestamps: `memory.inject_turn_timestamps` prefixes each user message with its local datetime at render time (`Message.ts`, events stay immutable). Inert `propose_*` config added.
+- **M2** — Blocking decision channel: `worker/decisions.py` (`DecisionBroker`) — a generic worker↔CLI consent round-trip (`decision/request` notification → block → `decision.respond`); no-session/detach auto-declines. **Closes the v0.0.2 interactive-permission-confirm TODO** — `ask`-mode destructive tools now prompt via this channel (`Decision.needs_prompt`); shared by compaction proposals.
+- **M3** — Agent-proposed semantic compaction: `memory(action="propose_compact", boundary_event_id, reason)` — floor + dual cooldown guards, interactive-only, blocks on consent, `yolo` auto-approves with audit. `run_tier1` gains an explicit-`boundary` mode + `snap_boundary_safe`. New events `MEM_COMPACT_PROPOSED`/`_APPROVED`/`_DECLINED` (**EventKind 36 → 39**).
+- **M4** — MEMORY_SPEC §4 trigger-matrix + consent + timestamps; AGENT_CONFIG/TOOL/CLI/SECURITY docs; templates (`assistant` enables `propose_semantic`, scheduled agents disable it, all stamp turns); CHANGELOG + this file.
+- **Test coverage**: new `tests/unit/test_decisions.py` + `test_tools_propose_compact.py`; extended tier-1/events/config/permission/agent-injection tests. Total: 552 tests; ruff + mypy clean.
 
 **v0.1.0 still owes** (non-engineering):
 - 30-second README demo GIF.
@@ -88,11 +109,11 @@ WorkerProcess
 
 ### Event-Sourced State
 
-Every state change is an immutable append to a per-agent SQLite log. `AgentState` is rebuilt by replaying events — no mutable in-memory state. `EventKind` has 37 variants covering: conversation turns, tool calls, permissions, triggers, budget, sessions, errors, and all memory operations.
+Every state change is an immutable append to a per-agent SQLite log. `AgentState` is rebuilt by replaying events — no mutable in-memory state. `EventKind` has **39 variants** covering: conversation turns, tool calls, permissions, triggers, budget, sessions, errors, memory operations (`mem_compacted`/`mem_ltm_promoted`/`mem_ltm_forgotten`/`mem_recall_invoked`/`mem_paused`/`mem_resumed`), compaction proposals (`mem_compact_proposed`/`mem_compact_approved`/`mem_compact_declined`), knowledge writes (`kb_written`/`kb_deleted`/`kb_moved`), tasks (`task_added`/`task_updated`/`task_deleted`), and web tool summaries.
 
 ```
 runtime/store.py   → SQLite append-only log
-runtime/events.py  → EventKind enum (37 variants), Event model
+runtime/events.py  → EventKind enum (39 variants), Event model
 runtime/state.py   → AgentState (replay-derived)
 runtime/agent.py   → AgentRuntime (orchestrates LLM calls, tool execution, permission gates)
 ```
@@ -112,25 +133,29 @@ Builtin tools live in `tools/builtin/` and self-register via `@tool` through `to
 
 The three reference agent templates in `src/eonlet/templates/` (`assistant`, `x-digest`, `portfolio`) are both **usage examples** and **canonical fixtures** against which the runtime is designed. When in doubt about a config field's shape, check how these agents use it.
 
-### Memory Subsystem (three storage files + three compaction tiers)
+### Memory: two axes + tasks (ADR-0005)
 
-Per-agent memory lives under `~/.eonlet/eonlets/<id>/memory/`:
+Memory splits into **two axes with two policies**, plus tasks (workflow state, not memory). Per-agent layout under `~/.eonlet/eonlets/<id>/`:
 
 ```
-working_memory.md   → recent conversation context (in-process buffer)
-short_term.md       → STM: dated sections (tier-1 compaction target)
-long_term.md        → LTM: categorized bullets with src/ts (tier-2 target)
-notes.md            → user-curated notes; YAML frontmatter; never auto-deleted
-todos.jsonl         → action items with status/due/priority
-recall.db           → SQLite FTS5 index over event log + memory files
+memory/
+  short_term.md         → episodic STM: dated sections (tier-1 target)
+  long_term.md          → episodic LTM: dated summaries only (tier-2/3 target)
+  knowledge/            → AXIS 2 — curated, hierarchical, NEVER auto-deleted
+    index.md            →   the agent-curated map; injected whole every call
+    user.md, rules/…    →   one file per topic; bodies opened on demand
+  index.sqlite          → SQLite FTS5 index over the event log
+tasks/
+  todos.jsonl           → action items (pending/done/cancelled) — MOVED out of memory/
 ```
 
-**Compaction cascade (tier1 → tier2 → tier3):**
-1. **Tier-1** (`memory/tier1.py`): LLM-driven working memory → STM sections. Fires automatically when working memory exceeds budget.
-2. **Tier-2** (`memory/tier2.py`): STM sections → LTM bullets when STM exceeds budget.
-3. **Tier-3** (`memory/tier3.py`): LTM self-compaction (LLM-driven deletion) when LTM exceeds budget.
+- **Axis 1 — episodic** (`memory/`): the conversation timeline. Working → STM → LTM via the compaction cascade. It *decays* — that's correct for a timeline.
+  1. **Tier-1** (`memory/tier1.py`): working memory → STM sections when working memory exceeds budget.
+  2. **Tier-2** (`memory/tier2.py`): STM → dated `episodic` LTM bullets when STM exceeds budget.
+  3. **Tier-3** (`memory/tier3.py`): LTM self-compaction (uniform recency/salience — no `src:explicit` exemption) when LTM exceeds budget.
+- **Axis 2 — knowledge** (`memory/knowledge/`): durable facts/rules/preferences the agent curates deliberately via the `knowledge` tool. Never budget-forgotten. Only `index.md` (the map) is injected; bodies are opened on demand by path.
 
-`memory/injection.py` injects the working + STM + LTM + notes + todos preamble into each LLM call.
+`memory/injection.py` builds the `<memory>` preamble (`<knowledge_index>` + `<short_term>` + `<long_term>`) and, separately, `build_tasks_block` injects a sibling `<tasks>` block from `tasks/` — **outside** `<memory>`.
 
 ---
 
@@ -148,30 +173,31 @@ src/eonlet/
 │   ├── openai_provider.py
 │   ├── fake_provider.py  — Deterministic FakeProvider (fake-echo, fake-tool-then-text)
 │   └── factory.py        — Provider selection by model prefix
-├── memory/               — Full memory subsystem (v0.0.6)
-│   ├── config.py         — MemoryConfig (budgets, enabled, compaction_model)
+├── memory/               — Dual-axis memory subsystem (v0.0.6, re-architected v0.0.8 / ADR-0005)
+│   ├── config.py         — MemoryConfig (EpisodicMemoryConfig + KnowledgeMemoryConfig)
 │   ├── stm.py            — STMStore (short_term.md sections)
-│   ├── ltm.py            — LTMStore (long_term.md bullets)
-│   ├── notes.py          — NotesStore (notes.md YAML-frontmatter)
-│   ├── todos.py          — TodosStore (todos.jsonl)
+│   ├── ltm.py            — LTMStore (long_term.md — episodic-only bullets)
+│   ├── knowledge.py      — KnowledgeStore (curated knowledge tree + index.md map)
 │   ├── recall.py         — RecallIndex (SQLite FTS5 search)
-│   ├── injection.py      — Context preamble injection
+│   ├── injection.py      — build_memory_preamble + build_tasks_block
 │   ├── compactor.py      — LLMCompactor (coordinates all tiers)
 │   ├── tier1.py          — Tier-1 runner (working → STM)
-│   ├── tier2.py          — Tier-2 runner (STM → LTM)
-│   ├── tier3.py          — Tier-3 runner (LTM forgetting)
-│   ├── migrate.py        — Claude Code memory migration
+│   ├── tier2.py          — Tier-2 runner (STM → episodic LTM)
+│   ├── tier3.py          — Tier-3 runner (episodic LTM forgetting; no exemptions)
 │   ├── storage.py        — atomic_write_text + file_lock
 │   ├── watermark.py      — Watermark tracking
 │   ├── tokens.py         — Token counting
-│   ├── ids.py            — ID generation
-│   └── paths.py          — Memory directory helpers
+│   └── paths.py          — Memory directory helpers (+ knowledge_root/index)
+├── tasks/                — Task / workflow state (v0.0.8, ADR-0005 — NOT memory)
+│   ├── store.py          — TaskStore (tasks/todos.jsonl)
+│   ├── config.py         — TasksConfig (inject_pending, archive_done_after_days)
+│   └── ids.py            — mint_task_id
 ├── permissions/
 │   └── gate.py           — Permission gate (ask / yolo modes + hardcoded deny list)
 ├── runtime/
 │   ├── agent.py          — AgentRuntime (main loop, ~460 lines)
 │   ├── definition.py     — Load agent.yaml + per-agent tools
-│   ├── events.py         — EventKind (37 variants), Event model
+│   ├── events.py         — EventKind (39 variants), Event model
 │   ├── state.py          — AgentState (event-sourced)
 │   └── store.py          — SQLite event store (append-only)
 ├── templates/            — Bundled example agents (config.yaml + 3 agent dirs)
@@ -181,26 +207,34 @@ src/eonlet/
 ├── tools/
 │   ├── protocol.py       — Tool interface, ToolContext, ToolResult
 │   ├── registry.py       — Tool registration + @tool decorator
-│   └── builtin/          — 13 modules, 21+ individual tools
+│   └── builtin/          — 11 modules
 │       ├── bash.py       — bash (shell execution)
 │       ├── files.py      — file_read, file_write, file_edit, glob, grep
-│       ├── web.py        — web_search (Tavily), web_fetch (httpx)
+│       ├── web.py        — web_search (Tavily / DDG), web_fetch (HTTPFetcher → trafilatura)
 │       ├── email.py      — send_email
 │       ├── sleep_tool.py — sleep
 │       ├── skill_tool.py — load_skill
 │       ├── schedule.py   — schedule (one-off future trigger)
-│       ├── memory.py     — memory (compact / pause / resume)
-│       ├── note.py       — note (add / get / list / delete)
-│       ├── todo.py       — todo (add / done / cancel / list)
-│       ├── recall.py     — recall (keyword + date + category search)
-│       ├── remember.py   — remember (explicit LTM write)
-│       └── forget.py     — forget (dry-run + confirmed LTM delete)
+│       ├── memory.py     — memory (show / compact / propose_compact / compact_ltm / pause / resume)
+│       ├── knowledge.py  — knowledge (open / list / write / edit / delete / move)
+│       ├── task.py       — task (add / list / done / cancel / update / delete)
+│       └── recall.py     — recall (keyword + date; events / knowledge / tasks scopes)
 ├── triggers/
 │   ├── scheduler.py      — Cron scheduler (croniter + IANA tz, catch-up, backoff)
 │   └── dynamic_store.py  — Persistent trigger state (last run, failure count)
+├── web/                  — Web subsystem (v0.0.7, ADR-0004)
+│   ├── ssrf.py           — SSRF classification (IPv4/IPv6, cloud-metadata)
+│   ├── transport.py      — HTTPFetcher (httpx + retries + size cap)
+│   ├── fetch.py          — extract_html / extract_text + ExtractedContent
+│   ├── pagination.py     — Token-window paginate / PaginatedSlice
+│   └── search/           — Search backends (two paths, no abstraction)
+│       ├── types.py      — SearchHit / SearchResponse
+│       ├── tavily.py     — Tavily REST API call via HTTPFetcher
+│       └── ddg.py        — DuckDuckGo HTML scrape (fragile fallback)
 └── worker/
     ├── main.py           — Worker entry point + _worker_main
     ├── ipc.py            — Unix socket JSON-RPC server + IPCClient demuxer
+    ├── decisions.py      — DecisionBroker (blocking user-consent round-trip, ADR-0006)
     └── lifecycle.py      — write_pid, write_status, write_heartbeat, read_meta
 ```
 
@@ -215,27 +249,33 @@ tests/
 │   ├── test_worker_inprocess.py         — run_worker() inside pytest (pytest-cov friendly)
 │   └── test_worker_subprocess.py        — python -m eonlet.worker.main real OS process
 └── unit/
-    ├── memory/                          — 21 test files for memory subsystem
-    │   ├── test_ltm.py                  — LTMStore CRUD + budgeting
+    ├── memory/                          — memory subsystem tests
+    │   ├── test_ltm.py                  — LTMStore (episodic-only) CRUD
     │   ├── test_stm.py                  — STMStore sections
-    │   ├── test_notes_store.py          — NotesStore YAML frontmatter
-    │   ├── test_todos_store.py          — TodosStore JSONL
+    │   ├── test_knowledge_store.py      — KnowledgeStore CRUD + index sync + path safety
+    │   ├── test_tools_knowledge.py      — knowledge tool dispatch + events
     │   ├── test_recall_index.py         — RecallIndex FTS5 search
-    │   ├── test_recall_tool.py          — recall tool behavior
-    │   ├── test_remember_forget.py      — remember/forget tool pair
+    │   ├── test_recall_tool.py          — recall tool (events / knowledge / tasks)
     │   ├── test_tier1.py               — Working → STM compaction
-    │   ├── test_tier2.py               — STM → LTM promotion
-    │   ├── test_tier3.py               — LTM forgetting
+    │   ├── test_tier2.py               — STM → episodic LTM promotion
+    │   ├── test_tier3.py               — Episodic LTM forgetting
     │   ├── test_compactor.py           — Full compaction flow
     │   ├── test_agent_injection.py     — Full agent context injection
-    │   ├── test_injection.py           — Preamble injection unit
-    │   ├── test_tools_note_todo.py     — note + todo tool integration
-    │   ├── test_migrate.py             — Claude Code memory migration
+    │   ├── test_injection.py           — Preamble + <tasks> injection unit
     │   ├── test_config.py              — MemoryConfig validation
-    │   ├── test_events.py              — Memory-related events
+    │   ├── test_events.py              — Memory / knowledge / task events
     │   ├── test_storage.py             — Atomic file writes
     │   ├── test_watermark.py           — Watermark tracking
     │   └── test_paths.py              — Memory path helpers
+    ├── tasks/                           — Task subsystem tests (v0.0.8)
+    │   ├── test_store.py               — TaskStore JSONL + state machine
+    │   └── test_tools_task.py          — task tool dispatch + events
+    ├── web/                             — Web subsystem tests (v0.0.7)
+    │   ├── test_ssrf.py                 — IP classification + check_url
+    │   ├── test_transport.py            — HTTPFetcher retries + size cap
+    │   ├── test_extract.py              — HTML/text/JSON extraction
+    │   ├── test_pagination.py           — Token-window slicing
+    │   └── test_search.py               — Tavily + DDG backends
     ├── test_event_store.py             — SQLite event store
     ├── test_providers.py               — Anthropic + OpenAI adapters
     ├── test_fake_provider.py           — FakeProvider determinism
@@ -259,7 +299,7 @@ tests/
     └── test_cli_commands_extra.py      — Additional CLI commands
 ```
 
-**Current coverage: 145+ tests, ≥72.6% branch coverage. CI gate: `--cov-fail-under=70`.**
+**Current coverage: 520+ tests, ≥72% branch coverage. CI gate: `--cov-fail-under=70`. Web subsystem (`src/eonlet/web/`) ≥94%; rewritten `tools/builtin/web.py` ≥91%.**
 
 ---
 
@@ -339,7 +379,7 @@ When editing or adding example agents under `src/eonlet/templates/`:
 4. **Tool registration is automatic.** Importing `eonlet.tools.builtin` registers all builtins. Never manually call `registry.register()` for builtins.
 5. **anyio, not asyncio.** Every async primitive must be from `anyio` or `anyio.abc`. Mixed usage breaks the backend abstraction.
 6. **No supervisor in v0.1.** The CLI directly manages worker processes. `eonletd` is a v0.4+ concern (ADR-0001).
-7. **Memory package is fully implemented.** `src/eonlet/memory/` is not a placeholder — it is the complete v0.0.6 memory subsystem with 16 modules and 56 unit tests.
+7. **Memory is the dual-axis model (ADR-0005), not a placeholder.** `src/eonlet/memory/` is the episodic axis (working→STM→LTM compaction) plus the curated `knowledge/` axis; tasks live in the separate `src/eonlet/tasks/` package, not memory. There is no `notes`/`remember`/`forget`/`todo` tool and no migration tool — don't reintroduce them.
 
 ---
 

@@ -37,8 +37,6 @@ def test_show_all_empty(tmp_path: Path) -> None:
     assert not result.is_error
     assert "short_term" in result.content
     assert "long_term" in result.content
-    assert "notes" in result.content
-    assert "todos" in result.content
 
 
 def test_show_stm_only_with_file(tmp_path: Path) -> None:
@@ -59,33 +57,13 @@ def test_show_ltm_only_with_file(tmp_path: Path) -> None:
     assert "bullet" in result.content
 
 
-def test_show_notes_with_entries(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    note_content = "---\nid: n1\ntitle: My Note\ntags: []\ncreated_at: 2026-05-22T00:00:00+00:00\n---\n\nbody text\n\n"
-    (ctx.memory_dir / "notes.md").write_text(note_content, encoding="utf-8")
-    result = anyio.run(MemoryTool().__call__, MemoryArgs(action="show", store="notes"), ctx)
-    assert not result.is_error
-    assert "notes" in result.content
+def test_show_rejects_retired_todos_store(tmp_path: Path) -> None:
+    # Tasks left memory (ADR-0005); `store="todos"` is no longer a valid option.
+    import pytest as _pytest
+    from pydantic import ValidationError
 
-
-def test_show_todos_with_entries(tmp_path: Path) -> None:
-    import json
-
-    ctx = _ctx(tmp_path)
-    lines = [
-        json.dumps(
-            {
-                "id": "t1",
-                "content": "task one",
-                "status": "pending",
-                "created_at": "2026-05-22T00:00:00+00:00",
-            }
-        ),
-    ]
-    (ctx.memory_dir / "todos.jsonl").write_text("\n".join(lines), encoding="utf-8")
-    result = anyio.run(MemoryTool().__call__, MemoryArgs(action="show", store="todos"), ctx)
-    assert not result.is_error
-    assert "todos" in result.content
+    with _pytest.raises(ValidationError):
+        MemoryArgs(action="show", store="todos")  # type: ignore[arg-type]
 
 
 # ── compact — no runtime ──────────────────────────────────────────────────────

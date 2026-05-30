@@ -46,6 +46,11 @@ class Decision:
     allowed: bool
     reason: str
     rule: str  # e.g. "hardcoded_deny", "ask_no_session", "yolo", "default_allow"
+    # True when the decision is *tentative* and must be confirmed by the user
+    # interactively (ADR-0006). The runtime, holding a decision broker, asks the
+    # attached user and upgrades the result to allow/deny. With no broker the
+    # tentative ``allowed`` (False) stands — i.e. deny when nobody can confirm.
+    needs_prompt: bool = False
 
 
 # Pattern syntax: `Tool(pattern)` where pattern is a glob.
@@ -102,11 +107,14 @@ class PermissionGate:
             return Decision(True, "non-destructive read", "ask_non_destructive")
 
         if self.session_attached:
-            # The worker IPC layer is responsible for prompting and overriding
-            # this decision interactively. For now, allow — v0.0.2 will gate
-            # interactively via a session callback.
+            # Tentative: the runtime confirms with the attached user via the
+            # decision broker (ADR-0006). The broker re-checks attachment at ask
+            # time and auto-declines if nobody is actually listening.
             return Decision(
-                True, "ask mode, session attached (auto-allowed in v0.0.1)", "ask_attached"
+                False,
+                "ask mode: destructive tool needs user confirmation",
+                "ask_prompt",
+                needs_prompt=True,
             )
 
         return Decision(False, "ask mode and no session attached", "ask_no_session")

@@ -6,20 +6,35 @@ import pytest
 
 from eonlet.runtime.events import (
     EventKind,
+    kb_deleted,
+    kb_moved,
+    kb_written,
+    mem_compact_approved,
+    mem_compact_declined,
+    mem_compact_proposed,
     mem_compacted,
     mem_ltm_forgotten,
     mem_ltm_promoted,
-    mem_note_added,
-    mem_note_deleted,
-    mem_note_updated,
     mem_paused,
     mem_recall_invoked,
-    mem_remember,
     mem_resumed,
-    mem_todo_added,
-    mem_todo_deleted,
-    mem_todo_updated,
+    session_ended,
+    session_started,
+    task_added,
+    task_deleted,
+    task_updated,
 )
+
+
+def test_session_helpers_carry_reason() -> None:
+    started = session_started(reason="compact")
+    ended = session_ended(reason="compact")
+    assert started.kind is EventKind.SESSION_STARTED
+    assert ended.kind is EventKind.SESSION_ENDED
+    assert started.payload == {"reason": "compact"}
+    assert ended.payload == {"reason": "compact"}
+    # Omitted reason → empty payload.
+    assert session_started().payload == {}
 
 
 def test_all_memory_kinds_exist() -> None:
@@ -27,20 +42,53 @@ def test_all_memory_kinds_exist() -> None:
         "mem_compacted",
         "mem_ltm_promoted",
         "mem_ltm_forgotten",
-        "mem_note_added",
-        "mem_note_updated",
-        "mem_note_deleted",
-        "mem_todo_added",
-        "mem_todo_updated",
-        "mem_todo_deleted",
-        "mem_remember",
         "mem_recall_invoked",
         "mem_paused",
         "mem_resumed",
+        "kb_written",
+        "kb_deleted",
+        "kb_moved",
+        "task_added",
+        "task_updated",
+        "task_deleted",
+        "mem_compact_proposed",
+        "mem_compact_approved",
+        "mem_compact_declined",
     }
     actual = {k.value for k in EventKind}
     missing = expected - actual
     assert not missing, f"missing event kinds: {missing}"
+
+
+def test_eventkind_count_is_39() -> None:
+    # ADR-0006 added the three mem_compact_* variants (36 → 39).
+    assert len(list(EventKind)) == 39
+
+
+def test_compact_proposal_helpers() -> None:
+    proposed = mem_compact_proposed(boundary_event_id=12, reason="moved on", working_tokens=6000)
+    assert proposed.kind is EventKind.MEM_COMPACT_PROPOSED
+    assert proposed.payload == {
+        "boundary_event_id": 12,
+        "reason": "moved on",
+        "working_tokens": 6000,
+    }
+    approved = mem_compact_approved(boundary_event_id=12, rule="yolo")
+    assert approved.kind is EventKind.MEM_COMPACT_APPROVED
+    assert approved.payload == {"boundary_event_id": 12, "rule": "yolo"}
+    declined = mem_compact_declined(boundary_event_id=12)
+    assert declined.kind is EventKind.MEM_COMPACT_DECLINED
+    assert declined.payload == {"boundary_event_id": 12, "rule": "user"}
+
+
+def test_retired_event_kinds_absent() -> None:
+    # ADR-0005 retired these; guard against accidental reintroduction.
+    actual = {k.value for k in EventKind}
+    assert "mem_remember" not in actual
+    assert "mem_note_added" not in actual
+    assert "mem_todo_added" not in actual  # renamed to task_added
+    assert "mem_todo_updated" not in actual
+    assert "mem_todo_deleted" not in actual
 
 
 def test_mem_compacted_payload() -> None:
@@ -62,12 +110,12 @@ def test_mem_compacted_payload() -> None:
 def test_mem_ltm_promoted_carries_additions() -> None:
     ev = mem_ltm_promoted(
         snapshot_id=100,
-        additions=[{"section": "user", "content": "prefers concise replies"}],
+        additions=[{"section": "episodic", "content": "2026-05-22: shipped web tools"}],
         kept_section_count=3,
         model="fake-echo",
     )
     assert ev.kind == EventKind.MEM_LTM_PROMOTED
-    assert ev.payload["additions"][0]["section"] == "user"
+    assert ev.payload["additions"][0]["section"] == "episodic"
     assert ev.payload["kept_section_count"] == 3
 
 
@@ -86,51 +134,44 @@ def test_mem_ltm_forgotten_tier3() -> None:
     assert ev.payload["model"] == "fake-echo"
 
 
-def test_mem_ltm_forgotten_forget_action_omits_optional() -> None:
+def test_mem_ltm_forgotten_omits_optional_when_absent() -> None:
     ev = mem_ltm_forgotten(
         kept_count=5,
         dropped_count=1,
-        dropped_digest=[{"section": "fact", "preview": "x", "reason": "user_forget"}],
-        cause="forget",
+        dropped_digest=[{"section": "episodic", "preview": "x", "reason": "stale"}],
     )
     assert "model" not in ev.payload
     assert "snapshot_id" not in ev.payload
-    assert ev.payload["cause"] == "forget"
+    assert ev.payload["cause"] == "tier3"  # the only valid cause now
 
 
-def test_mem_ltm_forgotten_rejects_bad_cause() -> None:
+def test_mem_ltm_forgotten_rejects_retired_forget_cause() -> None:
+    # ADR-0005 retired the `forget` tool and its cause variant.
     with pytest.raises(ValueError):
-        mem_ltm_forgotten(
-            kept_count=0,
-            dropped_count=0,
-            dropped_digest=[],
-            cause="bogus",
-        )
+        mem_ltm_forgotten(kept_count=0, dropped_count=0, dropped_digest=[], cause="forget")
 
 
-def test_note_event_shapes() -> None:
-    a = mem_note_added(id="note-1", title="t", tags=["x"])
-    u = mem_note_updated(id="note-1")
-    d = mem_note_deleted(id="note-1")
-    assert a.kind == EventKind.MEM_NOTE_ADDED and a.payload["id"] == "note-1"
-    assert u.kind == EventKind.MEM_NOTE_UPDATED
-    assert d.kind == EventKind.MEM_NOTE_DELETED
+def test_kb_event_shapes() -> None:
+    w = kb_written(path="rules/testing.md", size=42, action="write")
+    e = kb_written(path="rules/testing.md", size=10, action="edit")
+    d = kb_deleted(path="rules/testing.md")
+    m = kb_moved(src="a.md", dst="b.md")
+    assert w.kind == EventKind.KB_WRITTEN and w.payload["action"] == "write"
+    assert e.payload["action"] == "edit"
+    assert d.kind == EventKind.KB_DELETED and d.payload["path"] == "rules/testing.md"
+    assert (
+        m.kind == EventKind.KB_MOVED and m.payload["src"] == "a.md" and m.payload["dst"] == "b.md"
+    )
 
 
-def test_todo_event_shapes() -> None:
-    a = mem_todo_added(id="todo-1", content="do x", due=None, tags=[])
-    u = mem_todo_updated(id="todo-1", status="done", done_at="2026-05-22T15:00:00+08:00")
-    d = mem_todo_deleted(id="todo-1")
-    assert a.kind == EventKind.MEM_TODO_ADDED
-    assert u.kind == EventKind.MEM_TODO_UPDATED
+def test_task_event_shapes() -> None:
+    a = task_added(id="task-1", content="do x", due=None, tags=[])
+    u = task_updated(id="task-1", status="done", done_at="2026-05-22T15:00:00+08:00")
+    d = task_deleted(id="task-1")
+    assert a.kind == EventKind.TASK_ADDED
+    assert u.kind == EventKind.TASK_UPDATED
     assert u.payload["status"] == "done"
-    assert d.kind == EventKind.MEM_TODO_DELETED
-
-
-def test_remember_event_shape() -> None:
-    ev = mem_remember(section="user", content_preview="prefers...", ts="2026-05-22")
-    assert ev.kind == EventKind.MEM_REMEMBER
-    assert ev.payload["src"] == "explicit"
+    assert d.kind == EventKind.TASK_DELETED
 
 
 def test_recall_invoked_omits_optional() -> None:

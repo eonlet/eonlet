@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import anyio
@@ -9,11 +10,12 @@ import anyio
 from eonlet.memory.config import MemoryConfig
 from eonlet.memory.injection import (
     build_memory_preamble,
+    build_tasks_block,
+    format_turn_timestamp,
+    prefix_user_timestamp,
     select_recent_window,
     working_window_token_estimate,
 )
-from eonlet.memory.notes import NotesStore
-from eonlet.memory.todos import TodosStore
 from eonlet.runtime.events import (
     Event,
     EventKind,
@@ -22,10 +24,33 @@ from eonlet.runtime.events import (
     tool_result,
     user_message,
 )
+from eonlet.tasks import TaskStore
+from eonlet.tasks.config import TasksConfig
 
 
 def _evt(ev: Event, *, id_: int) -> Event:
     return ev.model_copy(update={"id": id_})
+
+
+# ── per-turn timestamp rendering (ADR-0006) ─────────────────────────────────
+
+_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} [+-]\d{2}:\d{2}\]$")
+
+
+def test_format_turn_timestamp_shape() -> None:
+    # 2026-05-30T12:00:00Z = 1_780_142_400 s.
+    tag = format_turn_timestamp(1_780_142_400 * 1_000_000)
+    assert _STAMP_RE.match(tag), tag
+
+
+def test_prefix_user_timestamp_adds_tag() -> None:
+    out = prefix_user_timestamp("hello", 1_780_142_400 * 1_000_000)
+    assert out.endswith(" hello")
+    assert _STAMP_RE.match(out.removesuffix(" hello"))
+
+
+def test_prefix_user_timestamp_none_passthrough() -> None:
+    assert prefix_user_timestamp("hello", None) == "hello"
 
 
 # ── preamble assembly ──────────────────────────────────────────────────────
@@ -54,49 +79,70 @@ def test_preamble_includes_ltm_when_present(tmp_path: Path) -> None:
     assert "</memory>" in out
 
 
-def test_preamble_includes_pending_todos_only(tmp_path: Path) -> None:
-    store = TodosStore(tmp_path)
+def test_preamble_injects_knowledge_index(tmp_path: Path) -> None:
+    kdir = tmp_path / "knowledge"
+    kdir.mkdir()
+    (kdir / "index.md").write_text("# Knowledge Index\n\n- [Testing](rules/testing.md) — DB rule\n")
+    cfg = MemoryConfig()
+    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
+    assert "<knowledge_index>" in out
+    assert "rules/testing.md" in out
+    assert "DB rule" in out
+
+
+def test_preamble_omits_knowledge_index_when_disabled(tmp_path: Path) -> None:
+    kdir = tmp_path / "knowledge"
+    kdir.mkdir()
+    (kdir / "index.md").write_text("# Knowledge Index\n\n- [A](a.md) — x\n")
+    cfg = MemoryConfig()
+    cfg.knowledge.inject_index = False
+    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
+    assert "<knowledge_index>" not in out
+
+
+def test_preamble_knowledge_index_tree_fallback(tmp_path: Path) -> None:
+    # Files present, no index.md → injection regenerates a map from the tree.
+    kdir = tmp_path / "knowledge"
+    (kdir / "rules").mkdir(parents=True)
+    (kdir / "rules" / "testing.md").write_text("body")
+    cfg = MemoryConfig()
+    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
+    assert "<knowledge_index>" in out
+    assert "rules/testing.md" in out
+
+
+def test_preamble_does_not_include_tasks(tmp_path: Path) -> None:
+    # Tasks live OUTSIDE <memory> now (ADR-0005) — the preamble must not carry them.
+    (tmp_path / "long_term.md").write_text("LTM-MARKER")
+    cfg = MemoryConfig()
+    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
+    assert "<tasks>" not in out
+    assert "<todos>" not in out
+
+
+# ── tasks block (sibling of <memory>) ──────────────────────────────────────
+
+
+def test_tasks_block_includes_pending_only(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path)
     anyio.run(lambda: store.add(id="t1", content="do thing"))
     anyio.run(lambda: store.add(id="t2", content="archived"))
     anyio.run(lambda: store.mark_done(id="t2"))
-    cfg = MemoryConfig()
-    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
+    out = anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig()))
+    assert out.startswith("<tasks>")
     assert "do thing" in out
     assert "archived" not in out  # done items NOT injected
 
 
-def test_preamble_ordering_long_notes_todos_short(tmp_path: Path) -> None:
-    (tmp_path / "long_term.md").write_text("LTM-MARKER")
-    (tmp_path / "short_term.md").write_text("STM-MARKER")
-    nstore = NotesStore(tmp_path)
-    anyio.run(lambda: nstore.add(id="n1", content="NOTE-MARKER"))
-    tstore = TodosStore(tmp_path)
-    anyio.run(lambda: tstore.add(id="t1", content="TODO-MARKER"))
-
-    cfg = MemoryConfig()
-    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
-    # All four substrings present and in spec-ordered positions
-    p_ltm = out.index("LTM-MARKER")
-    p_note = out.index("NOTE-MARKER")
-    p_todo = out.index("TODO-MARKER")
-    p_stm = out.index("STM-MARKER")
-    assert p_ltm < p_note < p_todo < p_stm
+def test_tasks_block_empty_when_no_pending(tmp_path: Path) -> None:
+    assert anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig())) == ""
 
 
-def test_preamble_omits_notes_when_inject_false(tmp_path: Path) -> None:
-    nstore = NotesStore(tmp_path)
-    anyio.run(lambda: nstore.add(id="n1", content="HIDDEN"))
-    cfg = MemoryConfig.model_validate({"notes": {"inject": False}})
-    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
-    assert "HIDDEN" not in out
-
-
-def test_preamble_omits_todos_when_inject_active_false(tmp_path: Path) -> None:
-    tstore = TodosStore(tmp_path)
-    anyio.run(lambda: tstore.add(id="t1", content="HIDDEN_TODO"))
-    cfg = MemoryConfig.model_validate({"todos": {"inject_active": False}})
-    out = anyio.run(lambda: build_memory_preamble(tmp_path, cfg))
-    assert "HIDDEN_TODO" not in out
+def test_tasks_block_omitted_when_inject_pending_false(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path)
+    anyio.run(lambda: store.add(id="t1", content="HIDDEN_TASK"))
+    out = anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig(inject_pending=False)))
+    assert out == ""
 
 
 # ── recent window selection ────────────────────────────────────────────────
@@ -117,7 +163,7 @@ def test_window_respects_watermark() -> None:
 def test_window_keeps_min_messages_even_under_tight_budget() -> None:
     events = [_evt(user_message("x" * 5000), id_=i) for i in range(1, 6)]
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 3}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 3}}
     )
     out = select_recent_window(events, cfg, watermark=0)
     # min=3 guarantees we keep the last 3 even when budget is blown.
@@ -134,7 +180,7 @@ def test_window_skips_orphan_tool_result_at_boundary() -> None:
         _evt(user_message("u2"), id_=5),
     ]
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 64, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 64, "keep_recent_messages_min": 1}}
     )
     out = select_recent_window(events, cfg, watermark=3)  # only events with id>3
     # id=4 is a tool_result whose call is outside the window → must be skipped.

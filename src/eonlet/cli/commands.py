@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -403,14 +404,25 @@ def cmd_attach(eonlet_id: str, readonly: bool) -> None:
     anyio.run(_attach_async, eid, str(sock), readonly)
 
 
+@dataclass(slots=True)
+class _DecisionPrompt:
+    """Shared between the event printer (which receives ``decision/request``
+    notifications) and the input reader (which routes the user's next typed line
+    to ``decision.respond``). Keeps the single stdin owner — no read races."""
+
+    id: str | None = None
+    options: list[str] = field(default_factory=list)
+
+
 async def _attach_async(eid: str, sock: str, readonly: bool) -> None:
     async with IPCClient(sock) as client, anyio.create_task_group() as tg:
         tg.start_soon(client.run)
         info = await client.request("session.start", {"client_id": "cli"})
         _print_attach_banner(eid, readonly, info)
-        tg.start_soon(_event_printer, client)
+        pending = _DecisionPrompt()
+        tg.start_soon(_event_printer, client, pending)
         if not readonly:
-            tg.start_soon(_input_reader, client, eid, tg.cancel_scope)
+            tg.start_soon(_input_reader, client, eid, tg.cancel_scope, pending)
 
 
 def _print_attach_banner(eid: str, readonly: bool, info: dict[str, Any] | None) -> None:
@@ -512,21 +524,21 @@ def _print_help() -> None:
     t.add_row("/trigger rm <id>", "remove a dynamic trigger")
     t.add_row("/trigger on|off <id>", "enable / disable a trigger")
     t.add_row("/trigger clear yes", "drop all dynamic triggers")
-    t.add_row("/note add <text>", "create a persistent note")
-    t.add_row("/note list [tag]", "list notes (optional tag filter)")
-    t.add_row("/note get <id>", "show one note in full")
-    t.add_row("/note rm <id>", "delete a note")
-    t.add_row("/todo add <text>", "add a pending todo")
-    t.add_row("/todo list [status]", "list todos (pending|done|cancelled|all)")
-    t.add_row("/todo done <id>", "mark a todo done")
-    t.add_row("/todo rm <id>", "delete a todo")
-    t.add_row("/compact", "force a tier-1 compaction pass right now")
+    t.add_row("/knowledge list", "list the curated knowledge map")
+    t.add_row("/knowledge open <path>", "print one knowledge file in full")
+    t.add_row("/knowledge write <path> <text>", "create/replace a knowledge file")
+    t.add_row("/knowledge rm <path>", "delete a knowledge file")
+    t.add_row("/task add <text>", "add a pending task")
+    t.add_row("/task list [status]", "list tasks (pending|done|cancelled|all)")
+    t.add_row("/task done <id>", "mark a task done")
+    t.add_row("/task rm <id>", "delete a task")
+    t.add_row("/compact", "full compaction now (empty working window, new episode)")
     t.add_row("/compact off|on", "toggle auto-compaction for this session")
-    t.add_row("/memory show [store]", "print stm|ltm|notes|todos|all")
+    t.add_row("/memory show [store]", "print stm|ltm|knowledge|all")
     console.print(t)
 
 
-async def _event_printer(client: IPCClient) -> None:
+async def _event_printer(client: IPCClient, pending: _DecisionPrompt) -> None:
     """Pretty-print server-pushed notifications.
 
     Streamed ``token_delta`` notifications are *buffered*, not echoed live.
@@ -573,6 +585,18 @@ async def _event_printer(client: IPCClient) -> None:
             text = params.get("delta_text") or ""
             stream_buf.append(text)
             _ensure_thinking_line()
+            continue
+        if method == "decision/request":
+            # The worker paused the turn to ask the user (ADR-0006). Stash the
+            # id so the input reader routes the next typed line to the answer.
+            pending.id = params.get("id")
+            pending.options = params.get("options") or ["approve", "deny"]
+            kind = params.get("kind") or "decision"
+            prompt = params.get("prompt") or ""
+            console.print(
+                f"\n[bold yellow]●[/] [yellow]{escape(str(kind))} confirm[/] — {escape(str(prompt))}"
+            )
+            console.print("[dim]   answer [bold]y[/]es or [bold]n[/]o at the prompt[/]")
             continue
         if method != "event":
             continue
@@ -637,9 +661,12 @@ def _short(v: Any, limit: int = 60) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-async def _input_reader(client: IPCClient, eid: str, cancel: anyio.CancelScope) -> None:
+async def _input_reader(
+    client: IPCClient, eid: str, cancel: anyio.CancelScope, pending: _DecisionPrompt
+) -> None:
     """Read user input via prompt_toolkit; send as message.send. Slash commands
-    are handled locally."""
+    are handled locally. While a decision is pending (ADR-0006), the next typed
+    line is routed to ``decision.respond`` instead of being sent as a message."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.formatted_text import ANSI
@@ -667,6 +694,17 @@ async def _input_reader(client: IPCClient, eid: str, cancel: anyio.CancelScope) 
             return
         line = (line or "").strip()
         if not line:
+            continue
+        if pending.id is not None:
+            # Route this line as the answer to the outstanding decision prompt.
+            did = pending.id
+            approve = line.lower() in {"y", "yes", "approve", "a", "ok"}
+            pending.id = None
+            pending.options = []
+            await client.request(
+                "decision.respond", {"id": did, "choice": "approve" if approve else "deny"}
+            )
+            console.print(f"[dim]   → {'approved' if approve else 'denied'}[/]")
             continue
         if line.startswith("/"):
             done = await _handle_slash(line, client, eid, cancel)
@@ -698,11 +736,11 @@ async def _handle_slash(line: str, client: IPCClient, eid: str, cancel: anyio.Ca
     if cmd in {"triggers", "trigger"}:
         await _handle_trigger_slash(rest, client)
         return False
-    if cmd in {"note", "notes"}:
-        await _handle_note_slash(rest, client)
+    if cmd in {"knowledge", "kb"}:
+        await _handle_knowledge_slash(rest, client)
         return False
-    if cmd in {"todo", "todos"}:
-        await _handle_todo_slash(rest, client)
+    if cmd in {"task", "tasks", "todo", "todos"}:
+        await _handle_task_slash(rest, client)
         return False
     if cmd == "compact":
         await _handle_compact_slash(rest, client)
@@ -866,15 +904,15 @@ async def _handle_trigger_slash(rest: str, client: IPCClient) -> None:
     console.print(f"[yellow]unknown trigger subcommand:[/] {sub}  (try /trigger)")
 
 
-async def _handle_note_slash(rest: str, client: IPCClient) -> None:
-    """Dispatch ``/note ...`` subcommands.
+async def _handle_knowledge_slash(rest: str, client: IPCClient) -> None:
+    """Dispatch ``/knowledge ...`` subcommands (ADR-0005).
 
     Forms:
-      /note                        — list all
-      /note list [tag]             — list (optional tag filter)
-      /note add <text>             — add a note
-      /note get <id>               — show one
-      /note rm <id>                — delete
+      /knowledge                       — list the map
+      /knowledge list                  — list the map
+      /knowledge open <path>           — print one file in full
+      /knowledge write <path> <text>   — create/replace a file
+      /knowledge rm <path>             — delete a file
     """
     from rich.table import Table
 
@@ -883,82 +921,70 @@ async def _handle_note_slash(rest: str, client: IPCClient) -> None:
     srest = srest.strip()
 
     if not sub or sub in {"ls", "list"}:
-        params: dict[str, Any] = {}
-        if srest:
-            params["tags"] = [srest]
-        resp = await client.request("memory.note.list", params)
-        notes = (resp or {}).get("notes") or []
-        if not notes:
-            console.print("[dim](no notes)[/]")
+        resp = await client.request("memory.knowledge.list", {})
+        entries = (resp or {}).get("knowledge") or []
+        if not entries:
+            console.print("[dim](knowledge base is empty)[/]")
             return
         t = Table(show_header=True, header_style="bold")
-        t.add_column("ID")
+        t.add_column("PATH")
         t.add_column("TITLE")
-        t.add_column("TAGS")
-        t.add_column("CREATED")
-        for n in notes:
-            t.add_row(
-                str(n.get("id", "?")),
-                str(n.get("title") or ""),
-                ", ".join(n.get("tags") or []),
-                str(n.get("created_at") or ""),
-            )
+        t.add_column("HOOK")
+        for e in entries:
+            t.add_row(str(e.get("path", "?")), str(e.get("title") or ""), str(e.get("hook") or ""))
         console.print(t)
         return
 
-    if sub == "add":
+    if sub == "open":
         if not srest:
-            console.print("[yellow]usage:[/] /note add <text>")
+            console.print("[yellow]usage:[/] /knowledge open <path>")
             return
-        resp = await client.request("memory.note.add", {"content": srest})
+        resp = await client.request("memory.knowledge.open", {"path": srest})
+        if not resp.get("ok"):
+            console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
+            return
+        console.print(f"[bold]{resp['path']}[/]")
+        console.print(resp.get("body") or "")
+        return
+
+    if sub == "write":
+        path, _, body = srest.partition(" ")
+        if not path or not body.strip():
+            console.print("[yellow]usage:[/] /knowledge write <path> <text>")
+            return
+        resp = await client.request(
+            "memory.knowledge.write", {"path": path, "content": body.strip()}
+        )
         if resp.get("ok"):
-            console.print(f"[green]added[/] {resp.get('id')}")
+            console.print(f"[green]wrote[/] {resp.get('path')}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
 
-    if sub == "get":
-        if not srest:
-            console.print("[yellow]usage:[/] /note get <id>")
-            return
-        resp = await client.request("memory.note.get", {"id": srest})
-        if not resp.get("ok"):
-            console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
-            return
-        n = resp["note"]
-        header = f"[bold]{n['id']}[/]"
-        if n.get("title"):
-            header += f" — {n['title']}"
-        if n.get("tags"):
-            header += "  (tags: " + ", ".join(n["tags"]) + ")"
-        console.print(header)
-        if n.get("body"):
-            console.print(n["body"])
-        return
-
     if sub in {"rm", "delete", "del"}:
         if not srest:
-            console.print("[yellow]usage:[/] /note rm <id>")
+            console.print("[yellow]usage:[/] /knowledge rm <path>")
             return
-        resp = await client.request("memory.note.delete", {"id": srest})
+        resp = await client.request("memory.knowledge.delete", {"path": srest})
         if resp.get("ok"):
             console.print(f"[green]deleted[/] {srest}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
 
-    console.print(f"[yellow]unknown note subcommand:[/] {sub}  (try /help)")
+    console.print(f"[yellow]unknown knowledge subcommand:[/] {sub}  (try /help)")
 
 
-async def _handle_todo_slash(rest: str, client: IPCClient) -> None:
-    """Dispatch ``/todo ...`` subcommands.
+async def _handle_task_slash(rest: str, client: IPCClient) -> None:
+    """Dispatch ``/task ...`` subcommands (ADR-0005; replaces ``/todo``).
 
     Forms:
-      /todo                        — list pending
-      /todo list [status]          — list with status filter
-      /todo add <text>             — add pending todo
-      /todo done <id>              — mark done
-      /todo rm <id>                — delete
+      /task                        — list pending
+      /task list [status]          — list with status filter
+      /task add <text>             — add pending task
+      /task done <id>              — mark done
+      /task cancel <id>            — mark cancelled
+      /task rm <id>                — delete
     """
     from rich.table import Table
 
@@ -971,17 +997,17 @@ async def _handle_todo_slash(rest: str, client: IPCClient) -> None:
         if status not in ("pending", "done", "cancelled", "all"):
             console.print(f"[yellow]bad status:[/] {status}")
             return
-        resp = await client.request("memory.todo.list", {"status": status})
-        todos = (resp or {}).get("todos") or []
-        if not todos:
-            console.print(f"[dim](no {status} todos)[/]")
+        resp = await client.request("task.list", {"status": status})
+        tasks = (resp or {}).get("tasks") or []
+        if not tasks:
+            console.print(f"[dim](no {status} tasks)[/]")
             return
         t = Table(show_header=True, header_style="bold")
         t.add_column("ID")
         t.add_column("STATUS")
         t.add_column("DUE")
         t.add_column("CONTENT")
-        for td in todos:
+        for td in tasks:
             t.add_row(
                 str(td.get("id", "?")),
                 str(td.get("status", "?")),
@@ -993,45 +1019,46 @@ async def _handle_todo_slash(rest: str, client: IPCClient) -> None:
 
     if sub == "add":
         if not srest:
-            console.print("[yellow]usage:[/] /todo add <text>")
+            console.print("[yellow]usage:[/] /task add <text>")
             return
-        resp = await client.request("memory.todo.add", {"content": srest})
+        resp = await client.request("task.add", {"content": srest})
         if resp.get("ok"):
             console.print(f"[green]added[/] {resp.get('id')}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
 
-    if sub == "done":
+    if sub in {"done", "cancel"}:
         if not srest:
-            console.print("[yellow]usage:[/] /todo done <id>")
+            console.print(f"[yellow]usage:[/] /task {sub} <id>")
             return
-        resp = await client.request("memory.todo.done", {"id": srest})
+        resp = await client.request(f"task.{sub}", {"id": srest})
         if resp.get("ok"):
-            console.print(f"[green]done[/] {srest}")
+            console.print(f"[green]{sub}[/] {srest}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
 
     if sub in {"rm", "delete", "del"}:
         if not srest:
-            console.print("[yellow]usage:[/] /todo rm <id>")
+            console.print("[yellow]usage:[/] /task rm <id>")
             return
-        resp = await client.request("memory.todo.delete", {"id": srest})
+        resp = await client.request("task.delete", {"id": srest})
         if resp.get("ok"):
             console.print(f"[green]deleted[/] {srest}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
 
-    console.print(f"[yellow]unknown todo subcommand:[/] {sub}  (try /help)")
+    console.print(f"[yellow]unknown task subcommand:[/] {sub}  (try /help)")
 
 
 async def _handle_compact_slash(rest: str, client: IPCClient) -> None:
     """``/compact`` family.
 
     Forms:
-      /compact            — force tier-1 now
+      /compact            — full compaction now: summarize the whole working
+                            window into STM, empty it, and start a fresh episode
       /compact off        — disable auto-compaction (session)
       /compact on         — enable auto-compaction
     """
@@ -1074,10 +1101,10 @@ async def _handle_memory_slash(rest: str, client: IPCClient) -> None:
     sub = sub.lower()
     srest = srest.strip()
     if sub != "show":
-        console.print("[yellow]usage:[/] /memory show [stm|ltm|notes|todos|all]")
+        console.print("[yellow]usage:[/] /memory show [stm|ltm|knowledge|all]")
         return
     store = srest or "all"
-    if store not in {"stm", "ltm", "notes", "todos", "all"}:
+    if store not in {"stm", "ltm", "knowledge", "all"}:
         console.print(f"[yellow]unknown store:[/] {store}")
         return
     resp = await client.request("memory.show", {"store": store})
@@ -1092,23 +1119,14 @@ async def _handle_memory_slash(rest: str, client: IPCClient) -> None:
     if "ltm" in resp:
         console.print("[bold]long_term[/]")
         console.print(resp["ltm"] or "[dim](empty)[/]")
-    if "notes" in resp:
-        console.print("[bold]notes[/]")
-        for n in resp["notes"] or []:
-            head = f"[{n['id']}] {n.get('title') or ''}"
-            if n.get("tags"):
-                head += "  (tags: " + ", ".join(n["tags"]) + ")"
-            console.print(head)
-            if n.get("body"):
-                console.print(n["body"])
-        if not resp["notes"]:
-            console.print("[dim](empty)[/]")
-    if "todos" in resp:
-        console.print("[bold]todos[/]")
-        for t in resp["todos"] or []:
-            icon = {"pending": "[ ]", "done": "[x]", "cancelled": "[-]"}.get(t["status"], "[?]")
-            console.print(f"{icon} {t['id']} — {t.get('content', '')}")
-        if not resp["todos"]:
+    if "knowledge" in resp:
+        console.print("[bold]knowledge[/]")
+        for e in resp["knowledge"] or []:
+            line = f"- [{e.get('title') or ''}]({e['path']})"
+            if e.get("hook"):
+                line += f" — {e['hook']}"
+            console.print(line)
+        if not resp["knowledge"]:
             console.print("[dim](empty)[/]")
 
 
@@ -1793,60 +1811,6 @@ def cmd_status(eonlet_id: str, as_json: bool = False) -> None:
         console.print_json(data=report.model_dump())
     else:
         render(report, console)
-
-
-# ── memory migrate ───────────────────────────────────────────────────────────
-
-
-def cmd_memory_migrate(
-    legacy_dir: Path,
-    eonlet_id: str,
-    force: bool = False,
-    dry_run: bool = False,
-) -> None:
-    from ..memory.ltm import LTMStore
-    from ..memory.migrate import apply_migration, migrate_legacy_memory
-    from ..memory.paths import long_term_path
-
-    if not legacy_dir.exists():
-        fail(f"legacy_dir not found: {legacy_dir}", code=3)
-
-    eid = resolve_eonlet_id(eonlet_id)
-    mem_dir = paths.memory_dir(eid)
-    ltm_path = long_term_path(mem_dir)
-
-    if ltm_path.exists() and not force and not dry_run:
-        fail(
-            f"{eid} already has long_term.md. Pass --force to overwrite or --dry-run to preview.",
-            code=4,
-        )
-
-    result = migrate_legacy_memory(legacy_dir)
-
-    if result.errors:
-        for e in result.errors:
-            console.print(f"[red]error:[/] {e}")
-    if result.skipped:
-        for s in result.skipped:
-            console.print(f"[yellow]skip:[/] {s}")
-
-    if not result.bullets:
-        console.print("[yellow]nothing to migrate[/]")
-        return
-
-    if dry_run:
-        console.print(f"[bold]Dry run — {len(result.bullets)} bullet(s) would be written:[/]")
-        for b in result.bullets:
-            console.print(f"  [{b.category}] {b.content[:80]}")
-        return
-
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    store = LTMStore(mem_dir)
-    written = anyio.run(lambda: apply_migration(result, store))
-    console.print(
-        f"[green]migrated {written} bullet(s)[/] to {eid} "
-        f"({len(result.skipped)} skipped, {len(result.errors)} errors)"
-    )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

@@ -76,6 +76,10 @@ class IPCServer:
         self.sessions: dict[str, Session] = {}
         self._next_id = 0
         self._sessions_lock = anyio.Lock()
+        # Optional hook fired (with the session id) after a session is removed —
+        # used by the decision broker to decline outstanding prompts when the
+        # last listener detaches (ADR-0006). Set post-construction.
+        self.on_disconnect: Callable[[str], None] | None = None
 
     async def serve(self) -> None:
         listener = await anyio.create_unix_listener(self.socket_path)
@@ -121,6 +125,11 @@ class IPCServer:
         finally:
             async with self._sessions_lock:
                 self.sessions.pop(sid, None)
+            if self.on_disconnect is not None:
+                try:
+                    self.on_disconnect(sid)
+                except Exception:
+                    log.exception("ipc: on_disconnect hook raised for %s", sid)
             log.info("ipc: session %s closed", sid)
 
     async def _process_line(self, session: Session, line: bytes) -> None:

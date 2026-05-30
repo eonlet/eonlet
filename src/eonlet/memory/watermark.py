@@ -35,8 +35,7 @@ def write_watermark(memory_dir: Path, value: int) -> None:
     """Persist a new watermark value.
 
     Callers MUST enforce monotonicity (invariant M-I2); the helper itself
-    is permissive so it can be used by the migration tool and by recovery
-    paths that need to reset state.
+    is permissive so it can be used by recovery paths that need to reset state.
     """
     if value < 0:
         raise ValueError(f"watermark must be non-negative, got {value}")

@@ -20,6 +20,7 @@ from typing import (
 if TYPE_CHECKING:
     from ..runtime.events import Event
     from ..triggers.scheduler import CronScheduler
+    from ..web import HTTPFetcher
 
 import anyio
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,6 +60,9 @@ class ToolContext:
     memory_dir: Path
     skills: dict[str, Any]  # name -> Skill (for load_skill)
     env: dict[str, str]
+    # Workflow state dir (tasks/todos.jsonl). Set by the worker; the `task`
+    # tool falls back to the memory-dir sibling when None (standalone tests).
+    tasks_dir: Path | None = None
     cancel_scope: anyio.CancelScope | None = None
     emit_event: EmitEvent | None = None
     # Append a memory/lifecycle event to the agent's store. Tools that mutate
@@ -67,6 +71,10 @@ class ToolContext:
     record_event: RecordEvent | None = None
     trigger_context: dict[str, Any] | None = None
     scheduler: CronScheduler | None = None  # set by worker; lets schedule tool mutate triggers
+    # Outbound HTTP client singleton — set by the worker for web_fetch /
+    # web_search. ``None`` in standalone tool tests; tools that need it
+    # assert and raise a project error on the ``None`` path.
+    http_fetcher: HTTPFetcher | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

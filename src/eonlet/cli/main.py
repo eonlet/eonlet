@@ -254,19 +254,6 @@ def import_cmd(
     commands.cmd_import(Path(archive), as_)
 
 
-@memory_app.command("migrate")
-def memory_migrate(
-    legacy_dir: str = typer.Argument(..., metavar="LEGACY_DIR"),
-    eonlet_id: str = typer.Option(..., "--eonlet", help="Target eonlet id."),
-    force: bool = typer.Option(False, "--force", help="Overwrite existing LTM."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
-) -> None:
-    """Migrate Claude Code auto-memory files into an eonlet's LTM."""
-    from pathlib import Path
-
-    commands.cmd_memory_migrate(Path(legacy_dir), eonlet_id, force=force, dry_run=dry_run)
-
-
 def cli_main() -> None:
     """Console-script entry point."""
     try:
