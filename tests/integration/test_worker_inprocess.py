@@ -269,3 +269,140 @@ tasks:
 
     assert final.get("status") == "done"
     assert final.get("result") == "completed"
+
+
+def _write_scheduling_agent(name: str, model: str) -> Path:
+    d = paths.agents_dir() / name
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(
+        f"""apiVersion: eonlet/v1
+kind: Agent
+metadata:
+  name: {name}
+  description: scheduler test
+  version: 0.0.1
+runtime:
+  model: {model}
+  max_steps_per_run: 8
+tools:
+  builtin: [task]
+permissions:
+  mode: yolo
+tasks:
+  scheduling:
+    enabled: true
+""",
+        encoding="utf-8",
+    )
+    (d / "system.md").write_text(f"# {name}\nrun tasks.\n", encoding="utf-8")
+    return d
+
+
+def test_inproc_scheduler_decompose_then_synthesize(isolated_home: Path) -> None:
+    """A parent task decomposes into two children; they run depth-first, then the
+    parent synthesizes and completes — the full M2 tree flow end-to-end."""
+    paths.ensure_home()
+    d = _write_scheduling_agent("treebot", "fake-task-tree")
+    eid = "treebot.alice"
+    _prep_eonlet(eid, d)
+
+    tasks_final: dict[str, dict] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    add = await client.request(
+                        "task.add", {"content": "DECOMPOSE: build the thing"}
+                    )
+                    assert add["ok"]
+
+                    # Wait until the whole forest (parent + 2 children) is done.
+                    for _ in range(80):
+                        listed = await client.request("task.list", {"status": "all"})
+                        by_id = {t["id"]: t for t in listed["tasks"]}
+                        done = [t for t in by_id.values() if t["status"] == "done"]
+                        if len(by_id) == 3 and len(done) == 3:
+                            tasks_final.update(by_id)
+                            break
+                        await anyio.sleep(0.2)
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(25):
+            await go()
+
+    anyio.run(with_timeout)
+
+    assert len(tasks_final) == 3, tasks_final
+    parents = [t for t in tasks_final.values() if t["parent_id"] is None]
+    children = [t for t in tasks_final.values() if t["parent_id"] is not None]
+    assert len(parents) == 1 and len(children) == 2
+    assert parents[0]["result"] == "synthesized"
+    assert all(c["parent_id"] == parents[0]["id"] for c in children)
+    assert all(c["result"] == "leaf done" for c in children)
+
+
+def test_inproc_scheduler_yield_checkpoints_and_suspends(isolated_home: Path) -> None:
+    """A task whose run neither completes nor decomposes is checkpointed and
+    suspended (M2 voluntary-yield path), with a non-empty resume brief."""
+    paths.ensure_home()
+    # fake-echo just emits text and ends the turn → no done, no children → yield.
+    d = _write_scheduling_agent("yieldbot", "fake-echo")
+    eid = "yieldbot.alice"
+    _prep_eonlet(eid, d)
+
+    final: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+                    add = await client.request("task.add", {"content": "open-ended musing"})
+                    tid = add["id"]
+                    for _ in range(60):
+                        listed = await client.request("task.list", {"status": "suspended"})
+                        by_id = {t["id"]: t for t in listed["tasks"]}
+                        if tid in by_id:
+                            final.update(by_id[tid])
+                            break
+                        await anyio.sleep(0.2)
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(20):
+            await go()
+
+    anyio.run(with_timeout)
+
+    assert final.get("status") == "suspended"
+    assert final.get("progress_summary")  # non-empty resume brief
