@@ -45,11 +45,58 @@ class TaskArgs(BaseModel):
         description="Optional ISO-8601 due date (e.g. '2026-05-30T18:00:00+08:00').",
     )
     tags: list[str] = Field(default_factory=list)
+    schedule: str | None = Field(
+        default=None,
+        description=(
+            "For action='add': a cron expression to run this task on a recurring "
+            "schedule. Each fire hatches a fresh task instance. Requires timezone."
+        ),
+    )
+    timezone: str | None = Field(
+        default=None, description="IANA tz for 'schedule' (e.g. 'Asia/Shanghai')."
+    )
     status: Literal["pending", "active", "suspended", "blocked", "done", "cancelled", "all"] = (
         Field(
             default="pending",
             description="For action='list': which status to return ('all' for everything).",
         )
+    )
+
+
+async def _schedule_task(args: TaskArgs, ctx: ToolContext) -> ToolResult:
+    """Register a recurring task-template trigger (ADR-0007 M3)."""
+    from ...config import CronTrigger
+    from ...errors import ConfigError
+    from ...triggers.dynamic_store import mint_dynamic_id
+
+    if ctx.scheduler is None:
+        return ToolResult(content="task add: scheduling unavailable here", is_error=True)
+    if not args.timezone:
+        return ToolResult(content="task add: 'timezone' is required with 'schedule'", is_error=True)
+    template = {
+        "content": args.content,
+        "goal": args.goal or "",
+        "priority": args.priority or 0,
+        "due": args.due,
+        "tags": args.tags,
+    }
+    # model_validate (not the kwargs ctor) so the extra ``task_template`` field
+    # — allowed at runtime by CronTrigger's extra="allow" — type-checks cleanly.
+    trig = CronTrigger.model_validate(
+        {
+            "id": mint_dynamic_id(),
+            "schedule": args.schedule,
+            "timezone": args.timezone,
+            "message": "(scheduled task)",
+            "task_template": template,
+        }
+    )
+    try:
+        await ctx.scheduler.add_dynamic(trig, created_by="agent")
+    except ConfigError as e:
+        return ToolResult(content=f"task add: {e}", is_error=True)
+    return ToolResult(
+        content=f"scheduled {trig.id} ({args.schedule})", structured_output={"trigger_id": trig.id}
     )
 
 
@@ -111,6 +158,10 @@ class TaskTool:
         if args.action == "add":
             if not args.content:
                 return ToolResult(content="task add: 'content' is required", is_error=True)
+            # A scheduled task registers a recurring template trigger instead of
+            # creating a task now; each fire hatches a fresh instance (ADR-0007).
+            if args.schedule:
+                return await _schedule_task(args, ctx)
             # Inside a task-scoped run, a new task without an explicit parent is a
             # subtask of the task being worked on (the decomposition signal).
             parent_id = args.parent_id or ctx.current_task_id

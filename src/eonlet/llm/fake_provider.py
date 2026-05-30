@@ -20,6 +20,9 @@ Available variants:
 - ``fake-task-busy`` — prompt-aware. A goal containing ``BUSY`` never finishes
   (emits ``sleep`` every turn, so it can be preempted); any other goal completes
   via ``task(done)``. Drives the M3 preemption path (needs the ``sleep`` tool).
+- ``fake-schedule`` — prompt-aware. An ordinary message registers a recurring
+  task template (``task(add, schedule=…)``); a hatched ``<task …>`` run completes
+  via ``task(done)``. Drives the M3 schedule→task-template bridge.
 
 The variant name is also stored on the instance as ``model``, so it shows up
 in event payloads / inspect output exactly like a real model.
@@ -53,6 +56,7 @@ class FakeProvider:
             "fake-task-done",
             "fake-task-tree",
             "fake-task-busy",
+            "fake-schedule",
         }:
             raise ValueError(f"unknown fake variant: {model!r}")
         # ``fake-tool-then-text`` is stateful across turns within one run; we
@@ -101,6 +105,10 @@ class FakeProvider:
             return
         if self.model == "fake-task-busy":
             async for c in self._task_busy_stream(messages):
+                yield c
+            return
+        if self.model == "fake-schedule":
+            async for c in self._schedule_stream(messages):
                 yield c
             return
         raise AssertionError(f"unhandled fake variant: {self.model}")  # pragma: no cover
@@ -248,4 +256,35 @@ class FakeProvider:
                 ],
                 stop_reason="tool_use",
             ),
+        )
+
+    async def _schedule_stream(self, messages: list[LLMMessage]) -> AsyncIterator[StreamChunk]:
+        last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=-1)
+        prompt = messages[last_user].content if last_user >= 0 else ""
+        acted = any(m.role in ("assistant", "tool") for m in messages[last_user + 1 :])
+        if acted:
+            yield DoneChunk(
+                type="done",
+                response=LLMResponse(content="ok", tool_calls=[], stop_reason="end_turn"),
+            )
+            return
+        if "<task" in prompt:
+            # A hatched task instance is running — complete it. (Substring, not
+            # startswith: user turns carry a leading [timestamp] prefix.)
+            call = LLMToolCall(id="d", name="task", arguments={"action": "done", "result": "ran"})
+        else:
+            # An ordinary message — register a recurring task template.
+            call = LLMToolCall(
+                id="s",
+                name="task",
+                arguments={
+                    "action": "add",
+                    "content": "daily report",
+                    "schedule": "0 8 * * *",
+                    "timezone": "UTC",
+                },
+            )
+        yield DoneChunk(
+            type="done",
+            response=LLMResponse(content="", tool_calls=[call], stop_reason="tool_use"),
         )

@@ -293,7 +293,7 @@ permissions:
 tasks:
   scheduling:
     enabled: true
-    preempt: {preempt}
+    preempt: "{preempt}"
     preempt_cooldown: 0s
 """,
         encoding="utf-8",
@@ -481,3 +481,70 @@ def test_inproc_scheduler_preempts_lower_priority(isolated_home: Path) -> None:
     preempts = result.get("preempt_events") or []
     assert preempts, "expected a 'preempted:' transition for the busy task"
     assert preempts[0]["payload"]["reason"] == f"preempted:{result['hi']['id']}"  # type: ignore[index]
+
+
+def test_inproc_scheduled_task_hatches_and_runs(isolated_home: Path) -> None:
+    """A message registers a recurring task template; firing it hatches a fresh
+    task instance (origin=trigger) that the scheduler runs to done (M3)."""
+    paths.ensure_home()
+    d = _write_scheduling_agent("schedbot", "fake-schedule", preempt="off")
+    eid = "schedbot.alice"
+    _prep_eonlet(eid, d)
+
+    out: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    # A normal message → the agent registers a scheduled template.
+                    await client.request("message.send", {"content": "set up my daily report"})
+                    trig_id = None
+                    for _ in range(50):
+                        listing = await client.request("triggers.list", {})
+                        trigs = listing.get("triggers") or []
+                        if trigs:
+                            trig_id = trigs[0]["id"]
+                            break
+                        await anyio.sleep(0.1)
+                    assert trig_id, "scheduled trigger was never registered"
+
+                    # Fire it manually → hatches a task instance that runs.
+                    fired = await client.request("trigger.fire", {"trigger_id": trig_id})
+                    assert fired["ok"]
+
+                    for _ in range(60):
+                        listed = await client.request("task.list", {"status": "all"})
+                        done = [t for t in listed["tasks"] if t["status"] == "done"]
+                        if done:
+                            out["task"] = done[0]
+                            break
+                        await anyio.sleep(0.2)
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(25):
+            await go()
+
+    anyio.run(with_timeout)
+
+    task = out.get("task")
+    assert task, "scheduled task never hatched + ran"
+    assert task["origin"] == "trigger"  # type: ignore[index]
+    assert task["content"] == "daily report"  # type: ignore[index]
+    assert task["result"] == "ran"  # type: ignore[index]

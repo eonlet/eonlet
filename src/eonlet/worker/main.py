@@ -315,6 +315,12 @@ async def _main_loop(
             if item.kind == "task_wake":
                 continue
 
+            # A scheduled task-template fire hatches a fresh task instance, then
+            # the scheduler picks it up on the next beat (ADR-0007 M3).
+            if item.kind == "task_hatch":
+                await _hatch_task(runtime, item)
+                continue
+
             ok = True
             try:
                 async for _ in runtime.handle_user_message(item.content):
@@ -469,6 +475,34 @@ def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> str:
     goal = (t.goal or t.content) if t is not None else task_id
     note = (last[:500] + " …") if len(last) > 500 else (last or "(no output)")
     return f"In progress: {goal}\nLast: {note}"
+
+
+async def _hatch_task(runtime: AgentRuntime, item: TriggerItem) -> None:
+    """Mint a fresh task instance from a scheduled template (ADR-0007 M3).
+
+    Each fire produces its own task (``origin="trigger"``) with its own id and
+    history — a recurring schedule is a template that hatches instances, not one
+    task that re-runs.
+    """
+    from ..runtime.events import task_created
+    from ..tasks import mint_task_id
+
+    t = item.task_template or {}
+    content = str(t.get("content", "")).strip()
+    if not content:
+        log.warning("task_hatch from trigger %s has no content; skipping", item.trigger_id)
+        return
+    await runtime._record(
+        task_created(
+            id=mint_task_id(),
+            content=content,
+            goal=str(t.get("goal", "")),
+            priority=int(t.get("priority", 0) or 0),
+            origin="trigger",
+            due=t.get("due"),
+            tags=list(t.get("tags") or []),
+        )
+    )
 
 
 async def _run_cascade(runtime: AgentRuntime) -> None:
@@ -640,22 +674,31 @@ def _make_handler(
             trig = scheduler.get(tid)
             if trig is None:
                 return {"ok": False, "error": f"no such trigger: {tid}"}
-            override = params.get("message")
-            state = runtime.store.get_trigger_state(tid)
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
+            # A task-template trigger hatches an instance (ADR-0007 M3) rather
+            # than running a conversation, even when fired manually.
+            template = getattr(trig, "task_template", None)
+            if isinstance(template, dict):
+                item = TriggerItem(
+                    kind="task_hatch", content="", trigger_id=tid, task_template=template
+                )
+            else:
+                override = params.get("message")
+                state = runtime.store.get_trigger_state(tid)
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
 
-            content = build_trigger_message(
-                trig,
-                tz=ZoneInfo(trig.timezone),
-                fired_at=datetime.now(UTC),
-                last_success_at=state["last_success_at"],
-                eonlet_id=eonlet_id,
-                catchup=False,
-                override_message=override,
-            )
+                content = build_trigger_message(
+                    trig,
+                    tz=ZoneInfo(trig.timezone),
+                    fired_at=datetime.now(UTC),
+                    last_success_at=state["last_success_at"],
+                    eonlet_id=eonlet_id,
+                    catchup=False,
+                    override_message=override,
+                )
+                item = TriggerItem(kind="cron", content=content, trigger_id=tid)
             try:
-                send.send_nowait(TriggerItem(kind="cron", content=content, trigger_id=tid))
+                send.send_nowait(item)
             except anyio.WouldBlock:
                 return {"ok": False, "error": "queue full"}
             return {"ok": True}
