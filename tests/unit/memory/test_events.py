@@ -20,8 +20,10 @@ from eonlet.runtime.events import (
     mem_resumed,
     session_ended,
     session_started,
-    task_added,
+    task_checkpointed,
+    task_created,
     task_deleted,
+    task_transitioned,
     task_updated,
 )
 
@@ -48,8 +50,10 @@ def test_all_memory_kinds_exist() -> None:
         "kb_written",
         "kb_deleted",
         "kb_moved",
-        "task_added",
+        "task_created",
         "task_updated",
+        "task_transitioned",
+        "task_checkpointed",
         "task_deleted",
         "mem_compact_proposed",
         "mem_compact_approved",
@@ -60,9 +64,10 @@ def test_all_memory_kinds_exist() -> None:
     assert not missing, f"missing event kinds: {missing}"
 
 
-def test_eventkind_count_is_39() -> None:
-    # ADR-0006 added the three mem_compact_* variants (36 → 39).
-    assert len(list(EventKind)) == 39
+def test_eventkind_count_is_41() -> None:
+    # ADR-0007 reworked the task family: TASK_ADDED→TASK_CREATED (rename) plus
+    # two new kinds (TASK_TRANSITIONED / TASK_CHECKPOINTED): 39 → 41.
+    assert len(list(EventKind)) == 41
 
 
 def test_compact_proposal_helpers() -> None:
@@ -86,9 +91,10 @@ def test_retired_event_kinds_absent() -> None:
     actual = {k.value for k in EventKind}
     assert "mem_remember" not in actual
     assert "mem_note_added" not in actual
-    assert "mem_todo_added" not in actual  # renamed to task_added
+    assert "mem_todo_added" not in actual  # renamed to task_created
     assert "mem_todo_updated" not in actual
     assert "mem_todo_deleted" not in actual
+    assert "task_added" not in actual  # ADR-0007 renamed task_added → task_created
 
 
 def test_mem_compacted_payload() -> None:
@@ -165,12 +171,19 @@ def test_kb_event_shapes() -> None:
 
 
 def test_task_event_shapes() -> None:
-    a = task_added(id="task-1", content="do x", due=None, tags=[])
-    u = task_updated(id="task-1", status="done", done_at="2026-05-22T15:00:00+08:00")
+    c = task_created(id="task-1", content="do x", goal="ship it", priority=5, parent_id="root")
+    u = task_updated(id="task-1", content="do y", priority=8)
+    tr = task_transitioned(id="task-1", from_state="pending", to_state="done", reason="tool:done")
+    cp = task_checkpointed(id="task-1", progress_summary="halfway")
     d = task_deleted(id="task-1")
-    assert a.kind == EventKind.TASK_ADDED
+    assert c.kind == EventKind.TASK_CREATED
+    assert c.payload["goal"] == "ship it" and c.payload["parent_id"] == "root"
+    assert c.payload["priority"] == 5
     assert u.kind == EventKind.TASK_UPDATED
-    assert u.payload["status"] == "done"
+    assert u.payload == {"id": "task-1", "content": "do y", "priority": 8}  # only set fields
+    assert tr.kind == EventKind.TASK_TRANSITIONED
+    assert tr.payload["from_state"] == "pending" and tr.payload["to_state"] == "done"
+    assert cp.kind == EventKind.TASK_CHECKPOINTED and cp.payload["progress_summary"] == "halfway"
     assert d.kind == EventKind.TASK_DELETED
 
 

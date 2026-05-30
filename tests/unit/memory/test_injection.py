@@ -20,11 +20,13 @@ from eonlet.runtime.events import (
     Event,
     EventKind,
     assistant_message,
+    task_created,
+    task_transitioned,
     tool_call,
     tool_result,
     user_message,
 )
-from eonlet.tasks import TaskStore
+from eonlet.tasks import TaskForest, fold_tasks
 from eonlet.tasks.config import TasksConfig
 
 
@@ -123,26 +125,30 @@ def test_preamble_does_not_include_tasks(tmp_path: Path) -> None:
 # ── tasks block (sibling of <memory>) ──────────────────────────────────────
 
 
+def _forest(*events: Event) -> TaskForest:
+    stamped = [e.model_copy(update={"id": i + 1}) for i, e in enumerate(events)]
+    return fold_tasks(stamped)
+
+
 def test_tasks_block_includes_pending_only(tmp_path: Path) -> None:
-    store = TaskStore(tmp_path)
-    anyio.run(lambda: store.add(id="t1", content="do thing"))
-    anyio.run(lambda: store.add(id="t2", content="archived"))
-    anyio.run(lambda: store.mark_done(id="t2"))
-    out = anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig()))
+    forest = _forest(
+        task_created(id="t1", content="do thing"),
+        task_created(id="t2", content="archived"),
+        task_transitioned(id="t2", from_state="pending", to_state="done"),
+    )
+    out = build_tasks_block(forest, TasksConfig())
     assert out.startswith("<tasks>")
     assert "do thing" in out
     assert "archived" not in out  # done items NOT injected
 
 
 def test_tasks_block_empty_when_no_pending(tmp_path: Path) -> None:
-    assert anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig())) == ""
+    assert build_tasks_block(TaskForest(), TasksConfig()) == ""
 
 
 def test_tasks_block_omitted_when_inject_pending_false(tmp_path: Path) -> None:
-    store = TaskStore(tmp_path)
-    anyio.run(lambda: store.add(id="t1", content="HIDDEN_TASK"))
-    out = anyio.run(lambda: build_tasks_block(tmp_path, TasksConfig(inject_pending=False)))
-    assert out == ""
+    forest = _forest(task_created(id="t1", content="HIDDEN_TASK"))
+    assert build_tasks_block(forest, TasksConfig(inject_pending=False)) == ""
 
 
 # ── recent window selection ────────────────────────────────────────────────

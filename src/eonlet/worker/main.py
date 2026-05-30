@@ -554,11 +554,12 @@ async def _handle_memory_ipc(
         kb_written,
         mem_paused,
         mem_resumed,
-        task_added,
+        task_created,
         task_deleted,
+        task_transitioned,
         task_updated,
     )
-    from ..tasks import TaskStore, mint_task_id
+    from ..tasks import can_transition, mint_task_id
 
     # ── compact / pause / resume / show ──────────────────────────────────
     if method == "memory.compact":
@@ -683,70 +684,74 @@ async def _handle_memory_ipc(
             return {"ok": True, "src": src_rel, "dst": dst_rel}
         return {"ok": False, "error": f"unknown method: {method}"}
 
-    # ── tasks (workflow state, ADR-0005 — moved out of memory) ─────────────
+    # ── tasks (workflow state — event-sourced forest, ADR-0007) ────────────
     if method.startswith("task."):
-        store_t = TaskStore(runtime.tasks_dir)
+        forest = runtime.task_forest
         sub = method.removeprefix("task.")
         if sub == "add":
             content = str(params.get("content", "")).strip()
             if not content:
                 return {"ok": False, "error": "content required"}
-            try:
-                task = await store_t.add(
-                    id=mint_task_id(),
+            parent_id = params.get("parent_id")
+            if parent_id and forest.get(str(parent_id)) is None:
+                return {"ok": False, "error": f"no such parent task: {parent_id}"}
+            tid = mint_task_id()
+            await runtime._record(
+                task_created(
+                    id=tid,
                     content=content,
+                    goal=str(params.get("goal") or ""),
+                    priority=int(params.get("priority") or 0),
+                    parent_id=str(parent_id) if parent_id else None,
+                    origin="user",
                     due=params.get("due"),
                     tags=list(params.get("tags") or []),
                 )
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
-            await runtime._record(
-                task_added(id=task.id, content=task.content, due=task.due, tags=task.tags)
             )
-            return {"ok": True, "id": task.id}
+            return {"ok": True, "id": tid}
         if sub == "list":
             status_param = str(params.get("status", "pending"))
-            if status_param not in ("pending", "done", "cancelled", "all"):
+            valid = ("pending", "active", "suspended", "blocked", "done", "cancelled", "all")
+            if status_param not in valid:
                 return {"ok": False, "error": f"invalid status: {status_param}"}
-            tasks = await store_t.list_tasks(status=status_param)  # type: ignore[arg-type]
-            return {"ok": True, "tasks": [t.to_json() for t in tasks]}
+            tasks = forest.by_status(status_param)  # type: ignore[arg-type]
+            return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
         if sub in ("done", "cancel"):
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            try:
-                task = (
-                    await store_t.mark_done(id=tid)
-                    if sub == "done"
-                    else await store_t.mark_cancelled(id=tid)
-                )
-            except KeyError:
+            task = forest.get(tid)
+            if task is None:
                 return {"ok": False, "error": f"no such task: {tid}"}
+            dst = "done" if sub == "done" else "cancelled"
+            if not can_transition(task.status, dst):
+                return {"ok": False, "error": f"cannot {sub} task in state {task.status}"}
             await runtime._record(
-                task_updated(id=task.id, status=task.status, done_at=task.done_at)
+                task_transitioned(id=tid, from_state=task.status, to_state=dst, reason=f"cli:{sub}")
             )
             return {"ok": True}
         if sub == "update":
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            try:
-                task = await store_t.update(
+            if forest.get(tid) is None:
+                return {"ok": False, "error": f"no such task: {tid}"}
+            await runtime._record(
+                task_updated(
                     id=tid,
                     content=params.get("content"),
+                    goal=params.get("goal"),
+                    priority=params.get("priority"),
                     due=params.get("due"),
                     tags=list(params["tags"]) if "tags" in params else None,
                 )
-            except KeyError:
-                return {"ok": False, "error": f"no such task: {tid}"}
-            await runtime._record(task_updated(id=task.id, status=task.status))
+            )
             return {"ok": True}
         if sub == "delete":
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            removed = await store_t.delete(id=tid)
-            if not removed:
+            if forest.get(tid) is None:
                 return {"ok": False, "error": f"no such task: {tid}"}
             await runtime._record(task_deleted(id=tid))
             return {"ok": True}

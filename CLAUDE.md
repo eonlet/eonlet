@@ -109,11 +109,11 @@ WorkerProcess
 
 ### Event-Sourced State
 
-Every state change is an immutable append to a per-agent SQLite log. `AgentState` is rebuilt by replaying events — no mutable in-memory state. `EventKind` has **39 variants** covering: conversation turns, tool calls, permissions, triggers, budget, sessions, errors, memory operations (`mem_compacted`/`mem_ltm_promoted`/`mem_ltm_forgotten`/`mem_recall_invoked`/`mem_paused`/`mem_resumed`), compaction proposals (`mem_compact_proposed`/`mem_compact_approved`/`mem_compact_declined`), knowledge writes (`kb_written`/`kb_deleted`/`kb_moved`), tasks (`task_added`/`task_updated`/`task_deleted`), and web tool summaries.
+Every state change is an immutable append to a per-agent SQLite log. `AgentState` is rebuilt by replaying events — no mutable in-memory state. `EventKind` has **41 variants** covering: conversation turns, tool calls, permissions, triggers, budget, sessions, errors, memory operations (`mem_compacted`/`mem_ltm_promoted`/`mem_ltm_forgotten`/`mem_recall_invoked`/`mem_paused`/`mem_resumed`), compaction proposals (`mem_compact_proposed`/`mem_compact_approved`/`mem_compact_declined`), knowledge writes (`kb_written`/`kb_deleted`/`kb_moved`), tasks (`task_created`/`task_updated`/`task_transitioned`/`task_checkpointed`/`task_deleted` — the event-sourced forest, ADR-0007 M1), and web tool summaries.
 
 ```
 runtime/store.py   → SQLite append-only log
-runtime/events.py  → EventKind enum (39 variants), Event model
+runtime/events.py  → EventKind enum (41 variants), Event model
 runtime/state.py   → AgentState (replay-derived)
 runtime/agent.py   → AgentRuntime (orchestrates LLM calls, tool execution, permission gates)
 ```
@@ -145,9 +145,13 @@ memory/
     index.md            →   the agent-curated map; injected whole every call
     user.md, rules/…    →   one file per topic; bodies opened on demand
   index.sqlite          → SQLite FTS5 index over the event log
-tasks/
-  todos.jsonl           → action items (pending/done/cancelled) — MOVED out of memory/
 ```
+
+Tasks are **event-sourced** (ADR-0007): the live forest is a `fold` of the task
+event family (`TASK_CREATED`/`UPDATED`/`TRANSITIONED`/`CHECKPOINTED`/`DELETED`)
+over the per-agent event log — there is no `tasks/todos.jsonl` store any more.
+The runtime owns the projection (`AgentRuntime.task_forest`) the same way it
+owns `AgentState`.
 
 - **Axis 1 — episodic** (`memory/`): the conversation timeline. Working → STM → LTM via the compaction cascade. It *decays* — that's correct for a timeline.
   1. **Tier-1** (`memory/tier1.py`): working memory → STM sections when working memory exceeds budget.
@@ -188,8 +192,8 @@ src/eonlet/
 │   ├── watermark.py      — Watermark tracking
 │   ├── tokens.py         — Token counting
 │   └── paths.py          — Memory directory helpers (+ knowledge_root/index)
-├── tasks/                — Task / workflow state (v0.0.8, ADR-0005 — NOT memory)
-│   ├── store.py          — TaskStore (tasks/todos.jsonl)
+├── tasks/                — Task / workflow state (ADR-0005; event-sourced forest ADR-0007)
+│   ├── forest.py         — Task, TaskForest, fold_tasks/reduce_task (projection of task events)
 │   ├── config.py         — TasksConfig (inject_pending, archive_done_after_days)
 │   └── ids.py            — mint_task_id
 ├── permissions/
@@ -197,7 +201,7 @@ src/eonlet/
 ├── runtime/
 │   ├── agent.py          — AgentRuntime (main loop, ~460 lines)
 │   ├── definition.py     — Load agent.yaml + per-agent tools
-│   ├── events.py         — EventKind (39 variants), Event model
+│   ├── events.py         — EventKind (41 variants), Event model
 │   ├── state.py          — AgentState (event-sourced)
 │   └── store.py          — SQLite event store (append-only)
 ├── templates/            — Bundled example agents (config.yaml + 3 agent dirs)
@@ -268,7 +272,7 @@ tests/
     │   ├── test_watermark.py           — Watermark tracking
     │   └── test_paths.py              — Memory path helpers
     ├── tasks/                           — Task subsystem tests (v0.0.8)
-    │   ├── test_store.py               — TaskStore JSONL + state machine
+    │   ├── test_forest.py              — TaskForest reducer + DFS + replay
     │   └── test_tools_task.py          — task tool dispatch + events
     ├── web/                             — Web subsystem tests (v0.0.7)
     │   ├── test_ssrf.py                 — IP classification + check_url

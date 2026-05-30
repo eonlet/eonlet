@@ -1282,6 +1282,69 @@ def _next_trigger_summary(eonlet_id: str, status: str) -> str:
     return result
 
 
+def cmd_tasks(eonlet_id: str, status: str = "all") -> None:
+    """Render the agent's task forest as a tree (read-only, folded from the log).
+
+    Reads ``state.db`` directly and replays the task events into a forest
+    (ADR-0007) — no worker required. ``status`` filters which tasks show; their
+    ancestors are kept so the tree stays connected.
+    """
+    valid = ("pending", "active", "suspended", "blocked", "done", "cancelled", "all")
+    if status not in valid:
+        fail(f"bad status: {status} (one of {', '.join(valid)})", code=2)
+    eid = resolve_eonlet_id(eonlet_id)
+    from ..runtime.store import EventStore
+    from ..tasks import fold_tasks
+
+    db = paths.state_db(eid)
+    if not db.exists():
+        fail(f"{eid}: no state.db", code=3)
+    store = EventStore(db)
+    try:
+        events = store.read()
+    finally:
+        store.close()
+    forest = fold_tasks(events)
+
+    keep = {t.id for t in forest.by_status(status)}  # type: ignore[arg-type]
+    if status != "all":
+        for tid in list(keep):
+            cur = forest.get(tid)
+            while cur is not None and cur.parent_id is not None:
+                keep.add(cur.parent_id)
+                cur = forest.get(cur.parent_id)
+    if not keep:
+        console.print(f"[dim]({eid}: no {status} tasks)[/]")
+        return
+
+    icon = {
+        "pending": "[ ]",
+        "active": "[*]",
+        "suspended": "[~]",
+        "blocked": "[!]",
+        "done": "[x]",
+        "cancelled": "[-]",
+    }
+    color = {
+        "active": "bold green",
+        "blocked": "red",
+        "suspended": "yellow",
+        "done": "dim",
+        "cancelled": "dim strike",
+    }
+    for t, depth in forest.dfs():
+        if t.id not in keep:
+            continue
+        indent = "  " * depth
+        prio = f" [cyan](p{t.priority})[/]" if t.priority else ""
+        due = f" [magenta](due {t.due})[/]" if t.due else ""
+        body = (t.goal or t.content).strip()
+        style = color.get(t.status, "")
+        head = f"{icon.get(t.status, '[?]')} {t.id}"
+        head = f"[{style}]{head}[/]" if style else head
+        console.print(f"{indent}{head}{prio}{due} — {body}")
+
+
 def cmd_tail(eonlet_id: str) -> None:
     """Live event stream from the worker. Each line is one event."""
     eid = resolve_eonlet_id(eonlet_id)

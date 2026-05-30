@@ -57,9 +57,11 @@ class EventKind(StrEnum):
     KB_WRITTEN = "kb_written"  # knowledge.write / knowledge.edit
     KB_DELETED = "kb_deleted"  # knowledge.delete
     KB_MOVED = "kb_moved"  # knowledge.move
-    # ── Tasks (ADR-0005 — moved out of memory) ───────────────────────────────
-    TASK_ADDED = "task_added"
-    TASK_UPDATED = "task_updated"  # done / cancel / edit
+    # ── Tasks (ADR-0007 — event-sourced hierarchical forest) ─────────────────
+    TASK_CREATED = "task_created"  # new node (parent_id, priority, goal, origin)
+    TASK_UPDATED = "task_updated"  # mutable fields: content/goal/priority/due/tags
+    TASK_TRANSITIONED = "task_transitioned"  # lifecycle move (from_state→to_state)
+    TASK_CHECKPOINTED = "task_checkpointed"  # resume brief written on suspend
     TASK_DELETED = "task_deleted"
 
 
@@ -230,19 +232,79 @@ def mem_ltm_forgotten(
     return Event(kind=EventKind.MEM_LTM_FORGOTTEN, payload=payload)
 
 
-def task_added(
-    *, id: str, content: str, due: str | None = None, tags: list[str] | None = None
+# ── Task helpers (ADR-0007 — event-sourced forest) ───────────────────────────
+
+
+def task_created(
+    *,
+    id: str,
+    content: str,
+    goal: str = "",
+    priority: int = 0,
+    parent_id: str | None = None,
+    origin: str = "agent",
+    due: str | None = None,
+    tags: list[str] | None = None,
+    schedule: str | None = None,
 ) -> Event:
+    """A new task node. ``parent_id`` attaches it under another task (tree)."""
     return Event(
-        kind=EventKind.TASK_ADDED,
-        payload={"id": id, "content": content, "due": due, "tags": tags or []},
+        kind=EventKind.TASK_CREATED,
+        payload={
+            "id": id,
+            "content": content,
+            "goal": goal,
+            "priority": priority,
+            "parent_id": parent_id,
+            "origin": origin,
+            "due": due,
+            "tags": tags or [],
+            "schedule": schedule,
+        },
     )
 
 
-def task_updated(*, id: str, status: str, done_at: str | None = None) -> Event:
+def task_updated(
+    *,
+    id: str,
+    content: str | None = None,
+    goal: str | None = None,
+    priority: int | None = None,
+    due: str | None = None,
+    tags: list[str] | None = None,
+) -> Event:
+    """Mutate a task's editable fields. Only non-None fields are applied."""
+    payload: dict[str, Any] = {"id": id}
+    if content is not None:
+        payload["content"] = content
+    if goal is not None:
+        payload["goal"] = goal
+    if priority is not None:
+        payload["priority"] = priority
+    if due is not None:
+        payload["due"] = due
+    if tags is not None:
+        payload["tags"] = tags
+    return Event(kind=EventKind.TASK_UPDATED, payload=payload)
+
+
+def task_transitioned(
+    *, id: str, from_state: str, to_state: str, reason: str | None = None, result: str | None = None
+) -> Event:
+    """A lifecycle move. ``reason`` audits *why* (e.g. ``"preempt:auto"``)."""
+    payload: dict[str, Any] = {"id": id, "from_state": from_state, "to_state": to_state}
+    if reason is not None:
+        payload["reason"] = reason
+    if result is not None:
+        payload["result"] = result
+    return Event(kind=EventKind.TASK_TRANSITIONED, payload=payload)
+
+
+def task_checkpointed(*, id: str, progress_summary: str) -> Event:
+    """The resume brief written when a task is suspended."""
     return Event(
-        kind=EventKind.TASK_UPDATED,
-        payload={"id": id, "status": status, "done_at": done_at},
+        kind=EventKind.TASK_CHECKPOINTED,
+        payload={"id": id, "progress_summary": progress_summary},
     )
 
 

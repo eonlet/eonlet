@@ -1,8 +1,13 @@
-"""Task / workflow state (ADR-0005).
+"""Task / workflow state — an event-sourced hierarchical forest (ADR-0007).
 
 Tasks are *things the agent will do*, not *things the agent knows* — so they
 live beside ``schedule`` (the trigger/workflow surface), not under ``memory/``.
-This package owns the ``tasks/todos.jsonl`` store, the ``tasks:`` config block,
+
+As of ADR-0007 the task source of truth is the **event log**: the live forest
+is a ``fold`` of the task event family (``TASK_CREATED`` / ``UPDATED`` /
+``TRANSITIONED`` / ``CHECKPOINTED`` / ``DELETED``), exactly as ``AgentState`` is
+a fold of conversation events. The old ``tasks/todos.jsonl`` store is retired.
+This package owns the projection (:mod:`forest`), the ``tasks:`` config block,
 and id minting; the ``task`` builtin tool and the runtime's ``<tasks>``
 injection consume it.
 """
@@ -10,15 +15,25 @@ injection consume it.
 from __future__ import annotations
 
 from .config import TasksConfig
+from .forest import (
+    Task,
+    TaskForest,
+    TaskOrigin,
+    TaskStatus,
+    can_transition,
+    fold_tasks,
+    reduce_task,
+)
 from .ids import mint_task_id
-from .store import Task, TaskStatus, TaskStore, todos_archive_path, todos_path
 
 __all__ = [
     "Task",
+    "TaskForest",
+    "TaskOrigin",
     "TaskStatus",
-    "TaskStore",
     "TasksConfig",
+    "can_transition",
+    "fold_tasks",
     "mint_task_id",
-    "todos_archive_path",
-    "todos_path",
+    "reduce_task",
 ]

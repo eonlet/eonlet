@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 from ...memory.knowledge import KnowledgeStore
 from ...memory.recall import IndexedMsg, RecallIndex
 from ...runtime.events import mem_recall_invoked
-from ...tasks import TaskStore
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
 RecallScope = Literal["events", "knowledge", "tasks"]
@@ -150,13 +149,15 @@ class RecallTool:
                 sections.append("## knowledge hits — 0\n")
             total_hits += len(k_matches)
 
-        if "tasks" in args.include and args.mode == "by_keyword" and args.query:
-            tasks_dir = (
-                ctx.tasks_dir if ctx.tasks_dir is not None else ctx.memory_dir.parent / "tasks"
-            )
-            tasks = await TaskStore(tasks_dir).list_tasks(status="all")
+        if (
+            "tasks" in args.include
+            and args.mode == "by_keyword"
+            and args.query
+            and ctx.read_tasks is not None
+        ):
+            tasks = ctx.read_tasks().all_tasks()
             q = args.query.lower()
-            matches_t = [t for t in tasks if q in t.content.lower()]
+            matches_t = [t for t in tasks if q in t.content.lower() or q in t.goal.lower()]
             if matches_t:
                 lines = ["## tasks hits"]
                 for t in matches_t[: args.limit]:

@@ -215,6 +215,20 @@ def tail(id_: str = typer.Argument(..., metavar="ID")) -> None:
 
 
 @app.command()
+def tasks(
+    id_: str = typer.Argument(..., metavar="ID"),
+    status: str = typer.Option(
+        "all",
+        "--status",
+        "-s",
+        help="Filter: pending|active|suspended|blocked|done|cancelled|all.",
+    ),
+) -> None:
+    """Show an eonlet's task forest as a tree (read-only, folded from the log)."""
+    commands.cmd_tasks(id_, status)
+
+
+@app.command()
 def replay(
     id_: str = typer.Argument(..., metavar="ID"),
     from_: int | None = typer.Option(None, "--from", help="Starting event id."),

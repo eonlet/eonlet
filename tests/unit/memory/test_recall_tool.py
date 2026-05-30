@@ -148,12 +148,15 @@ def test_includes_knowledge_in_keyword_mode(tmp_path: Path) -> None:
 
 
 def test_includes_tasks_in_keyword_mode(tmp_path: Path) -> None:
-    from eonlet.tasks import TaskStore
+    from eonlet.runtime.events import task_created
+    from eonlet.tasks import fold_tasks
 
     idx = RecallIndex(tmp_path)
-    tstore = TaskStore(tmp_path)
-    anyio.run(lambda: tstore.add(id="t1", content="check the AAPL filing"))
+    forest = fold_tasks(
+        [task_created(id="t1", content="check the AAPL filing").model_copy(update={"id": 1})]
+    )
     ctx, _ = _ctx(tmp_path, idx)
+    ctx.read_tasks = lambda: forest
 
     async def go() -> None:
         out = await RecallTool()(

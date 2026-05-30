@@ -1,20 +1,24 @@
-"""task: action-style task / action-item management (ADR-0005).
+"""task: hierarchical, event-sourced action-item management (ADR-0007).
 
 Tasks are workflow state — things the agent will *do* — and live beside
-``schedule``, not in memory. Replaces the old ``todo`` tool (same state
-machine: pending/done/cancelled, due dates, tags), persisted as JSONL in
-``tasks/todos.jsonl``.
+``schedule``, not in memory. As of ADR-0007 the task source of truth is the
+**event log**: this tool mutates only by emitting task events (``record_event``)
+and reads the live forest projection via ``ctx.read_tasks``. There is no JSONL
+store to double-write.
+
+Actions: ``add`` (optional ``parent_id`` for a subtask, ``priority``, ``goal``),
+``list`` (status filter, rendered as a tree), ``done`` / ``cancel`` (lifecycle
+transition by id), ``update`` (edit content/goal/priority/due/tags), ``delete``.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from ...runtime.events import task_added, task_deleted, task_updated
-from ...tasks import Task, TaskStore, mint_task_id
+from ...runtime.events import task_created, task_deleted, task_transitioned, task_updated
+from ...tasks import Task, TaskForest, can_transition, mint_task_id
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
 
@@ -24,114 +28,172 @@ class TaskArgs(BaseModel):
         default=None, description="Task id (required for done/cancel/update/delete)."
     )
     content: str | None = Field(default=None, description="Body text.")
+    goal: str | None = Field(
+        default=None, description="Durable objective (used to rebuild context on resume)."
+    )
+    parent_id: str | None = Field(
+        default=None, description="For action='add': attach as a subtask of this task id."
+    )
+    priority: int | None = Field(
+        default=None, description="Scheduling priority; higher runs first. Default 0."
+    )
     due: str | None = Field(
         default=None,
         description="Optional ISO-8601 due date (e.g. '2026-05-30T18:00:00+08:00').",
     )
     tags: list[str] = Field(default_factory=list)
-    status: Literal["pending", "done", "cancelled", "all"] = Field(
-        default="pending",
-        description="For action='list': which status to return ('all' to list everything).",
+    status: Literal["pending", "active", "suspended", "blocked", "done", "cancelled", "all"] = (
+        Field(
+            default="pending",
+            description="For action='list': which status to return ('all' for everything).",
+        )
     )
 
 
-def _tasks_dir(ctx: ToolContext) -> Path:
-    # The worker sets ctx.tasks_dir explicitly; fall back to the eonlet-dir
-    # sibling of memory/ when running outside the full runtime.
-    return ctx.tasks_dir if ctx.tasks_dir is not None else ctx.memory_dir.parent / "tasks"
-
-
-def _render(t: Task) -> str:
-    icon = {"pending": "[ ]", "done": "[x]", "cancelled": "[-]"}[t.status]
-    head = f"{icon} {t.id}"
-    if t.due:
-        head += f"  (due: {t.due})"
-    if t.tags:
-        head += "  (tags: " + ", ".join(t.tags) + ")"
-    return head + "\n    " + t.content.replace("\n", "\n    ")
+def _render_tree(forest: TaskForest, status_filter: str) -> str:
+    """Indented tree of tasks matching the status filter (ancestors shown for context)."""
+    icon = {
+        "pending": "[ ]",
+        "active": "[*]",
+        "suspended": "[~]",
+        "blocked": "[!]",
+        "done": "[x]",
+        "cancelled": "[-]",
+    }
+    keep = {t.id for t in forest.by_status(status_filter)}  # type: ignore[arg-type]
+    if status_filter != "all":
+        # Keep ancestors of matches so the tree stays connected/readable.
+        for tid in list(keep):
+            cur = forest.get(tid)
+            while cur is not None and cur.parent_id is not None:
+                keep.add(cur.parent_id)
+                cur = forest.get(cur.parent_id)
+    lines: list[str] = []
+    for t, depth in forest.dfs():
+        if t.id not in keep:
+            continue
+        indent = "  " * depth
+        head = f"{indent}{icon.get(t.status, '[?]')} {t.id}"
+        if t.priority:
+            head += f"  (p{t.priority})"
+        if t.due:
+            head += f"  (due: {t.due})"
+        if t.tags:
+            head += "  (tags: " + ", ".join(t.tags) + ")"
+        body = (t.goal or t.content).strip()
+        lines.append(f"{head} — {body}" if body else head)
+    return "\n".join(lines)
 
 
 @tool
 class TaskTool:
     name = "task"
     description = (
-        "Action-item tracker with structured state. Actions: "
-        "'add' (content required; optional due/tags), "
-        "'list' (status filter: pending|done|cancelled|all), "
-        "'done' (mark pending → done by id), "
-        "'cancel' (mark → cancelled by id), "
-        "'update' (id + any of content/due/tags), "
-        "'delete' (id)."
+        "Hierarchical action-item tracker. Tasks form a tree (add with parent_id) "
+        "and carry a priority. Actions: "
+        "'add' (content required; optional parent_id/priority/goal/due/tags), "
+        "'list' (status filter: pending|active|suspended|blocked|done|cancelled|all; "
+        "rendered as a tree), "
+        "'done' (mark → done by id), 'cancel' (mark → cancelled by id), "
+        "'update' (id + any of content/goal/priority/due/tags), 'delete' (id)."
     )
     input_schema = TaskArgs
     annotations = ToolAnnotations(destructive=True)
 
     async def __call__(self, args: TaskArgs, ctx: ToolContext) -> ToolResult:
-        store = TaskStore(_tasks_dir(ctx))
+        if ctx.record_event is None:
+            return ToolResult(content="task: no event sink (not in an agent run)", is_error=True)
+        forest = ctx.read_tasks() if ctx.read_tasks is not None else None
 
         if args.action == "add":
             if not args.content:
                 return ToolResult(content="task add: 'content' is required", is_error=True)
-            try:
-                task = await store.add(
-                    id=mint_task_id(), content=args.content, due=args.due, tags=args.tags
+            if args.parent_id and forest is not None and forest.get(args.parent_id) is None:
+                return ToolResult(
+                    content=f"task add: no such parent task: {args.parent_id}", is_error=True
                 )
-            except ValueError as e:
-                return ToolResult(content=f"task add: {e}", is_error=True)
-            if ctx.record_event is not None:
-                await ctx.record_event(
-                    task_added(id=task.id, content=task.content, due=task.due, tags=task.tags)
+            tid = mint_task_id()
+            await ctx.record_event(
+                task_created(
+                    id=tid,
+                    content=args.content,
+                    goal=args.goal or "",
+                    priority=args.priority or 0,
+                    parent_id=args.parent_id,
+                    origin="agent",
+                    due=args.due,
+                    tags=args.tags,
                 )
-            return ToolResult(content=f"added {task.id}", structured_output={"id": task.id})
+            )
+            return ToolResult(content=f"added {tid}", structured_output={"id": tid})
 
         if args.action == "list":
-            tasks = await store.list_tasks(status=args.status)
-            if not tasks:
+            if forest is None:
+                return ToolResult(content="task list: unavailable outside the agent run")
+            rendered = _render_tree(forest, args.status)
+            if not rendered:
                 return ToolResult(content=f"(no {args.status} tasks)")
-            return ToolResult(content="\n".join(_render(t) for t in tasks))
+            return ToolResult(content=rendered)
 
         if args.action in ("done", "cancel"):
             if not args.id:
                 return ToolResult(content=f"task {args.action}: 'id' is required", is_error=True)
-            try:
-                if args.action == "done":
-                    task = await store.mark_done(id=args.id)
-                else:
-                    task = await store.mark_cancelled(id=args.id)
-            except KeyError:
+            task = forest.get(args.id) if forest is not None else None
+            if task is None:
                 return ToolResult(content=f"no such task: {args.id}", is_error=True)
-            if ctx.record_event is not None:
-                await ctx.record_event(
-                    task_updated(id=task.id, status=task.status, done_at=task.done_at)
+            dst = "done" if args.action == "done" else "cancelled"
+            if task.status == dst:
+                return ToolResult(content=f"{args.id} already {dst}")
+            if not can_transition(task.status, dst):
+                return ToolResult(
+                    content=f"task {args.action}: cannot move {args.id} from "
+                    f"{task.status} to {dst}",
+                    is_error=True,
                 )
+            await ctx.record_event(
+                task_transitioned(
+                    id=task.id, from_state=task.status, to_state=dst, reason=f"tool:{args.action}"
+                )
+            )
             return ToolResult(content=f"{args.action} {task.id}")
 
         if args.action == "update":
             if not args.id:
                 return ToolResult(content="task update: 'id' is required", is_error=True)
-            if args.content is None and args.due is None and not args.tags:
+            if (
+                args.content is None
+                and args.goal is None
+                and args.priority is None
+                and args.due is None
+                and not args.tags
+            ):
                 return ToolResult(
-                    content="task update: provide at least one of content/due/tags",
+                    content="task update: provide at least one of content/goal/priority/due/tags",
                     is_error=True,
                 )
-            try:
-                task = await store.update(
-                    id=args.id, content=args.content, due=args.due, tags=args.tags or None
-                )
-            except KeyError:
+            if forest is not None and forest.get(args.id) is None:
                 return ToolResult(content=f"no such task: {args.id}", is_error=True)
-            if ctx.record_event is not None:
-                await ctx.record_event(task_updated(id=task.id, status=task.status))
-            return ToolResult(content=f"updated {task.id}")
+            await ctx.record_event(
+                task_updated(
+                    id=args.id,
+                    content=args.content,
+                    goal=args.goal,
+                    priority=args.priority,
+                    due=args.due,
+                    tags=args.tags or None,
+                )
+            )
+            return ToolResult(content=f"updated {args.id}")
 
         if args.action == "delete":
             if not args.id:
                 return ToolResult(content="task delete: 'id' is required", is_error=True)
-            removed = await store.delete(id=args.id)
-            if not removed:
+            if forest is not None and forest.get(args.id) is None:
                 return ToolResult(content=f"no such task: {args.id}", is_error=True)
-            if ctx.record_event is not None:
-                await ctx.record_event(task_deleted(id=args.id))
+            await ctx.record_event(task_deleted(id=args.id))
             return ToolResult(content=f"deleted {args.id}")
 
         return ToolResult(content=f"task: unknown action {args.action!r}", is_error=True)
+
+
+__all__ = ["Task", "TaskArgs", "TaskTool"]

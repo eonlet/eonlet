@@ -26,7 +26,7 @@ from pathlib import Path
 import structlog
 
 from ..runtime.events import Event, EventKind
-from ..tasks import TaskStore
+from ..tasks import TaskForest
 from ..tasks.config import TasksConfig
 from .config import MemoryConfig
 from .knowledge import KnowledgeStore
@@ -106,22 +106,28 @@ async def build_memory_preamble(memory_dir: Path, cfg: MemoryConfig) -> str:
 # ── Tasks block (sibling of <memory>, ADR-0005) ─────────────────────────────
 
 
-async def build_tasks_block(tasks_dir: Path, cfg: TasksConfig) -> str:
-    """Return the ``<tasks>...</tasks>`` block of pending tasks, or ``""``.
+def build_tasks_block(forest: TaskForest, cfg: TasksConfig) -> str:
+    """Return the ``<tasks>...</tasks>`` block of pending leaf tasks, or ``""``.
 
     Tasks are workflow state, not memory, so this block is injected as a
-    sibling of ``<memory>`` — not nested inside it. Pending only, by default.
+    sibling of ``<memory>`` — not nested inside it. Only pending **leaves** (the
+    actionable work items) are surfaced, highest priority first; internal
+    orchestration nodes and completed work stay out of the window (ADR-0007).
+    The forest is the runtime's live projection (folded from the event log), so
+    this is pure in-memory rendering.
     """
     if not cfg.inject_pending:
         return EMPTY_PREAMBLE
-    pending = await TaskStore(tasks_dir).list_tasks(status="pending")
+    pending = forest.pending_leaves()
     if not pending:
         return EMPTY_PREAMBLE
     lines = []
     for t in pending:
+        prio = f" (p{t.priority})" if t.priority else ""
         due = f" (due: {t.due})" if t.due else ""
         tags = "  (tags: " + ", ".join(t.tags) + ")" if t.tags else ""
-        lines.append(f"- [{t.id}] {t.content}{due}{tags}")
+        body = t.goal or t.content
+        lines.append(f"- [{t.id}]{prio} {body}{due}{tags}")
     return "<tasks>\n" + "\n".join(lines) + "\n</tasks>"
 
 

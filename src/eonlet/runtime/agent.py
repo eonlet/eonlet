@@ -20,6 +20,7 @@ from ..llm import LLMMessage, LLMProvider, LLMResponse, LLMToolCall, resolve_mod
 from ..memory.injection import build_memory_preamble, build_tasks_block, current_watermark
 from ..memory.recall import RecallIndex
 from ..permissions import PermissionGate
+from ..tasks import TaskForest, fold_tasks, reduce_task
 from ..tools import ToolContext, ToolResult, get_registry
 from ..web import HTTPFetcher
 from .definition import Definition
@@ -49,6 +50,10 @@ class AgentRuntime:
     provider: LLMProvider
     gate: PermissionGate
     state: AgentState = field(default_factory=AgentState)
+    # Live task forest (ADR-0007) — a fold of the task events, kept current the
+    # same way ``state`` is: reduced on every append in ``_record``. The event
+    # log is the source of truth; this is the projection tools/injection read.
+    task_forest: TaskForest = field(default_factory=TaskForest)
     # Callable[[Event], Awaitable[None]] | None — wired by the worker to push to IPC.
     event_listener: Callable[[Event], Any] | None = None
     # Callable[[str], Awaitable[None]] | None — token delta push (not persisted).
@@ -103,6 +108,7 @@ class AgentRuntime:
     ) -> AgentRuntime:
         events = store.read()
         state = fold(events)
+        task_forest = fold_tasks(events)
         gate = PermissionGate(
             mode=definition.config.permissions.mode,
             extra_deny=definition.config.permissions.extra_deny,
@@ -118,6 +124,7 @@ class AgentRuntime:
             provider=prov,
             gate=gate,
             state=state,
+            task_forest=task_forest,
             auto_compact_enabled=definition.config.memory.episodic.auto_compact,
         )
 
@@ -143,9 +150,7 @@ class AgentRuntime:
             log.exception("memory preamble build failed; injecting nothing")
             self._cached_preamble = ""
         try:
-            self._cached_tasks = await build_tasks_block(
-                self.tasks_dir, self.definition.config.tasks
-            )
+            self._cached_tasks = build_tasks_block(self.task_forest, self.definition.config.tasks)
         except Exception:
             log.exception("tasks block build failed; injecting nothing")
             self._cached_tasks = ""
@@ -392,6 +397,7 @@ class AgentRuntime:
             env=dict(self.definition.config.env.defaults),
             scheduler=self.scheduler,
             record_event=self._record,
+            read_tasks=lambda: self.task_forest,
             http_fetcher=self.http_fetcher,
             extra=extra,
         )
@@ -489,6 +495,8 @@ class AgentRuntime:
         from .state import reduce as _reduce
 
         self.state = _reduce(self.state, stored)
+        # Keep the task-forest projection current the same way (ADR-0007).
+        reduce_task(self.task_forest, stored)
         if self.recall_index is not None:
             try:
                 self.recall_index.index_event(stored)
