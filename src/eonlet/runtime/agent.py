@@ -94,6 +94,14 @@ class AgentRuntime:
     # path around a task-scoped run; threaded into ToolContext so the `task`
     # tool's done/add default to it. ``None`` for ordinary turns.
     current_task_id: str | None = None
+    # Turn-boundary hook (ADR-0007 M3). Called before each turn; if it returns
+    # True the run ends cleanly at that boundary. The worker installs it to
+    # implement cooperative preemption (pause this task for a higher-priority
+    # one). ``None`` for ordinary runs.
+    pause_check: Callable[[], Any] | None = None
+    # Monotonic timestamp of the last preemption (ADR-0007 M3) — anti-thrash
+    # cooldown guard. In-memory; resets on worker restart.
+    last_preempt_monotonic: float = 0.0
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -183,6 +191,12 @@ class AgentRuntime:
         last_bad_signature: tuple[str, str] | None = None
 
         for _step in range(max_steps):
+            # Cooperative preemption point (ADR-0007 M3): give the worker a chance
+            # to pause this task-scoped run for a higher-priority one. Ends the
+            # run cleanly; the worker checkpoints + re-queues the paused task.
+            if self.pause_check is not None and await self.pause_check():
+                log.info("agent: run paused at turn boundary")
+                return
             messages = self._build_llm_messages()
             try:
                 resp = await self._stream_one_turn(messages, tool_specs)

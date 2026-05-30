@@ -271,7 +271,9 @@ tasks:
     assert final.get("result") == "completed"
 
 
-def _write_scheduling_agent(name: str, model: str) -> Path:
+def _write_scheduling_agent(
+    name: str, model: str, *, tools: str = "[task]", preempt: str = "ask"
+) -> Path:
     d = paths.agents_dir() / name
     d.mkdir(parents=True)
     (d / "agent.yaml").write_text(
@@ -285,12 +287,14 @@ runtime:
   model: {model}
   max_steps_per_run: 8
 tools:
-  builtin: [task]
+  builtin: {tools}
 permissions:
   mode: yolo
 tasks:
   scheduling:
     enabled: true
+    preempt: {preempt}
+    preempt_cooldown: 0s
 """,
         encoding="utf-8",
     )
@@ -406,3 +410,74 @@ def test_inproc_scheduler_yield_checkpoints_and_suspends(isolated_home: Path) ->
 
     assert final.get("status") == "suspended"
     assert final.get("progress_summary")  # non-empty resume brief
+
+
+def test_inproc_scheduler_preempts_lower_priority(isolated_home: Path) -> None:
+    """A running low-priority task is paused mid-run when a higher-priority task
+    appears; the high-priority one completes, the low one is re-queued (M3)."""
+    paths.ensure_home()
+    d = _write_scheduling_agent(
+        "preemptbot", "fake-task-busy", tools="[task, sleep]", preempt="auto_by_priority"
+    )
+    eid = "preemptbot.alice"
+    _prep_eonlet(eid, d)
+
+    result: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    # Low-priority long task starts running (it just sleeps).
+                    await client.request("task.add", {"content": "BUSY: long job", "priority": 1})
+                    await anyio.sleep(0.3)  # let it get into its run
+                    # Higher-priority task arrives → should preempt.
+                    hi = await client.request("task.add", {"content": "urgent", "priority": 9})
+                    hi_id = hi["id"]
+
+                    # Wait until the urgent task is done.
+                    for _ in range(80):
+                        listed = await client.request("task.list", {"status": "all"})
+                        by_id = {t["id"]: t for t in listed["tasks"]}
+                        if by_id.get(hi_id, {}).get("status") == "done":
+                            result["hi"] = by_id[hi_id]
+                            # Capture the preemption transition from the log.
+                            evs = await client.request("events.replay", {"from": 0})
+                            result["preempt_events"] = [
+                                e
+                                for e in evs
+                                if e["kind"] == "task_transitioned"
+                                and str(e["payload"].get("reason", "")).startswith("preempted:")
+                            ]
+                            break
+                        await anyio.sleep(0.2)
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(25):
+            await go()
+
+    anyio.run(with_timeout)
+
+    # The urgent task completed...
+    assert result.get("hi", {}).get("status") == "done"  # type: ignore[union-attr]
+    assert result["hi"]["result"] == "quick done"  # type: ignore[index]
+    # ...because the busy task was preempted to make way for it.
+    preempts = result.get("preempt_events") or []
+    assert preempts, "expected a 'preempted:' transition for the busy task"
+    assert preempts[0]["payload"]["reason"] == f"preempted:{result['hi']['id']}"  # type: ignore[index]

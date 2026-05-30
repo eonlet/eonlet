@@ -26,7 +26,7 @@ from .forest import (
     reduce_task,
 )
 from .ids import mint_task_id
-from .scheduler import PostRun, classify_post_run, next_runnable
+from .scheduler import PostRun, classify_post_run, next_runnable, preemptor
 
 __all__ = [
     "PostRun",
@@ -42,5 +42,6 @@ __all__ = [
     "is_terminal",
     "mint_task_id",
     "next_runnable",
+    "preemptor",
     "reduce_task",
 ]

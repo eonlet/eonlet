@@ -17,6 +17,9 @@ Available variants:
   either decomposes (a goal containing ``DECOMPOSE`` → adds two subtasks),
   synthesizes (prompt has ``Subtask results`` → ``task(done)``), or completes a
   leaf (``task(done)``). Drives the full decompose → children → synthesis flow.
+- ``fake-task-busy`` — prompt-aware. A goal containing ``BUSY`` never finishes
+  (emits ``sleep`` every turn, so it can be preempted); any other goal completes
+  via ``task(done)``. Drives the M3 preemption path (needs the ``sleep`` tool).
 
 The variant name is also stored on the instance as ``model``, so it shows up
 in event payloads / inspect output exactly like a real model.
@@ -44,7 +47,13 @@ class FakeProvider:
 
     def __init__(self, model: str) -> None:
         self.model = model
-        if model not in {"fake-echo", "fake-tool-then-text", "fake-task-done", "fake-task-tree"}:
+        if model not in {
+            "fake-echo",
+            "fake-tool-then-text",
+            "fake-task-done",
+            "fake-task-tree",
+            "fake-task-busy",
+        }:
             raise ValueError(f"unknown fake variant: {model!r}")
         # ``fake-tool-then-text`` is stateful across turns within one run; we
         # count how many ``stream()``s have happened.
@@ -88,6 +97,10 @@ class FakeProvider:
             return
         if self.model == "fake-task-tree":
             async for c in self._task_tree_stream(messages):
+                yield c
+            return
+        if self.model == "fake-task-busy":
+            async for c in self._task_busy_stream(messages):
                 yield c
             return
         raise AssertionError(f"unhandled fake variant: {self.model}")  # pragma: no cover
@@ -199,4 +212,40 @@ class FakeProvider:
         yield DoneChunk(
             type="done",
             response=LLMResponse(content="", tool_calls=calls, stop_reason="tool_use"),
+        )
+
+    async def _task_busy_stream(self, messages: list[LLMMessage]) -> AsyncIterator[StreamChunk]:
+        last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=-1)
+        prompt = messages[last_user].content if last_user >= 0 else ""
+        goal_line = next((ln for ln in prompt.splitlines() if ln.startswith("Goal:")), "")
+        if "BUSY" in goal_line:
+            # Never completes — sleep every turn so the run spans real time and a
+            # higher-priority task can preempt it at a turn boundary.
+            yield DoneChunk(
+                type="done",
+                response=LLMResponse(
+                    content="",
+                    tool_calls=[LLMToolCall(id="s", name="sleep", arguments={"seconds": 0.2})],
+                    stop_reason="tool_use",
+                ),
+            )
+            return
+        acted = any(m.role in ("assistant", "tool") for m in messages[last_user + 1 :])
+        if acted:
+            yield DoneChunk(
+                type="done",
+                response=LLMResponse(content="ok", tool_calls=[], stop_reason="end_turn"),
+            )
+            return
+        yield DoneChunk(
+            type="done",
+            response=LLMResponse(
+                content="",
+                tool_calls=[
+                    LLMToolCall(
+                        id="d", name="task", arguments={"action": "done", "result": "quick done"}
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
         )

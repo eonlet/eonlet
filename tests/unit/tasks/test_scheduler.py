@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from eonlet.runtime.events import Event, task_created, task_transitioned
-from eonlet.tasks import TaskForest, classify_post_run, fold_tasks, next_runnable
+from eonlet.tasks import TaskForest, classify_post_run, fold_tasks, next_runnable, preemptor
 from eonlet.tasks.scheduler import PostRun, synthesis_ready
 
 
@@ -140,3 +140,54 @@ def test_classify_post_run_yielded() -> None:
 def test_classify_post_run_gone() -> None:
     forest = TaskForest()
     assert classify_post_run(forest, "ghost") is PostRun.GONE
+
+
+# ── preemption (M3) ──────────────────────────────────────────────────────────
+
+
+def test_next_runnable_excludes_subtree() -> None:
+    forest = _forest(
+        task_created(id="a", content="a", priority=5),
+        task_created(id="a1", content="a1", parent_id="a", priority=9),
+        task_transitioned(id="a", from_state="pending", to_state="active"),
+        task_created(id="b", content="b", priority=3),
+    )
+    # Excluding a's subtree (a + a1), the only other runnable is b.
+    got = next_runnable(forest, exclude_id="a")
+    assert got is not None and got.id == "b"
+
+
+def test_preemptor_returns_strictly_higher_priority() -> None:
+    forest = _forest(
+        task_created(id="cur", content="current", priority=2),
+        task_transitioned(id="cur", from_state="pending", to_state="active"),
+        task_created(id="hot", content="urgent", priority=9),
+    )
+    cur = forest.get("cur")
+    assert cur is not None
+    p = preemptor(forest, cur)
+    assert p is not None and p.id == "hot"
+
+
+def test_preemptor_ignores_equal_or_lower_priority() -> None:
+    forest = _forest(
+        task_created(id="cur", content="current", priority=5),
+        task_transitioned(id="cur", from_state="pending", to_state="active"),
+        task_created(id="eq", content="equal", priority=5),
+        task_created(id="lo", content="lower", priority=1),
+    )
+    cur = forest.get("cur")
+    assert cur is not None
+    assert preemptor(forest, cur) is None  # neither equal nor lower preempts
+
+
+def test_preemptor_ignores_own_subtask() -> None:
+    forest = _forest(
+        task_created(id="cur", content="current", priority=2),
+        task_transitioned(id="cur", from_state="pending", to_state="active"),
+        # A high-priority *subtask* of the running task must not preempt it.
+        task_created(id="sub", content="subtask", parent_id="cur", priority=9),
+    )
+    cur = forest.get("cur")
+    assert cur is not None
+    assert preemptor(forest, cur) is None

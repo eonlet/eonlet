@@ -32,7 +32,11 @@ def _ordered_children(forest: TaskForest, task_id: str) -> list[Task]:
     return sorted(forest.children(task_id), key=lambda t: (-t.priority, t.created_at, t.id))
 
 
-def _runnable_in_subtree(forest: TaskForest, node: Task) -> Task | None:
+def _runnable_in_subtree(forest: TaskForest, node: Task, exclude_id: str | None) -> Task | None:
+    if node.id == exclude_id:
+        # Skip the excluded task and its whole subtree (used by preemption so a
+        # running task isn't "preempted" by one of its own subtasks).
+        return None
     if is_terminal(node.status):
         return None
     children = _ordered_children(forest, node.id)
@@ -42,7 +46,7 @@ def _runnable_in_subtree(forest: TaskForest, node: Task) -> Task | None:
         return node if node.status == "pending" else None
     # Has children — descend depth-first to the highest-priority runnable one.
     for child in children:
-        found = _runnable_in_subtree(forest, child)
+        found = _runnable_in_subtree(forest, child, exclude_id)
         if found is not None:
             return found
     # No runnable descendant. If every child is terminal, this node is ready for
@@ -53,17 +57,31 @@ def _runnable_in_subtree(forest: TaskForest, node: Task) -> Task | None:
     return None
 
 
-def next_runnable(forest: TaskForest) -> Task | None:
+def next_runnable(forest: TaskForest, *, exclude_id: str | None = None) -> Task | None:
     """The single task the agent should work on next, or ``None`` if idle.
 
     Highest-priority root tree first; within a tree, depth-first through
-    highest-priority siblings to the first runnable node.
+    highest-priority siblings to the first runnable node. ``exclude_id`` skips a
+    task and its subtree (preemption asks "what else is runnable besides me?").
     """
     for root in forest.roots():  # already priority-ordered
-        found = _runnable_in_subtree(forest, root)
+        found = _runnable_in_subtree(forest, root, exclude_id)
         if found is not None:
             return found
     return None
+
+
+def preemptor(forest: TaskForest, current: Task) -> Task | None:
+    """A runnable task that should preempt ``current``, or ``None``.
+
+    A contender preempts only if it is **strictly higher priority** than the
+    running task and lies outside the running task's own subtree. (Equal
+    priority never preempts — that would let two same-priority tasks thrash.)
+    """
+    contender = next_runnable(forest, exclude_id=current.id)
+    if contender is None:
+        return None
+    return contender if contender.priority > current.priority else None
 
 
 def synthesis_ready(forest: TaskForest, task_id: str) -> bool:

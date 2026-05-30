@@ -15,10 +15,12 @@ socket task pushes to the queue and returns immediately.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC
 from pathlib import Path
@@ -235,11 +237,19 @@ _CLOSED = object()  # sentinel: the trigger stream was closed
 
 
 def _try_receive(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | None:
-    """Non-blocking peek at the trigger queue. ``None`` if empty (or closed)."""
-    try:
-        return recv.receive_nowait()
-    except (anyio.WouldBlock, anyio.EndOfStream, anyio.ClosedResourceError):
-        return None
+    """Non-blocking drain to the first real trigger. ``None`` if only wakes/empty.
+
+    ``task_wake`` sentinels (pushed by the IPC handler to unblock an idle loop)
+    carry no work — they are drained here so the caller falls through to the
+    scheduler check.
+    """
+    while True:
+        try:
+            item = recv.receive_nowait()
+        except (anyio.WouldBlock, anyio.EndOfStream, anyio.ClosedResourceError):
+            return None
+        if item.kind != "task_wake":
+            return item
 
 
 async def _recv_one(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | object:
@@ -300,6 +310,11 @@ async def _main_loop(
                 assert isinstance(got, TriggerItem)
                 item = got
 
+            # A wake sentinel only exists to re-check the scheduler — it carries
+            # no message to run.
+            if item.kind == "task_wake":
+                continue
+
             ok = True
             try:
                 async for _ in runtime.handle_user_message(item.content):
@@ -317,24 +332,48 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
     """Run one scheduler-selected task to a yield point, then apply its outcome.
 
     The task is activated, run with its assembled prompt, then classified: the
-    agent marks it done via the `task` tool (DONE), adds subtasks (DECOMPOSED →
-    block on them), or yields without finishing (checkpoint a resume brief +
-    suspend). Cooperative — preemption is M3.
+    agent marks it done (DONE), adds subtasks (DECOMPOSED → block on them),
+    yields without finishing (YIELDED → checkpoint + suspend), or is paused mid-
+    run for a higher-priority task (preempted → checkpoint + re-queue as pending,
+    so it resumes once the preemptor is done). All cooperative (ADR-0007 M2/M3).
     """
     from ..runtime.events import task_checkpointed, task_transitioned
     from ..tasks import PostRun, classify_post_run
     from ..tasks.context import build_task_prompt
+
+    sched = runtime.definition.config.tasks.scheduling
+    preempt_to: dict[str, str] = {}  # {"id": contender} once we decide to pause
 
     await runtime._record(
         task_transitioned(id=task.id, from_state=task.status, to_state="active", reason="scheduled")
     )
     prompt = build_task_prompt(runtime.task_forest, task.id)
     runtime.current_task_id = task.id
+    runtime.pause_check = (
+        _make_pause_check(runtime, task, sched, preempt_to) if sched.preempt != "off" else None
+    )
     try:
         async for _ in runtime.handle_user_message(prompt):
             pass
     finally:
         runtime.current_task_id = None
+        runtime.pause_check = None
+
+    if preempt_to:
+        # Paused for a higher-priority task: checkpoint a resume brief and put
+        # the task back to pending so the scheduler re-picks it after the
+        # preemptor (which now outranks it) and it resumes from the brief.
+        summary = _checkpoint_summary(runtime, task.id)
+        await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+        await runtime._record(
+            task_transitioned(
+                id=task.id,
+                from_state="active",
+                to_state="pending",
+                reason=f"preempted:{preempt_to['id']}",
+            )
+        )
+        return
 
     outcome = classify_post_run(runtime.task_forest, task.id)
     if outcome is PostRun.DECOMPOSED:
@@ -352,6 +391,63 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
             )
         )
     # DONE / GONE: the agent already moved the task (or it's gone) — nothing to do.
+
+
+def _task_label(task: Task) -> str:
+    text = (task.goal or task.content).strip()
+    return text if len(text) <= 60 else text[:59] + "…"
+
+
+def _make_pause_check(
+    runtime: AgentRuntime, task: Task, sched: Any, preempt_to: dict[str, str]
+) -> Callable[[], Awaitable[bool]]:
+    """Build the turn-boundary preemption check for one task-scoped run."""
+    from ..config import parse_duration
+    from ..tasks import preemptor
+
+    cooldown = parse_duration(sched.preempt_cooldown)
+
+    async def check() -> bool:
+        if preempt_to:  # already decided to pause this run
+            return True
+        if time.monotonic() - runtime.last_preempt_monotonic < cooldown:
+            return False  # anti-thrash
+        cur = runtime.task_forest.get(task.id)
+        if cur is None:
+            return False
+        contender = preemptor(runtime.task_forest, cur)
+        if contender is None:
+            return False
+        if not await _approve_preempt(runtime, cur, contender, sched):
+            return False
+        preempt_to["id"] = contender.id
+        runtime.last_preempt_monotonic = time.monotonic()
+        log.info("task %s paused for higher-priority %s", task.id, contender.id)
+        return True
+
+    return check
+
+
+async def _approve_preempt(
+    runtime: AgentRuntime, current: Task, contender: Task, sched: Any
+) -> bool:
+    """Consent for a preemption switch. ``auto_by_priority`` (or yolo) auto-
+    approves; ``ask`` prompts the attached user (declines if headless)."""
+    if sched.preempt == "auto_by_priority" or runtime.gate.mode == "yolo":
+        return True
+    broker = runtime.decision_broker
+    if broker is None:
+        return False
+    choice = await broker.ask(
+        kind="task_preempt",
+        prompt=(
+            f"Pause '{_task_label(current)}' to run higher-priority '{_task_label(contender)}'?"
+        ),
+        options=["switch", "keep"],
+        payload={"pause": current.id, "start": contender.id},
+        decline="keep",
+    )
+    return bool(choice == "switch")
 
 
 def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> str:
@@ -645,7 +741,14 @@ def _make_handler(
             n = await scheduler.clear_dynamic()
             return {"ok": True, "cleared": n}
         if method.startswith(("memory.", "task.")):
-            return await _handle_memory_ipc(method, params, runtime)
+            resp = await _handle_memory_ipc(method, params, runtime)
+            # A task mutation may create runnable work; poke the loop so it
+            # re-checks the scheduler promptly instead of waiting for the idle
+            # poll (ADR-0007 M2). The sentinel carries no message.
+            if method.startswith("task.") and runtime.definition.config.tasks.scheduling.enabled:
+                with contextlib.suppress(anyio.WouldBlock):
+                    send.send_nowait(TriggerItem(kind="task_wake", content=""))
+            return resp
         return {"error": f"unknown method: {method}"}
 
     return handle
