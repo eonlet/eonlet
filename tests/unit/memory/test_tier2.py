@@ -114,7 +114,7 @@ def test_prompt_lists_sections() -> None:
 
 _GOOD_RESP = {
     "ltm_additions": [
-        {"section": "fact", "content": "agent compacted portfolio notes"},
+        {"section": "episodic", "content": "2026-05-22: compacted portfolio notes"},
         {"section": "episodic", "content": "2026-05-22: portfolio rebalance discussion"},
     ],
     "stm_keep_section_headers": [
@@ -127,14 +127,14 @@ def test_parse_accepts_good_response() -> None:
     secs = [_section()]
     resp = parse_tier2_response(json.dumps(_GOOD_RESP), secs)
     assert len(resp.ltm_additions) == 2
-    assert resp.ltm_additions[0].section == "fact"
+    assert resp.ltm_additions[0].section == "episodic"
     assert len(resp.stm_keep_section_headers) == 1
 
 
 def test_parse_accepts_fenced_json() -> None:
     fenced = "```json\n" + json.dumps(_GOOD_RESP) + "\n```"
     resp = parse_tier2_response(fenced, [_section()])
-    assert resp.ltm_additions[0].section == "fact"
+    assert resp.ltm_additions[0].section == "episodic"
 
 
 def test_parse_rejects_non_json() -> None:
@@ -161,14 +161,14 @@ def test_parse_rejects_schema_violation() -> None:
 
 def _under_budget_cfg() -> MemoryConfig:
     return MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 64, "short_term_tokens": 99999}}
+        {"episodic": {"working_memory_tokens": 64, "short_term_tokens": 99999}}
     )
 
 
 def _over_budget_cfg() -> MemoryConfig:
     # short_term_tokens=64 (minimum) ensures a moderately sized STM is over budget.
     return MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 64, "short_term_tokens": 64}}
+        {"episodic": {"working_memory_tokens": 64, "short_term_tokens": 64}}
     )
 
 
@@ -196,7 +196,7 @@ def test_run_tier2_promotes_to_ltm(tmp_path: Path) -> None:
 
     cfg = _over_budget_cfg()
     good_resp = {
-        "ltm_additions": [{"section": "fact", "content": "portfolio stuff"}],
+        "ltm_additions": [{"section": "episodic", "content": "2026-05-22: portfolio stuff"}],
         "stm_keep_section_headers": [],
     }
     provider = _StaticProvider(good_resp)
@@ -208,9 +208,9 @@ def test_run_tier2_promotes_to_ltm(tmp_path: Path) -> None:
     # LTM bullet written with src:implicit.
     ltm_bullets = LTMStore(tmp_path).read_bullets()
     assert len(ltm_bullets) == 1
-    assert ltm_bullets[0].content == "portfolio stuff"
+    assert ltm_bullets[0].content == "2026-05-22: portfolio stuff"
     assert ltm_bullets[0].src == "implicit"
-    assert ltm_bullets[0].section == "fact"
+    assert ltm_bullets[0].section == "episodic"
 
     # STM replaced with kept sections (none kept in this run).
     stm_sections = anyio.run(STMStore(tmp_path).read)
@@ -286,7 +286,7 @@ def test_run_tier2_emits_event(tmp_path: Path) -> None:
     anyio.run(lambda: stm_store.append_sections([_section(body="x" * 200)]))
 
     good_resp = {
-        "ltm_additions": [{"section": "fact", "content": "something durable"}],
+        "ltm_additions": [{"section": "episodic", "content": "2026-05-22: something durable"}],
         "stm_keep_section_headers": [],
     }
     cfg = _over_budget_cfg()

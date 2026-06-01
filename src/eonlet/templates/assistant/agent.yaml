@@ -34,13 +34,12 @@ tools:
     - file_edit
     - glob
     - grep
-    # web_search and web_fetch land in v0.0.2 — see ROADMAP.md
-    - note
-    - todo
+    - web_search
+    - web_fetch
+    - knowledge               # curated knowledge base (ADR-0005)
+    - task                    # action items / workflow state
     - recall
     - memory
-    - remember
-    - forget
     - load_skill
     - sleep
     - schedule
@@ -51,12 +50,25 @@ permissions:
 memory:
   enabled: true
   compaction_model: deepseek-v4-flash@deepseek
-  conversation:
+  inject_turn_timestamps: true       # stamp each user turn with its local datetime
+  episodic:                    # the conversation timeline: working → STM → LTM
     working_memory_tokens: 12000     # higher cap for chatty interactive use
     keep_recent_messages_min: 6
     short_term_tokens: 4000
     long_term_tokens: 8000
     auto_compact: true
+    propose_semantic: true           # let the agent propose folding away stale context
+    propose_floor_tokens: 6000       # …but only once the window is sizeable
+    propose_min_interval_seconds: 1800
+    propose_min_turns: 3
+  knowledge:                   # curated, hierarchical knowledge tree (never auto-deleted)
+    inject_index: true
+
+tasks:                         # action items — workflow state, not memory
+  inject_pending: true
+  scheduling:                  # ADR-0007 — run slightly-complex work as tasks
+    enabled: true
+    preempt: ask               # ask before pausing a task for a higher-priority one
 
 lifecycle:
   on_crash: warn               # MVP: just log; v0.4+ supervisor will auto-restart

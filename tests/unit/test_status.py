@@ -254,28 +254,29 @@ def test_collect_memory_reads_ltm(isolated_home: Path) -> None:
     assert report.memory.ltm.estimated_tokens > 0
 
 
-def test_collect_memory_reads_notes(isolated_home: Path) -> None:
-    eid = "test.notes"
+def test_collect_memory_reads_knowledge(isolated_home: Path) -> None:
+    eid = "test.knowledge"
     mem = paths.memory_dir(eid)
-    mem.mkdir(parents=True, exist_ok=True)
-    note_content = "---\nid: n1\ntitle: My Note\ntags: []\ncreated_at: 2026-05-22T00:00:00+00:00\n---\n\nbody\n\n"
-    (mem / "notes.md").write_text(note_content, encoding="utf-8")
+    (mem / "knowledge").mkdir(parents=True, exist_ok=True)
+    (mem / "knowledge" / "index.md").write_text(
+        "# Knowledge Index\n\n- [User](user.md) — prefers concise\n", encoding="utf-8"
+    )
     report = collect(eid)
-    assert report.memory.notes.estimated_tokens > 0
+    assert report.memory.knowledge.estimated_tokens > 0
 
 
-def test_collect_memory_reads_todos(isolated_home: Path) -> None:
+def test_collect_memory_reads_tasks(isolated_home: Path) -> None:
     import json
 
-    eid = "test.todos"
-    mem = paths.memory_dir(eid)
-    mem.mkdir(parents=True, exist_ok=True)
+    eid = "test.tasks"
+    tasks = paths.tasks_dir(eid)
+    tasks.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps({"id": "t1", "content": "do this", "status": "pending"}),
         json.dumps({"id": "t2", "content": "done thing", "status": "done"}),
         json.dumps({"id": "t3", "content": "nope", "status": "cancelled"}),
     ]
-    (mem / "todos.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    (tasks / "todos.jsonl").write_text("\n".join(lines), encoding="utf-8")
     report = collect(eid)
     assert report.memory.todos_active == 1
     assert report.memory.todos_done == 1
@@ -322,7 +323,7 @@ def _make_report(eid: str = "test.bot") -> StatusReport:
             working=MemoryTierInfo(estimated_tokens=500, budget_tokens=4000, count=5),
             stm=MemoryTierInfo(estimated_tokens=1000, budget_tokens=8000, count=2),
             ltm=MemoryTierInfo(estimated_tokens=200, budget_tokens=4000, count=10),
-            notes=MemoryTierInfo(estimated_tokens=100, budget_tokens=2000, count=3),
+            knowledge=MemoryTierInfo(estimated_tokens=100, budget_tokens=2000, count=3),
             todos_active=2,
             todos_done=1,
             todos_cancelled=0,
@@ -605,12 +606,12 @@ def test_collect_memory_todos_unknown_status(isolated_home: Path) -> None:
     import json
 
     eid = "test.unkstatus"
-    mem = paths.memory_dir(eid)
-    mem.mkdir(parents=True, exist_ok=True)
+    tasks = paths.tasks_dir(eid)
+    tasks.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps({"id": "t1", "content": "task", "status": "unknown_status"}),
     ]
-    (mem / "todos.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    (tasks / "todos.jsonl").write_text("\n".join(lines), encoding="utf-8")
     report = collect(eid)
     # Unknown status should not increment any counter
     assert report.memory.todos_active == 0

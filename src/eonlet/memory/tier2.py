@@ -65,27 +65,31 @@ class PromotionOutcome:
 # ── Prompt ─────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
-    "You distill short-term memory summaries into durable long-term knowledge.\n"
+    "You distill short-term memory summaries into a dated long-term timeline.\n"
     "\n"
     "You receive the current short-term memory (STM) as a list of sections.\n"
     "For each section decide:\n"
-    "  1. What knowledge is durable enough to promote to long-term memory (LTM).\n"
+    "  1. What is worth keeping as a dated episodic summary in long-term memory (LTM).\n"
     "  2. Whether to keep the section in STM (very recent context) or discard it.\n"
+    "\n"
+    "LTM is a TIMELINE of what happened, when — not a knowledge base. Durable\n"
+    "facts, rules, and preferences are NOT your job: the agent writes those to\n"
+    "its knowledge base deliberately. You only produce episodic summaries.\n"
     "\n"
     "Return ONE JSON object with this exact shape and no surrounding text:\n"
     "{\n"
     '  "ltm_additions": [\n'
-    '    {"section": "<user|feedback|project|reference|fact|episodic>", "content": "<bullet>"}\n'
+    '    {"section": "episodic", "content": "2026-05-22: <one-line summary>"}\n'
     "  ],\n"
     '  "stm_keep_section_headers": ["## [ts – ts] topic", ...]\n'  # noqa: RUF001
     "}\n"
     "\n"
     "Rules:\n"
-    "- ltm_additions[].section must be one of: user, feedback, project, reference, fact, episodic.\n"
+    "- ltm_additions[].section must always be 'episodic'.\n"
+    "- Every episodic bullet MUST start with a date: '2026-05-22: <one-line summary>'.\n"
     "- stm_keep_section_headers must be EXACT copies of the '## [...]' header lines.\n"
     "  Sections NOT listed are dropped from STM (they are represented by LTM now).\n"
     "- Keep sections that contain very recent context. Promote older ones.\n"
-    "- Episodic LTM bullets should be dated: '2026-05-22: <one-line summary>'.\n"
     "- Do not invent facts. Be concise.\n"
 )
 
@@ -170,7 +174,7 @@ async def run_tier2(
             return PromotionOutcome(ran=False)
 
         stm_tokens = estimate(await stm_store.read_raw())
-        if stm_tokens < cfg.conversation.short_term_tokens:
+        if stm_tokens < cfg.episodic.short_term_tokens:
             return PromotionOutcome(ran=False)
 
         prompt = build_tier2_prompt(sections)

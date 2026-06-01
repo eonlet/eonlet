@@ -295,9 +295,15 @@ Enters an interactive REPL:
 |---|---|
 | `/help` | Show available commands |
 | `/state` | Print current eonlet state |
-| `/notes` | Print contents of `memory/notes.md` |
-| `/notes append "text"` | Append to notes.md |
-| `/todo` | Print `memory/todo.md` |
+| `/knowledge` / `/knowledge list` | Print the curated knowledge map |
+| `/knowledge open <path>` | Print one knowledge file in full |
+| `/knowledge write <path> <text>` | Create/replace a knowledge file |
+| `/knowledge rm <path>` | Delete a knowledge file |
+| `/task` / `/task list [status]` | List tasks (pending by default) |
+| `/task add <text>` / `/task done <id>` / `/task rm <id>` | Manage tasks |
+| `/memory show [stm\|ltm\|knowledge\|all]` | Print episodic memory stores |
+| `/compact` | Full compaction now: summarize the whole working window into STM, empty it, start a fresh episode (ADR-0006) |
+| `/compact [off\|on]` | Toggle auto-compaction for this session |
 | `/budget` | Show today's and month's spending |
 | `/triggers` | List configured triggers and next fire times |
 | `/fire <trigger_id>` | Manually fire a configured trigger (great for testing) |
@@ -362,7 +368,7 @@ Answers "what is this agent doing right now?". Sections:
 |---|---|
 | **PROCESS** | status, pid, uptime, heartbeat age |
 | **TOKENS** | tokens in/out (total), cost today/total, last-turn in/out, turn count |
-| **MEMORY** | per-tier token usage vs budget (working/STM/LTM/notes), todos active/done/cancelled, compact-paused flag |
+| **MEMORY** | per-tier token usage vs budget (working/STM/LTM/knowledge), tasks active/done/cancelled, compact-paused flag |
 | **TRIGGERS** | per-trigger: schedule, next fire, total fires, consecutive failures; data source `live` (IPC) or `offline` (event store) |
 | **RECENT ACTIVITY** | last 10 events with kind, age, and payload preview |
 
@@ -374,35 +380,10 @@ Token totals are read from the event store — no LLM API call required. Working
 
 ## Memory Commands
 
-### `eonlet memory migrate <legacy_dir>`
-
-Migrate Claude Code auto-memory files into an eonlet's long-term memory (LTM).
-
-```bash
-eonlet memory migrate <legacy_dir> --eonlet <id> [--force] [--dry-run]
-```
-
-What it does:
-1. Reads `<legacy_dir>/MEMORY.md` and the per-fact `.md` files it links to.
-2. Maps each fact's frontmatter `metadata.type` → LTM category (`user` / `feedback` / `project` / `reference`; anything else becomes `fact`).
-3. Writes each fact as one bullet in `memory/long_term.md` with trailer `[src:explicit, ts:<mtime>]`.
-
-Flags:
-- `--eonlet <id>` — **required**. Target eonlet instance (e.g. `assistant.alice`).
-- `--force` — overwrite an existing `long_term.md`. Without this flag the command exits with code 4 if LTM already exists.
-- `--dry-run` — preview the bullets that would be written without touching disk.
-
-Exit codes: 0 on success, 3 if `legacy_dir` not found, 4 if LTM exists and `--force` not set.
-
-Example:
-
-```bash
-# Preview what would be migrated
-eonlet memory migrate ~/.claude/projects/my-project/memory --eonlet assistant.alice --dry-run
-
-# Run the migration
-eonlet memory migrate ~/.claude/projects/my-project/memory --eonlet assistant.alice
-```
+Memory has no top-level subcommands. Inspect and edit it from inside `eonlet
+attach` via the slash commands (`/memory show`, `/knowledge`, `/task`,
+`/compact`) listed above. (Pre-alpha ships no `memory migrate` — there is no
+cross-version migration path; rewrite `agent.yaml` and start fresh.)
 
 ---
 
@@ -459,6 +440,22 @@ eonlet tail <id>
 ```
 
 Each line is one event with `kind`, `ts`, summary.
+
+### `eonlet tasks <id> [action]`
+
+Show or manage the agent's task forest (ADR-0007 / [TASK_SPEC](TASK_SPEC.md)).
+
+```bash
+eonlet tasks <id>                          # render the forest as a tree (offline)
+eonlet tasks <id> --status=pending         # filter the tree
+eonlet tasks <id> suspend <task_id>        # pause a task (→ suspended)
+eonlet tasks <id> resume  <task_id>        # re-queue a suspended task (→ pending)
+eonlet tasks <id> cancel  <task_id>        # cancel a task
+eonlet tasks <id> prio    <task_id> <n>    # reprioritize
+```
+
+The bare/`--status` form reads `state.db` directly (no worker needed); the
+mutating actions go through the running worker over IPC.
 
 ### `eonlet export <id>`
 

@@ -1,14 +1,32 @@
-"""Web tools — web_search (Tavily or DDG fallback) and web_fetch (httpx + strip)."""
+"""Web tools — ``web_search`` and ``web_fetch`` (ADR-0004).
+
+Thin shim over ``src/eonlet/web/``. Search dispatches on
+``TAVILY_API_KEY`` env-var presence; fetch goes through the shared
+``HTTPFetcher`` then content-type triage → extraction → pagination.
+"""
 
 from __future__ import annotations
 
-import html
 import os
-import re
 
-import httpx
 from pydantic import BaseModel, Field
 
+from ...errors import (
+    HTTPFetchError,
+    ResponseTooLargeError,
+    SSRFRejectedError,
+    UnsupportedSchemeError,
+)
+from ...runtime.events import web_fetch_performed, web_search_performed
+from ...web.fetch import (
+    ExtractedContent,
+    extract_html,
+    extract_text,
+    is_html_content_type,
+    is_text_content_type,
+)
+from ...web.pagination import paginate
+from ...web.search import SearchResponse, ddg_search, tavily_search
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
 # ── web_search ───────────────────────────────────────────────────────────────
@@ -17,100 +35,107 @@ from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 class WebSearchArgs(BaseModel):
     query: str
     max_results: int = Field(default=5, ge=1, le=20)
+    include_raw_content: bool = Field(
+        default=False,
+        description="Tavily only: include each hit's extracted body. Ignored by DDG.",
+    )
 
 
 @tool
 class WebSearchTool:
     name = "web_search"
     description = (
-        "Search the web. Uses Tavily if TAVILY_API_KEY is set, otherwise "
-        "DuckDuckGo Instant Answer + HTML fallback. Returns title/url/snippet."
+        "Search the web. Uses Tavily when TAVILY_API_KEY is set; otherwise "
+        "falls back to a fragile DuckDuckGo HTML scrape. Returns "
+        "title/url/snippet (and raw_content/answer when Tavily is in use)."
     )
     input_schema = WebSearchArgs
     annotations = ToolAnnotations(read_only=True, network=True, estimated_cost_usd=0.0)
 
     async def __call__(self, args: WebSearchArgs, ctx: ToolContext) -> ToolResult:
-        if os.environ.get("TAVILY_API_KEY"):
-            return await _tavily_search(args)
-        return await _ddg_search(args)
+        if ctx.http_fetcher is None:
+            return ToolResult(
+                content="web_search: HTTP transport not initialised (worker bug)",
+                is_error=True,
+            )
+        fetcher = ctx.http_fetcher
+
+        use_tavily = bool(os.environ.get("TAVILY_API_KEY"))
+        provider = "tavily" if use_tavily else "ddg"
+        warnings: list[str] = []
+        try:
+            if use_tavily:
+                response = await tavily_search(
+                    query=args.query,
+                    max_results=args.max_results,
+                    include_raw_content=args.include_raw_content,
+                    fetcher=fetcher,
+                )
+            else:
+                response = await ddg_search(
+                    query=args.query,
+                    max_results=args.max_results,
+                    fetcher=fetcher,
+                )
+                if args.include_raw_content:
+                    warnings.append("raw_content_unavailable_on_ddg")
+        except (HTTPFetchError, SSRFRejectedError, UnsupportedSchemeError) as e:
+            await _emit_search_event(ctx, provider, args, hit_count=0, error=str(e))
+            return ToolResult(content=f"{provider} search error: {e}", is_error=True)
+
+        response.warnings.extend(warnings)
+        await _emit_search_event(ctx, provider, args, hit_count=len(response.hits))
+        return ToolResult(content=_render_search(response), structured_output=_as_dict(response))
 
 
-async def _tavily_search(args: WebSearchArgs) -> ToolResult:
-    key = os.environ["TAVILY_API_KEY"]
-    payload = {
-        "api_key": key,
-        "query": args.query,
-        "max_results": args.max_results,
-        "search_depth": "basic",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post("https://api.tavily.com/search", json=payload)
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:
-        return ToolResult(content=f"tavily error: {e}", is_error=True)
-    results = [
-        {"title": x.get("title", ""), "url": x.get("url", ""), "snippet": x.get("content", "")}
-        for x in (data.get("results") or [])
-    ]
+def _render_search(response: SearchResponse) -> str:
+    head = f"Answer: {response.answer}\n\n" if response.answer else ""
+    if not response.hits:
+        return f"{head}no results"
     body = "\n\n".join(
-        f"{i + 1}. {r['title']}\n   {r['url']}\n   {r['snippet']}" for i, r in enumerate(results)
+        f"{i + 1}. {h.title}\n   {h.url}\n   {h.snippet}" for i, h in enumerate(response.hits)
     )
-    return ToolResult(content=body or "no results", structured_output={"results": results})
+    return f"{head}{body}"
 
 
-async def _ddg_search(args: WebSearchArgs) -> ToolResult:
-    """DuckDuckGo HTML scrape — best-effort, no key needed."""
-    headers = {"User-Agent": "Mozilla/5.0 (eonlet)"}
-    params = {"q": args.query}
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as c:
-            r = await c.get("https://duckduckgo.com/html/", params=params)
-            r.raise_for_status()
-            html_text = r.text
-    except Exception as e:
-        return ToolResult(content=f"ddg error: {e}", is_error=True)
-
-    # The DDG HTML page wraps each result in `<a class="result__a" href="…">title</a>`
-    # with a snippet in `<a class="result__snippet">…</a>`. Use regex — fragile,
-    # but acceptable for an MVP fallback that has no key.
-    titles = re.findall(
-        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-        html_text,
-        flags=re.DOTALL,
-    )
-    snippets = re.findall(
-        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', html_text, flags=re.DOTALL
-    )
-    results: list[dict[str, str]] = []
-    for i, (url, title) in enumerate(titles[: args.max_results]):
-        snippet = snippets[i] if i < len(snippets) else ""
-        results.append(
+def _as_dict(response: SearchResponse) -> dict[str, object]:
+    return {
+        "provider": response.provider,
+        "query": response.query,
+        "answer": response.answer,
+        "warnings": response.warnings,
+        "results": [
             {
-                "url": _decode_ddg_url(url),
-                "title": _strip_tags(title),
-                "snippet": _strip_tags(snippet),
+                "title": h.title,
+                "url": h.url,
+                "snippet": h.snippet,
+                "raw_content": h.raw_content,
+                "published_at": h.published_at.isoformat() if h.published_at else None,
             }
+            for h in response.hits
+        ],
+    }
+
+
+async def _emit_search_event(
+    ctx: ToolContext,
+    provider: str,
+    args: WebSearchArgs,
+    *,
+    hit_count: int,
+    error: str | None = None,
+) -> None:
+    if ctx.record_event is None:
+        return
+    await ctx.record_event(
+        web_search_performed(
+            provider=provider,
+            query=args.query,
+            max_results=args.max_results,
+            hit_count=hit_count,
+            error=error,
         )
-    body = "\n\n".join(
-        f"{i + 1}. {r['title']}\n   {r['url']}\n   {r['snippet']}" for i, r in enumerate(results)
     )
-    return ToolResult(content=body or "no results", structured_output={"results": results})
-
-
-def _strip_tags(s: str) -> str:
-    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
-
-
-def _decode_ddg_url(u: str) -> str:
-    """DDG wraps real URLs as ``/l/?uddg=<urlencoded>``. Extract."""
-    m = re.search(r"uddg=([^&]+)", u)
-    if not m:
-        return u
-    from urllib.parse import unquote
-
-    return unquote(m.group(1))
 
 
 # ── web_fetch ────────────────────────────────────────────────────────────────
@@ -118,56 +143,128 @@ def _decode_ddg_url(u: str) -> str:
 
 class WebFetchArgs(BaseModel):
     url: str
-    prompt: str = Field(default="", description="Optional summarization hint (unused at v0.0.2).")
+    max_tokens: int = Field(default=4000, ge=200, le=20000)
+    offset_tokens: int = Field(default=0, ge=0)
 
 
 @tool
 class WebFetchTool:
     name = "web_fetch"
-    description = "Fetch a URL, return readable text content (HTML tags stripped)."
+    description = (
+        "Fetch a URL and return its main content as markdown. HTML pages "
+        "are extracted via trafilatura; plain text and JSON pass through. "
+        "Use offset_tokens / max_tokens to page through long pages. "
+        "For PDFs, RSS, or JS-rendered content, write a custom tool."
+    )
     input_schema = WebFetchArgs
     annotations = ToolAnnotations(read_only=True, network=True)
 
     async def __call__(self, args: WebFetchArgs, ctx: ToolContext) -> ToolResult:
+        if ctx.http_fetcher is None:
+            return ToolResult(
+                content="web_fetch: HTTP transport not initialised (worker bug)",
+                is_error=True,
+            )
+        fetcher = ctx.http_fetcher
+
         try:
-            async with httpx.AsyncClient(
-                timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (eonlet)"}
-            ) as c:
-                r = await c.get(args.url)
-                r.raise_for_status()
-        except Exception as e:
+            raw, headers, final_url = await fetcher.get(args.url)
+        except (SSRFRejectedError, UnsupportedSchemeError) as e:
+            await _emit_fetch_event(ctx, args, "", 0, 0, truncated=False, error=str(e))
+            return ToolResult(content=f"fetch rejected: {e}", is_error=True)
+        except ResponseTooLargeError as e:
+            await _emit_fetch_event(ctx, args, "", 0, 0, truncated=True, error=str(e))
+            return ToolResult(content=f"response too large: {e}", is_error=True)
+        except HTTPFetchError as e:
+            await _emit_fetch_event(ctx, args, "", 0, 0, truncated=False, error=str(e))
             return ToolResult(content=f"fetch failed: {e}", is_error=True)
 
-        ctype = r.headers.get("content-type", "")
-        if "html" in ctype:
-            text = _readable(r.text)
-            title = _find_title(r.text)
-        else:
-            text = r.text
-            title = args.url
+        content_type = headers.get("content-type", "")
+        bytes_in = len(raw)
 
-        # Cap at ~50KB for context-budget safety.
-        if len(text) > 50_000:
-            text = text[:50_000] + "\n…[truncated]…"
+        if is_html_content_type(content_type):
+            extracted = extract_html(raw, url=final_url)
+        elif is_text_content_type(content_type):
+            extracted = extract_text(raw, content_type=content_type, url=final_url)
+        else:
+            await _emit_fetch_event(
+                ctx, args, content_type, bytes_in, 0, truncated=False, error="unsupported"
+            )
+            return ToolResult(
+                content=(
+                    f"Unsupported content type: {content_type!r}. "
+                    f"For PDFs, RSS, or binary content, write a custom tool "
+                    f"under your agent's tools/ directory or wait for MCP "
+                    f"integration in v0.2."
+                ),
+                is_error=True,
+            )
+
+        sliced = paginate(
+            extracted.content_markdown,
+            offset_tokens=args.offset_tokens,
+            max_tokens=args.max_tokens,
+        )
+
+        await _emit_fetch_event(
+            ctx,
+            args,
+            content_type,
+            bytes_in,
+            sliced.total_tokens,
+            truncated=sliced.truncated,
+        )
 
         return ToolResult(
-            content=text,
-            structured_output={"url": args.url, "title": title, "bytes": len(r.content)},
+            content=sliced.text,
+            structured_output=_fetch_structured(args, final_url, content_type, extracted, sliced),
         )
 
 
-def _find_title(html_text: str) -> str:
-    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
-    return _strip_tags(m.group(1)) if m else ""
+def _fetch_structured(
+    args: WebFetchArgs,
+    final_url: str,
+    content_type: str,
+    extracted: ExtractedContent,
+    sliced: object,
+) -> dict[str, object]:
+    # ``sliced`` is duck-typed to expose the pagination fields; importing
+    # PaginatedSlice here would create a tight circular import path.
+    truncated = getattr(sliced, "truncated", False)
+    total_tokens = getattr(sliced, "total_tokens", 0)
+    next_offset = getattr(sliced, "next_offset", None)
+    return {
+        "url": final_url,
+        "title": extracted.title,
+        "content_type": content_type,
+        "metadata": extracted.metadata,
+        "offset_tokens": args.offset_tokens,
+        "total_tokens": total_tokens,
+        "truncated": truncated,
+        "next_offset": next_offset,
+    }
 
 
-def _readable(html_text: str) -> str:
-    """Crude HTML→text. Strips scripts, styles, then all remaining tags."""
-    body = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text)
-    body = re.sub(r"(?is)<!--.*?-->", " ", body)
-    body = re.sub(r"<[^>]+>", " ", body)
-    body = html.unescape(body)
-    # Collapse whitespace.
-    body = re.sub(r"\n\s*\n+", "\n\n", body)
-    body = re.sub(r"[ \t]+", " ", body)
-    return body.strip()
+async def _emit_fetch_event(
+    ctx: ToolContext,
+    args: WebFetchArgs,
+    content_type: str,
+    bytes_in: int,
+    total_tokens: int,
+    *,
+    truncated: bool,
+    error: str | None = None,
+) -> None:
+    if ctx.record_event is None:
+        return
+    await ctx.record_event(
+        web_fetch_performed(
+            url=args.url,
+            content_type=content_type,
+            bytes_in=bytes_in,
+            offset_tokens=args.offset_tokens,
+            total_tokens=total_tokens,
+            truncated=truncated,
+            error=error,
+        )
+    )

@@ -21,7 +21,8 @@
 | 5 | [`TOOL_SPEC.md`](TOOL_SPEC.md) | Tool interface and the 21+ builtin tools |
 | 6 | [`TRIGGER_SPEC.md`](TRIGGER_SPEC.md) | Cron and interactive triggers |
 | 7 | [`MEMORY_SPEC.md`](MEMORY_SPEC.md) | Memory subsystem — storage layout, three-tier compaction, FTS5 recall |
-| 8 | [`SECURITY.md`](SECURITY.md) | Threat model, defenses, and explicit limits |
+| 8 | [`TASK_SPEC.md`](TASK_SPEC.md) | Task subsystem — event-sourced forest, scheduler, lifecycle, preemption, schedule bridge, guards |
+| 9 | [`SECURITY.md`](SECURITY.md) | Threat model, defenses, and explicit limits |
 
 ## Plans (in-flight design work)
 

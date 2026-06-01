@@ -35,7 +35,7 @@ class DynamicTriggerRecord:
     created_by: str  # "agent" | "cli" | "user"
 
     def to_json(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "id": self.trig.id,
             "schedule": self.trig.schedule,
             "timezone": self.trig.timezone,
@@ -45,20 +45,29 @@ class DynamicTriggerRecord:
             "created_at": self.created_at,
             "created_by": self.created_by,
         }
+        # Carry the task-template payload (ADR-0007 M3) so scheduled tasks
+        # survive a worker restart.
+        template = getattr(self.trig, "task_template", None)
+        if template is not None:
+            out["task_template"] = template
+        return out
 
     @classmethod
     def from_json(cls, d: dict[str, object]) -> DynamicTriggerRecord:
         tid = str(d["id"])
         if not tid.startswith(DYNAMIC_ID_PREFIX):
             raise ConfigError(f"dynamic trigger id missing {DYNAMIC_ID_PREFIX!r} prefix: {tid!r}")
-        trig = CronTrigger(
-            id=tid,
-            schedule=str(d["schedule"]),
-            timezone=str(d["timezone"]),
-            message=str(d["message"]),
-            grace_period=str(d.get("grace_period", "1h")),
-            enabled=bool(d.get("enabled", True)),
-        )
+        fields: dict[str, object] = {
+            "id": tid,
+            "schedule": str(d["schedule"]),
+            "timezone": str(d["timezone"]),
+            "message": str(d["message"]),
+            "grace_period": str(d.get("grace_period", "1h")),
+            "enabled": bool(d.get("enabled", True)),
+        }
+        if d.get("task_template") is not None:
+            fields["task_template"] = d["task_template"]
+        trig = CronTrigger.model_validate(fields)
         return cls(
             trig=trig,
             created_at=str(d.get("created_at", "")),

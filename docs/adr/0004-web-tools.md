@@ -2,8 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
-| Date | 2026-05-26 |
+| Status | Accepted (shipped in v0.0.7) |
+| Proposed | 2026-05-26 |
+| Accepted | 2026-05-28 |
 | Deciders | Ziyu |
 | Supersedes | – |
 | Superseded by | – |
@@ -319,7 +320,11 @@ src/eonlet/web/
 ```
 
 `src/eonlet/tools/builtin/web.py` becomes a thin shim wiring args → these
-modules → `ToolResult`. About 80 lines total.
+modules → `ToolResult`. Original design budget was ~80 lines; the shipped
+shim is ~270 lines after event emission, structured-output assembly, and
+error-mapping for the five SSRF / size-cap / scheme / fetch / unsupported
+branches. The body is still pure plumbing — see "Outcome vs design"
+below.
 
 ### Part 4 — Configuration
 
@@ -477,3 +482,28 @@ This ADR is validated when:
    hit, returns a markdown summary; `eonlet replay` shows the two new
    summary events plus the standard `TOOL_RESULT`s.
 7. Coverage: `src/eonlet/web/` ≥ 80%; project ≥ 70%.
+
+## Outcome vs design (post-ship, 2026-05-28)
+
+Recorded after v0.0.7 shipped, for future readers wondering whether the
+ADR matches the code:
+
+- **Shim size.** The design called for ~80 LOC in
+  `tools/builtin/web.py`; the shipped shim is ~270 LOC. The extra
+  weight is event emission (`WEB_SEARCH_PERFORMED` /
+  `WEB_FETCH_PERFORMED`), the five SSRF / size-cap / scheme / fetch /
+  unsupported error branches, and `structured_output` assembly. None of
+  it is new logic — just plumbing the design implied but did not count.
+- **HTTP/2.** Enabled (`http2=True`), as specified. Requires the `h2`
+  runtime dep, added in the same release.
+- **Tavily reliability.** `HTTPFetcher.post_json` was added in
+  follow-up so Tavily shares one retry + size-cap path with
+  `web_fetch`. The original ADR text described one shared transport but
+  Tavily's first cut bypassed it.
+- **XML.** `is_text_content_type` deliberately excludes
+  `application/xml` and friends so feeds fall through to the
+  "unsupported content type" branch and steer the agent at
+  `feed_read.py`, matching the §"`web_fetch`" pipeline diagram.
+- **Coverage gate.** The 80% target in §Validation is enforced by an
+  explicit `pytest --cov=src/eonlet/web --cov-fail-under=80` step in
+  CI, layered on top of the project-wide 70% floor.

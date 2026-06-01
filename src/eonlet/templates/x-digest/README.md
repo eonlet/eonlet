@@ -35,7 +35,7 @@ A scheduled agent that reads your X (Twitter) timeline each morning, groups twee
 ┌─────────────────────────────────────────────┐
 │  file_write → workspace/outputs/YYYY-MM-DD  │
 │  send_email → user                          │
-│  notes_append → last_run.md                 │
+│  knowledge.write → last_run.md              │
 └─────────────────────────────────────────────┘
 ```
 
@@ -132,7 +132,7 @@ Each eonlet has its own memory and state — they don't interfere.
 
 - X API Basic tier returns at most 200 tweets per call. If you follow many high-volume accounts, you may not get full coverage during quiet windows.
 - The agent does not currently de-duplicate threads — if @someone tweets a 10-part thread, you may see references to multiple parts (the system prompt instructs the agent to fold these, but it's not perfect).
-- The `send_email` tool sends one email per run. If SMTP fails, the digest still lives in `workspace/outputs/` and you can read it via `cat` or `eonlet attach` and `/notes`.
+- The `send_email` tool sends one email per run. If SMTP fails, the digest still lives in `workspace/outputs/` and you can read it via `cat` or `eonlet attach` and `/knowledge`.
 
 ## Troubleshooting
 

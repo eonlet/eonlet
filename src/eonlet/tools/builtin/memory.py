@@ -2,13 +2,17 @@
 
 Actions:
 
-- ``show``         — render current STM / LTM / notes / todos for inspection
-- ``compact``      — force a tier-1 compaction pass right now
-- ``compact_ltm``  — tier-3 (LTM forgetting); placeholder until P5 ships
-- ``pause``        — disable auto-compaction for this session
-- ``resume``       — re-enable auto-compaction
+- ``show``            — render current STM / LTM for inspection
+- ``compact``         — force a tier-1 compaction pass right now
+- ``compact_ltm``     — force a tier-3 (episodic-LTM forgetting) pass
+- ``propose_compact`` — propose a semantic compaction to the user (ADR-0006)
+- ``pause``           — disable auto-compaction for this session
+- ``resume``          — re-enable auto-compaction
 
 ``compact`` runs synchronously and emits ``mem_compacted`` on success.
+``propose_compact`` blocks on the user's consent (decision broker) unless the
+agent runs in ``yolo`` mode, then emits ``mem_compact_proposed`` plus
+``mem_compact_approved``/``mem_compact_declined``.
 ``pause``/``resume`` emit ``mem_paused`` / ``mem_resumed``.
 """
 
@@ -19,22 +23,42 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from ...memory.compactor import LLMCompactor
-from ...memory.notes import NotesStore
+from ...memory.injection import working_window_token_estimate
 from ...memory.paths import long_term_path, short_term_path
 from ...memory.tier1 import run_tier1
 from ...memory.tier3 import run_tier3
-from ...memory.todos import TodosStore
-from ...runtime.events import mem_paused, mem_resumed
+from ...memory.watermark import read_watermark
+from ...runtime.events import (
+    EventKind,
+    mem_compact_approved,
+    mem_compact_declined,
+    mem_compact_proposed,
+    mem_paused,
+    mem_resumed,
+    now_us,
+)
 from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
-MemoryStoreName = Literal["stm", "ltm", "notes", "todos", "all"]
+MemoryStoreName = Literal["stm", "ltm", "all"]
 
 
 class MemoryArgs(BaseModel):
-    action: Literal["show", "compact", "compact_ltm", "pause", "resume"]
+    action: Literal["show", "compact", "compact_ltm", "pause", "resume", "propose_compact"]
     store: MemoryStoreName = Field(
         default="all",
         description="For action='show': which memory store(s) to print.",
+    )
+    boundary_event_id: int | None = Field(
+        default=None,
+        description=(
+            "For action='propose_compact': fold everything up to and including this "
+            "event id into short-term memory, keeping more recent events raw. Pick the "
+            "point where the conversation moved on from older, now-irrelevant context."
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description="For action='propose_compact': why the older context can be folded away.",
     )
 
 
@@ -50,33 +74,6 @@ async def _render_show(args: MemoryArgs, ctx: ToolContext) -> str:
         path = long_term_path(md)
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         chunks.append("## long_term\n" + (text or "(empty)\n"))
-    if args.store in ("notes", "all"):
-        notes = await NotesStore(md).list_notes()
-        if notes:
-            lines = ["## notes"]
-            for n in notes:
-                head = f"### [{n.id}] {n.title or '(untitled)'}"
-                if n.tags:
-                    head += "  (tags: " + ", ".join(n.tags) + ")"
-                lines.append(head)
-                if n.body:
-                    lines.append(n.body)
-            chunks.append("\n".join(lines))
-        else:
-            chunks.append("## notes\n(empty)\n")
-    if args.store in ("todos", "all"):
-        todos = await TodosStore(md).list_todos(status="all")
-        if todos:
-            lines = ["## todos"]
-            for t in todos:
-                icon = {"pending": "[ ]", "done": "[x]", "cancelled": "[-]"}[t.status]
-                head = f"{icon} {t.id}"
-                if t.due:
-                    head += f"  (due: {t.due})"
-                lines.append(f"{head} — {t.content}")
-            chunks.append("\n".join(lines))
-        else:
-            chunks.append("## todos\n(empty)\n")
     return "\n\n".join(chunks).rstrip() + "\n"
 
 
@@ -85,9 +82,12 @@ class MemoryTool:
     name = "memory"
     description = (
         "Inspect and control the eonlet's memory subsystem. Actions: "
-        "'show' (print STM/LTM/notes/todos — pick which via 'store'), "
+        "'show' (print STM/LTM — pick which via 'store'), "
         "'compact' (force a tier-1 working→STM compaction pass), "
         "'compact_ltm' (force a tier-3 LTM forgetting/pruning pass), "
+        "'propose_compact' (propose folding away older context up to "
+        "'boundary_event_id' with a 'reason'; the user must approve before it "
+        "happens — use when the conversation has clearly moved on), "
         "'pause' (disable auto-compaction for this session), "
         "'resume' (re-enable auto-compaction)."
     )
@@ -139,6 +139,9 @@ class MemoryTool:
                     "tokens_after": outcome.tokens_after,
                 },
             )
+
+        if args.action == "propose_compact":
+            return await _handle_propose_compact(args, ctx, runtime)
 
         if args.action == "compact_ltm":
             if runtime is None:
@@ -193,6 +196,138 @@ class MemoryTool:
             return ToolResult(content="auto-compaction resumed")
 
         return ToolResult(content=f"memory: unknown action {args.action!r}", is_error=True)
+
+
+# ── propose_compact (ADR-0006 M3) ────────────────────────────────────────────
+
+
+def _propose_guards(runtime: Any, ctx: ToolContext) -> tuple[int, str | None]:
+    """Evaluate the floor + cooldown guards.
+
+    Returns ``(working_tokens, blocked_reason)``. ``blocked_reason`` is ``None``
+    when a proposal is allowed, otherwise a short human reason the model can act
+    on (e.g. raise the boundary, or just wait).
+    """
+    ep = runtime.definition.config.memory.episodic
+    watermark = read_watermark(ctx.memory_dir)
+    events = runtime.store.read(since=watermark)
+    working = working_window_token_estimate(events, watermark=0)
+    if working < ep.propose_floor_tokens:
+        return working, (
+            f"working memory is only {working} tokens (< floor {ep.propose_floor_tokens}); "
+            "nothing worth folding yet"
+        )
+    compactions = [e for e in events if e.kind == EventKind.MEM_COMPACTED]
+    if compactions:
+        last = max(compactions, key=lambda e: e.id or 0)
+        elapsed = (now_us() - last.ts) / 1_000_000
+        if elapsed < ep.propose_min_interval_seconds:
+            return working, (
+                f"only {int(elapsed)}s since the last compaction "
+                f"(cooldown {ep.propose_min_interval_seconds}s)"
+            )
+        turns = sum(
+            1 for e in events if e.kind == EventKind.USER_MESSAGE and (e.id or 0) > (last.id or 0)
+        )
+        if turns < ep.propose_min_turns:
+            return working, (
+                f"only {turns} turn(s) since the last compaction "
+                f"(cooldown {ep.propose_min_turns} turns)"
+            )
+    return working, None
+
+
+async def _handle_propose_compact(
+    args: MemoryArgs, ctx: ToolContext, runtime: Any | None
+) -> ToolResult:
+    if runtime is None:
+        return ToolResult(content="propose_compact: no live runtime in this context", is_error=True)
+    cfg = runtime.definition.config.memory
+    if not cfg.enabled:
+        return ToolResult(
+            content="propose_compact: subsystem disabled in agent.yaml", is_error=True
+        )
+    if not cfg.episodic.propose_semantic:
+        return ToolResult(
+            content="propose_compact: disabled (memory.episodic.propose_semantic=false)"
+        )
+
+    boundary = args.boundary_event_id
+    reason = (args.reason or "").strip()
+    watermark = read_watermark(ctx.memory_dir)
+    latest = runtime.store.latest_id()
+    if boundary is None or not (watermark < boundary <= latest):
+        return ToolResult(
+            content=(
+                f"propose_compact: boundary_event_id must be an event id in "
+                f"({watermark}, {latest}] — got {boundary!r}"
+            ),
+            is_error=True,
+        )
+
+    working, blocked = _propose_guards(runtime, ctx)
+    if blocked is not None:
+        return ToolResult(content=f"propose_compact: not now — {blocked}")
+
+    mode = runtime.gate.mode
+    broker = runtime.decision_broker
+    # Interactive-only unless yolo: in a headless/cron run there is no one to
+    # approve, so the proposal is a clean no-op (no events recorded).
+    if mode != "yolo" and (broker is None or not broker.has_listener()):
+        return ToolResult(content="propose_compact: no interactive session attached; skipped")
+
+    if ctx.record_event is not None:
+        await ctx.record_event(
+            mem_compact_proposed(boundary_event_id=boundary, reason=reason, working_tokens=working)
+        )
+
+    if mode == "yolo":
+        approved, rule = True, "yolo"
+    else:
+        choice = await broker.ask(
+            kind="compaction",
+            prompt=f"Fold away the conversation up to #{boundary}? {reason}".strip(),
+            options=["approve", "deny"],
+            payload={"boundary_event_id": boundary, "reason": reason},
+            decline="deny",
+        )
+        approved, rule = (choice == "approve"), "user"
+
+    if not approved:
+        if ctx.record_event is not None:
+            await ctx.record_event(mem_compact_declined(boundary_event_id=boundary, rule=rule))
+        return ToolResult(content="propose_compact: declined — keeping the full window")
+
+    if ctx.record_event is not None:
+        await ctx.record_event(mem_compact_approved(boundary_event_id=boundary, rule=rule))
+    compactor = _build_compactor(runtime, cfg.compaction_model)
+    outcome = await run_tier1(
+        memory_dir=ctx.memory_dir,
+        store=runtime.store,
+        cfg=cfg,
+        compactor=compactor,
+        record_event=ctx.record_event,
+        boundary=boundary,
+    )
+    if outcome.error:
+        return ToolResult(content=f"propose_compact: {outcome.error}", is_error=True)
+    if not outcome.ran:
+        return ToolResult(content="propose_compact: approved but nothing to compact")
+    return ToolResult(
+        content=(
+            f"compacted up to #{outcome.boundary_event_id}: "
+            f"{outcome.tokens_before}→{outcome.tokens_after} tokens, "
+            f"{outcome.sections_added} STM sections"
+        ),
+        structured_output={
+            "approved": True,
+            "rule": rule,
+            "boundary_event_id": outcome.boundary_event_id,
+            "sections_added": outcome.sections_added,
+            "tokens_before": outcome.tokens_before,
+            "tokens_after": outcome.tokens_after,
+        },
+    )
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

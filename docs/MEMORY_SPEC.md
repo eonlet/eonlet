@@ -2,17 +2,52 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft (normative) |
+| Status | **Partially superseded by [ADR-0005](adr/0005-dual-axis-memory.md)** (dual-axis memory, v0.0.8) |
 | Spec version | 0.1.0 |
-| Depends on | `SPEC.md`, `AGENT_CONFIG_SPEC.md`, `TOOL_SPEC.md`, `TRIGGER_SPEC.md`, `adr/0003-memory-system.md` |
-| Implements | ADR-0003 |
+| Depends on | `SPEC.md`, `AGENT_CONFIG_SPEC.md`, `TOOL_SPEC.md`, `TRIGGER_SPEC.md`, `adr/0003-memory-system.md`, `adr/0005-dual-axis-memory.md` |
+| Implements | ADR-0003, then ADR-0005 |
+
+> ## ⚠️ Superseding notice (ADR-0005, v0.0.8)
+>
+> The shipped memory subsystem now follows the **dual-axis** model of
+> [ADR-0005](adr/0005-dual-axis-memory.md) and its implementation plan
+> ([plans/dual-axis-memory.md](plans/dual-axis-memory.md)), which are the
+> **authoritative design record**. This document predates that change; the
+> mechanics below (compaction tiers, watermark, FTS5 recall, injection,
+> events, invariants) remain accurate, but the following are **out of date**
+> — defer to the ADR/plan and the code:
+>
+> - **Two axes, not one store.** `long_term.md` holds only the **`episodic`**
+>   category (dated summaries). The five semantic categories
+>   (`user`/`feedback`/`project`/`reference`/`fact`) moved to a separate,
+>   **never-auto-deleted curated knowledge axis** at `memory/knowledge/`
+>   (a tree of markdown files + an injected `index.md` map), written via the
+>   `knowledge` tool. Tier-3 forgetting applies uniformly — the `src:explicit`
+>   "never drop" exemption is **removed**.
+> - **Tasks are no longer memory.** `todos.jsonl` moved to a sibling
+>   `tasks/` dir; the `todo` tool became `task`; pending tasks inject as a
+>   `<tasks>` block **outside** `<memory>`. Config is the top-level `tasks`
+>   block, not `memory.todos`.
+> - **Notes are gone.** `NotesStore`, `notes.md`, and the `note` / `remember`
+>   / `forget` tools are retired — the knowledge axis subsumes them. The
+>   single durable-write tool is `knowledge`.
+> - **Config:** `memory.conversation` → `memory.episodic`; new
+>   `memory.knowledge` block; `memory.notes`/`memory.todos` removed.
+> - **Events:** `mem_remember` / `mem_note_*` retired; `mem_todo_*` →
+>   `task_*`; new `kb_written` / `kb_deleted` / `kb_moved`.
+> - **No migration tool** — pre-alpha rewrites `agent.yaml` and starts fresh.
+>
+> A full rewrite of this spec to the dual-axis model is tracked but not yet
+> done; until then, read §§ below for the *unchanged* compaction/recall
+> mechanics and the ADR for the *current* data model and tool surface.
 
 ## 0. Reader Guide
 
 This spec is the **normative reference** for the memory subsystem introduced
 by ADR-0003. The ADR records the *decision*; this spec records the *contract*
 the implementation must satisfy. When the two disagree, the spec wins (and
-the ADR should be amended).
+the ADR should be amended). **For anything ADR-0005 changed (see the
+superseding notice above), ADR-0005 + the code win over this document.**
 
 Audience: implementers of `src/eonlet/memory/`, the related builtin tools,
 the runtime injection point, and the CLI slash commands.
@@ -291,11 +326,45 @@ either fully included or fully omitted.
 Three tiers. All three are LLM-driven, run in the background, and respect
 snapshot semantics.
 
+### 4.0 Tier-1 trigger model (ADR-0006)
+
+There is **one tier-1 mechanism** (summarize the older portion of the working
+window into STM) with **three triggers**, and the trigger decides the boundary:
+
+| Trigger | Initiator | Boundary | Consent | Availability |
+|---|---|---|---|---|
+| **Bounded auto** | runtime, post-turn | keep ~30% tail (`compute_suggested_boundary`) | none | interactive + cron |
+| **User-forced full** | user, `/compact` | **everything** — working emptied, no tail | n/a | interactive |
+| **Agent-proposed semantic** | agent, `memory.propose_compact` | agent-chosen topic-shift point (`boundary_event_id`, tool-pair-snapped) | **required, blocking** | interactive only |
+
+- **Bounded auto** is the only trigger that runs in cron/autonomous turns and the
+  only one that *guarantees* the working window stays bounded (it fires whenever
+  the window exceeds `episodic.working_memory_tokens`).
+- **User-forced full** (`/compact`) empties the working window into STM and marks
+  an episode boundary by emitting `session_ended` then `session_started`. The
+  next user message starts a fresh episode carrying only the injected memory
+  preamble.
+- **Agent-proposed semantic** is the agent's *only* path to compaction — there is
+  no unconsented agent force-compact. The agent calls
+  `memory.propose_compact(boundary_event_id, reason)` when the conversation has
+  moved on from older context. It is gated by:
+  - **floor** — `episodic.propose_floor_tokens` (no proposal below this size);
+  - **cooldown** — both `episodic.propose_min_interval_seconds` (wall-clock) and
+    `episodic.propose_min_turns` (turns) since the last compaction.
+
+  When the guards pass, the runtime emits `mem_compact_proposed`, then **blocks
+  the turn** awaiting consent over the decision channel (§4.6.1): on approval it
+  emits `mem_compact_approved` and runs tier-1 at the proposed boundary; on
+  decline it emits `mem_compact_declined` and leaves memory untouched. Under
+  `yolo` the proposal auto-approves (`mem_compact_approved` with `rule:"yolo"`)
+  without a round-trip — still recorded for audit. In a headless/cron run with no
+  attached session, a non-`yolo` proposal is a no-op (no events).
+
 ### 4.1 Tier-1 (working → STM)
 
-**Trigger:** when the token estimate of the recent-messages window (as it
-would be assembled in §3.2) exceeds `conversation.working_memory_tokens`,
-the runtime schedules a tier-1 pass.
+**Trigger:** see §4.0. The bounded-auto trigger fires when the token estimate of
+the recent-messages window (as assembled in §3.2) exceeds
+`episodic.working_memory_tokens`.
 
 **Input:** all events with `id > compaction_watermark` and `id ≤ snapshot_id`.
 
@@ -448,11 +517,39 @@ log retains *what was forgotten* even when LTM no longer does.
 ### 4.6 Auto-compact pause
 
 The worker exposes a session-scoped boolean `auto_compact_enabled`,
-initialized from `agent.yaml`'s `memory.conversation.auto_compact`. When
-false, threshold-driven compaction is suppressed; explicit calls to
-`memory.compact` / `/compact` still run.
+initialized from `agent.yaml`'s `memory.episodic.auto_compact`. When
+false, threshold-driven (bounded-auto) compaction is suppressed; explicit calls
+to `memory.compact` / `/compact` still run.
 
 This flag is **not** persisted. Restart re-reads config defaults.
+
+### 4.6.1 Decision channel (consent round-trip, ADR-0006)
+
+The agent-proposed trigger (§4.0) and the interactive permission confirm share
+**one** generic blocking round-trip (`worker/decisions.py`):
+
+1. The worker registers a pending decision and pushes a `decision/request`
+   notification (`{id, kind, prompt, options, payload}`, `kind ∈ {"permission",
+   "compaction"}`) to the attached session(s); the agent task blocks.
+2. An attached CLI renders the prompt and replies with a `decision.respond`
+   request (`{id, choice}`). The first responder wins; later/duplicate answers
+   to a resolved id are ignored.
+3. The blocked task resumes with the choice.
+
+If **no session is attached** when the decision is raised, or the **last session
+detaches while waiting**, the decision auto-declines — a headless worker never
+hangs. The blocking design also means the working window cannot keep growing
+while a proposal awaits consent.
+
+### 4.7 Per-turn timestamps (ADR-0006)
+
+When `memory.inject_turn_timestamps` is true, each user message rendered into the
+working window is prefixed at render time with its local datetime, e.g.
+`[2026-05-30 14:23 +08:00] <content>`. This is **render-time only** — nothing is
+written back into the `user_message` event payload (events stay immutable;
+`Event.ts` already carries the time). It gives the model temporal cognition of
+*when* episodes happened, matching the dated STM/LTM and the session boundaries
+that user-forced compaction emits.
 
 ---
 
@@ -613,6 +710,10 @@ All memory-related state changes append events to the event store. Kinds:
 | `mem_remember` | `remember` tool | `{section, content_preview, src:"explicit", ts}` |
 | `mem_recall_invoked` | `recall` tool entry | `{mode, query?, date?, hits:int}` |
 | `mem_paused` / `mem_resumed` | `/compact off` / `/compact on` | `{}` |
+| `mem_compact_proposed` | `memory.propose_compact` (guards passed) | `{boundary_event_id:int, reason:str, working_tokens:int}` |
+| `mem_compact_approved` | proposal approved | `{boundary_event_id:int, rule:"user"\|"yolo"}` |
+| `mem_compact_declined` | proposal declined | `{boundary_event_id:int, rule:"user"}` |
+| `session_started` / `session_ended` | user-forced full `/compact` boundary | `{reason:"compact"}` |
 
 All of these are first-class `EventKind` values. `eonlet replay`, `eonlet
 tail`, and `eonlet export` MUST include them.

@@ -15,10 +15,12 @@ socket task pushes to the queue and returns immediately.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC
 from pathlib import Path
@@ -33,12 +35,15 @@ from ..runtime.agent import AgentRuntime
 from ..runtime.definition import import_custom_tool_module, load_definition
 from ..runtime.events import Event
 from ..runtime.store import EventStore
+from ..tasks import Task, next_runnable
 from ..tools import builtin as _builtin  # noqa: F401 — side-effect: register builtin tools
 from ..triggers.scheduler import (
     CronScheduler,
     TriggerItem,
     build_trigger_message,
 )
+from ..web import HTTPFetcher
+from .decisions import DecisionBroker
 from .ipc import IPCServer
 from .lifecycle import (
     cleanup,
@@ -143,6 +148,8 @@ async def run_worker(
     )
     runtime.recall_index = recall_index
 
+    http_fetcher: HTTPFetcher | None = None
+
     write_pid(eonlet_id)
     write_status(eonlet_id, "running")
     write_heartbeat(eonlet_id)
@@ -163,6 +170,11 @@ async def run_worker(
         str(paths.runtime_sock(eonlet_id)),
         _make_handler(runtime, eonlet_id, send, scheduler),
     )
+    # Blocking user-decision channel (ADR-0006): shared by the interactive
+    # permission confirm and (M3) compaction proposals.
+    broker = DecisionBroker(server)
+    server.on_disconnect = broker.on_session_closed
+    runtime.decision_broker = broker
     runtime.event_listener = _make_event_broadcaster(server)
     runtime.on_delta = _make_delta_broadcaster(server)
 
@@ -171,6 +183,19 @@ async def run_worker(
         shutdown.set()
 
     try:
+        # Outbound HTTP client — shared by web_fetch / web_search and any
+        # future tool that needs SSRF-guarded egress. Built from the
+        # agent's web.fetch config block (ADR-0004). Constructed inside
+        # the try so a bad config still tears down via the finally.
+        web_cfg = definition.config.web.fetch
+        http_fetcher = HTTPFetcher(
+            max_bytes=web_cfg.max_bytes,
+            timeout=web_cfg.timeout_seconds,
+            allow_private_networks=web_cfg.allow_private_networks,
+            user_agent=web_cfg.user_agent,
+        )
+        runtime.http_fetcher = http_fetcher
+
         await scheduler.catch_up_missed()
         async with anyio.create_task_group() as tg:
             tg.start_soon(server.serve)
@@ -186,6 +211,8 @@ async def run_worker(
         cleanup(eonlet_id)
         store.close()
         recall_index.close()
+        if http_fetcher is not None:
+            await http_fetcher.aclose()
 
 
 # ── tasks ────────────────────────────────────────────────────────────────────
@@ -205,26 +232,95 @@ async def _signal_watcher(shutdown: anyio.Event, on_signal: Callable[[], None]) 
             return
 
 
+SCHED_POLL_S = 1.0  # idle re-check cadence when the task scheduler is enabled
+_CLOSED = object()  # sentinel: the trigger stream was closed
+
+
+def _try_receive(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | None:
+    """Non-blocking drain to the first real trigger. ``None`` if only wakes/empty.
+
+    ``task_wake`` sentinels (pushed by the IPC handler to unblock an idle loop)
+    carry no work — they are drained here so the caller falls through to the
+    scheduler check.
+    """
+    while True:
+        try:
+            item = recv.receive_nowait()
+        except (anyio.WouldBlock, anyio.EndOfStream, anyio.ClosedResourceError):
+            return None
+        if item.kind != "task_wake":
+            return item
+
+
+async def _recv_one(recv: MemoryObjectReceiveStream[TriggerItem]) -> TriggerItem | object:
+    """Block for one trigger; ``_CLOSED`` if the stream closed. Caller bounds the wait."""
+    try:
+        return await recv.receive()
+    except (anyio.EndOfStream, anyio.ClosedResourceError):
+        return _CLOSED
+
+
 async def _main_loop(
     runtime: AgentRuntime,
     recv: MemoryObjectReceiveStream[TriggerItem],
     scheduler: CronScheduler,
     shutdown: anyio.Event,
 ) -> None:
-    """Drain trigger items one at a time, dispatch to the agent runtime.
+    """Drive triggers and autonomous task work, one beat at a time.
 
-    A cron-fired item carries trigger_id; we report success/failure back to
-    the scheduler so it can update consecutive_failures + backoff counters.
-    After each run we check the tier-1 compaction trigger (MEMORY_SPEC §4.1)
-    and run it inline before pulling the next item — keeping the model's
-    context bounded between turns.
+    Each beat: a queued trigger (user/cron input) takes precedence; otherwise,
+    when ``tasks.scheduling.enabled``, the task scheduler picks the next runnable
+    task and the agent runs it task-scoped (ADR-0007 M2). When fully idle the
+    loop blocks — with a poll timeout under scheduling so a task created
+    out-of-band (e.g. via the `task` IPC) is noticed. The worker's single
+    consumer keeps execution strictly serial (the "one human-like worker"
+    invariant). After every run the compaction cascade runs inline.
     """
     async with recv:
         while not shutdown.is_set():
-            try:
-                item = await recv.receive()
-            except (anyio.EndOfStream, anyio.ClosedResourceError):
-                return
+            sched = runtime.definition.config.tasks.scheduling
+
+            # 1. A queued trigger always wins over autonomous task work.
+            item = _try_receive(recv)
+
+            # 2. Otherwise, run the next scheduler-selected task.
+            if item is None and sched.enabled:
+                task = next_runnable(runtime.task_forest)
+                if task is not None:
+                    try:
+                        await _run_task(runtime, task)
+                    except Exception:
+                        log.exception("main_loop: task run failed")
+                    await _run_cascade(runtime)
+                    continue
+
+            # 3. Block for the next trigger. Under scheduling, bound the wait so
+            #    a task created out-of-band (e.g. via the `task` IPC) is noticed.
+            if item is None:
+                got: TriggerItem | object | None = None
+                if sched.enabled:
+                    with anyio.move_on_after(SCHED_POLL_S):
+                        got = await _recv_one(recv)
+                else:
+                    got = await _recv_one(recv)
+                if got is _CLOSED:
+                    return
+                if got is None:
+                    continue  # timed out → re-check the scheduler
+                assert isinstance(got, TriggerItem)
+                item = got
+
+            # A wake sentinel only exists to re-check the scheduler — it carries
+            # no message to run.
+            if item.kind == "task_wake":
+                continue
+
+            # A scheduled task-template fire hatches a fresh task instance, then
+            # the scheduler picks it up on the next beat (ADR-0007 M3).
+            if item.kind == "task_hatch":
+                await _hatch_task(runtime, item)
+                continue
+
             ok = True
             try:
                 async for _ in runtime.handle_user_message(item.content):
@@ -235,11 +331,216 @@ async def _main_loop(
             if item.kind == "cron" and item.trigger_id:
                 scheduler.record_outcome(item.trigger_id, success=ok)
 
-            # Post-run compaction cascade (MEMORY_SPEC §4.1 / §4.4 / §4.5).
-            tier1_ran = await _maybe_run_tier1(runtime)
-            if tier1_ran:
-                await _maybe_run_tier2(runtime)
-            await _maybe_run_tier3(runtime)
+            await _run_cascade(runtime)
+
+
+async def _run_task(runtime: AgentRuntime, task: Task) -> None:
+    """Run one scheduler-selected task to a yield point, then apply its outcome.
+
+    The task is activated, run with its assembled prompt, then classified: the
+    agent marks it done (DONE), adds subtasks (DECOMPOSED → block on them),
+    yields without finishing (YIELDED → checkpoint + suspend), or is paused mid-
+    run for a higher-priority task (preempted → checkpoint + re-queue as pending,
+    so it resumes once the preemptor is done). All cooperative (ADR-0007 M2/M3).
+    """
+    from ..runtime.events import task_checkpointed, task_transitioned
+    from ..tasks import PostRun, classify_post_run
+    from ..tasks.context import build_task_prompt
+
+    sched = runtime.definition.config.tasks.scheduling
+    preempt_to: dict[str, str] = {}  # {"id": contender} once we decide to pause
+
+    await runtime._record(
+        task_transitioned(id=task.id, from_state=task.status, to_state="active", reason="scheduled")
+    )
+    prompt = build_task_prompt(runtime.task_forest, task.id)
+    runtime.current_task_id = task.id
+    # Install the turn-boundary hook when preemption is enabled or a per-task
+    # token budget caps the run (ADR-0007 M3/M4).
+    needs_hook = sched.preempt != "off" or sched.per_task_budget_tokens > 0
+    runtime.pause_check = (
+        _make_pause_check(runtime, task, sched, preempt_to) if needs_hook else None
+    )
+    try:
+        async for _ in runtime.handle_user_message(prompt):
+            pass
+    finally:
+        runtime.current_task_id = None
+        runtime.pause_check = None
+
+    if preempt_to:
+        # Paused for a higher-priority task: checkpoint a resume brief and put
+        # the task back to pending so the scheduler re-picks it after the
+        # preemptor (which now outranks it) and it resumes from the brief.
+        summary = _checkpoint_summary(runtime, task.id)
+        await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+        await runtime._record(
+            task_transitioned(
+                id=task.id,
+                from_state="active",
+                to_state="pending",
+                reason=f"preempted:{preempt_to['id']}",
+            )
+        )
+        return
+
+    outcome = classify_post_run(runtime.task_forest, task.id)
+    if outcome is PostRun.DECOMPOSED:
+        await runtime._record(
+            task_transitioned(
+                id=task.id, from_state="active", to_state="blocked", reason="decomposed"
+            )
+        )
+    elif outcome is PostRun.YIELDED:
+        # Cap the suspended backlog (ADR-0007 M4): if too many tasks are already
+        # suspended, drop this no-progress task instead of growing the pile.
+        suspended = len(runtime.task_forest.by_status("suspended"))
+        if sched.max_suspended and suspended >= sched.max_suspended:
+            log.warning("suspended backlog full (%d); cancelling %s", suspended, task.id)
+            await runtime._record(
+                task_transitioned(
+                    id=task.id,
+                    from_state="active",
+                    to_state="cancelled",
+                    reason="suspend_backlog_full",
+                )
+            )
+        else:
+            summary = _checkpoint_summary(runtime, task.id)
+            await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+            await runtime._record(
+                task_transitioned(
+                    id=task.id, from_state="active", to_state="suspended", reason="yielded"
+                )
+            )
+    # DONE / GONE: the agent already moved the task (or it's gone) — nothing to do.
+
+
+def _task_label(task: Task) -> str:
+    text = (task.goal or task.content).strip()
+    return text if len(text) <= 60 else text[:59] + "…"
+
+
+def _make_pause_check(
+    runtime: AgentRuntime, task: Task, sched: Any, preempt_to: dict[str, str]
+) -> Callable[[], Awaitable[bool]]:
+    """Build the turn-boundary hook: per-task budget cap + preemption."""
+    from ..config import parse_duration
+    from ..tasks import preemptor
+
+    cooldown = parse_duration(sched.preempt_cooldown)
+    budget = int(sched.per_task_budget_tokens or 0)
+    start_id = runtime.store.latest_id()  # token baseline for this run
+
+    async def check() -> bool:
+        if preempt_to:  # already decided to pause this run
+            return True
+        # Per-task token budget (ADR-0007 M4): end the run if it has spent its
+        # allowance. Leaves preempt_to empty → classified as a yield (suspend).
+        if budget:
+            spent = sum(
+                (e.tokens_in or 0) + (e.tokens_out or 0) for e in runtime.store.read(since=start_id)
+            )
+            if spent >= budget:
+                log.info("task %s hit per-task token budget %d (spent %d)", task.id, budget, spent)
+                return True
+        if sched.preempt == "off":
+            return False
+        if time.monotonic() - runtime.last_preempt_monotonic < cooldown:
+            return False  # anti-thrash
+        cur = runtime.task_forest.get(task.id)
+        if cur is None:
+            return False
+        contender = preemptor(runtime.task_forest, cur)
+        if contender is None:
+            return False
+        if not await _approve_preempt(runtime, cur, contender, sched):
+            return False
+        preempt_to["id"] = contender.id
+        runtime.last_preempt_monotonic = time.monotonic()
+        log.info("task %s paused for higher-priority %s", task.id, contender.id)
+        return True
+
+    return check
+
+
+async def _approve_preempt(
+    runtime: AgentRuntime, current: Task, contender: Task, sched: Any
+) -> bool:
+    """Consent for a preemption switch. ``auto_by_priority`` (or yolo) auto-
+    approves; ``ask`` prompts the attached user (declines if headless)."""
+    if sched.preempt == "auto_by_priority" or runtime.gate.mode == "yolo":
+        return True
+    broker = runtime.decision_broker
+    if broker is None:
+        return False
+    choice = await broker.ask(
+        kind="task_preempt",
+        prompt=(
+            f"Pause '{_task_label(current)}' to run higher-priority '{_task_label(contender)}'?"
+        ),
+        options=["switch", "keep"],
+        payload={"pause": current.id, "start": contender.id},
+        decline="keep",
+    )
+    return bool(choice == "switch")
+
+
+def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> str:
+    """A minimal, deterministic resume brief from the run's last assistant turn.
+
+    M2 keeps this structural; enriching it with an LLM summary (compactor reuse)
+    is a later refinement. The contract is only that it is non-empty so a resumed
+    task has something to pick up from.
+    """
+    last = next(
+        (
+            m.content
+            for m in reversed(runtime.state.messages)
+            if m.role == "assistant" and m.content.strip()
+        ),
+        "",
+    )
+    t = runtime.task_forest.get(task_id)
+    goal = (t.goal or t.content) if t is not None else task_id
+    note = (last[:500] + " …") if len(last) > 500 else (last or "(no output)")
+    return f"In progress: {goal}\nLast: {note}"
+
+
+async def _hatch_task(runtime: AgentRuntime, item: TriggerItem) -> None:
+    """Mint a fresh task instance from a scheduled template (ADR-0007 M3).
+
+    Each fire produces its own task (``origin="trigger"``) with its own id and
+    history — a recurring schedule is a template that hatches instances, not one
+    task that re-runs.
+    """
+    from ..runtime.events import task_created
+    from ..tasks import mint_task_id
+
+    t = item.task_template or {}
+    content = str(t.get("content", "")).strip()
+    if not content:
+        log.warning("task_hatch from trigger %s has no content; skipping", item.trigger_id)
+        return
+    await runtime._record(
+        task_created(
+            id=mint_task_id(),
+            content=content,
+            goal=str(t.get("goal", "")),
+            priority=int(t.get("priority", 0) or 0),
+            origin="trigger",
+            due=t.get("due"),
+            tags=list(t.get("tags") or []),
+        )
+    )
+
+
+async def _run_cascade(runtime: AgentRuntime) -> None:
+    """Post-run compaction cascade (MEMORY_SPEC §4.1 / §4.4 / §4.5)."""
+    tier1_ran = await _maybe_run_tier1(runtime)
+    if tier1_ran:
+        await _maybe_run_tier2(runtime)
+    await _maybe_run_tier3(runtime)
 
 
 async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:
@@ -256,7 +557,7 @@ async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:
     if not events:
         return False
     tokens = working_window_token_estimate(events, watermark=0)
-    if tokens < cfg.conversation.working_memory_tokens:
+    if tokens < cfg.episodic.working_memory_tokens:
         return False
     from ..memory.compactor import LLMCompactor
 
@@ -291,7 +592,7 @@ async def _maybe_run_tier2(runtime: AgentRuntime) -> None:
     if not stm_path.exists():
         return
     stm_tokens = estimate(stm_path.read_text(encoding="utf-8"))
-    if stm_tokens < cfg.conversation.short_term_tokens:
+    if stm_tokens < cfg.episodic.short_term_tokens:
         return
 
     provider = _resolve_compaction_provider(runtime, cfg.compaction_model)
@@ -322,7 +623,7 @@ async def _maybe_run_tier3(runtime: AgentRuntime) -> None:
     if not ltm_path.exists():
         return
     ltm_tokens = estimate(ltm_path.read_text(encoding="utf-8"))
-    if ltm_tokens < cfg.conversation.long_term_tokens:
+    if ltm_tokens < cfg.episodic.long_term_tokens:
         return
 
     provider = _resolve_compaction_provider(runtime, cfg.compaction_model)
@@ -381,6 +682,14 @@ def _make_handler(
             }
         if method == "session.end":
             return {"ok": True}
+        if method == "decision.respond":
+            # User answered a blocking decision prompt (ADR-0006). First
+            # responder wins; an unknown/stale id is a no-op.
+            did = str(params.get("id") or "")
+            choice = str(params.get("choice") or "")
+            broker = runtime.decision_broker
+            applied = broker.resolve(did, choice) if broker is not None else False
+            return {"ok": applied}
         if method == "message.send":
             content = params.get("content", "")
             try:
@@ -395,22 +704,31 @@ def _make_handler(
             trig = scheduler.get(tid)
             if trig is None:
                 return {"ok": False, "error": f"no such trigger: {tid}"}
-            override = params.get("message")
-            state = runtime.store.get_trigger_state(tid)
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
+            # A task-template trigger hatches an instance (ADR-0007 M3) rather
+            # than running a conversation, even when fired manually.
+            template = getattr(trig, "task_template", None)
+            if isinstance(template, dict):
+                item = TriggerItem(
+                    kind="task_hatch", content="", trigger_id=tid, task_template=template
+                )
+            else:
+                override = params.get("message")
+                state = runtime.store.get_trigger_state(tid)
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
 
-            content = build_trigger_message(
-                trig,
-                tz=ZoneInfo(trig.timezone),
-                fired_at=datetime.now(UTC),
-                last_success_at=state["last_success_at"],
-                eonlet_id=eonlet_id,
-                catchup=False,
-                override_message=override,
-            )
+                content = build_trigger_message(
+                    trig,
+                    tz=ZoneInfo(trig.timezone),
+                    fired_at=datetime.now(UTC),
+                    last_success_at=state["last_success_at"],
+                    eonlet_id=eonlet_id,
+                    catchup=False,
+                    override_message=override,
+                )
+                item = TriggerItem(kind="cron", content=content, trigger_id=tid)
             try:
-                send.send_nowait(TriggerItem(kind="cron", content=content, trigger_id=tid))
+                send.send_nowait(item)
             except anyio.WouldBlock:
                 return {"ok": False, "error": "queue full"}
             return {"ok": True}
@@ -495,8 +813,15 @@ def _make_handler(
         if method == "triggers.clear":
             n = await scheduler.clear_dynamic()
             return {"ok": True, "cleared": n}
-        if method.startswith("memory."):
-            return await _handle_memory_ipc(method, params, runtime)
+        if method.startswith(("memory.", "task.")):
+            resp = await _handle_memory_ipc(method, params, runtime)
+            # A task mutation may create runnable work; poke the loop so it
+            # re-checks the scheduler promptly instead of waiting for the idle
+            # poll (ADR-0007 M2). The sentinel carries no message.
+            if method.startswith("task.") and runtime.definition.config.tasks.scheduling.enabled:
+                with contextlib.suppress(anyio.WouldBlock):
+                    send.send_nowait(TriggerItem(kind="task_wake", content=""))
+            return resp
         return {"error": f"unknown method: {method}"}
 
     return handle
@@ -507,26 +832,27 @@ async def _handle_memory_ipc(
     params: dict[str, Any],
     runtime: AgentRuntime,
 ) -> dict[str, Any]:
-    """Dispatch ``memory.note.*`` / ``memory.todo.*`` / ``memory.{compact,show,...}``
+    """Dispatch ``memory.knowledge.*`` / ``task.*`` / ``memory.{compact,show,...}``
     IPC methods.
 
     Events are appended through ``runtime._record`` so they flow into the
     IPC broadcaster the same way tool-driven calls do.
     """
-    from ..memory.ids import mint_note_id, mint_todo_id
-    from ..memory.notes import NotesStore
+    from ..errors import KnowledgeError, KnowledgePathError
+    from ..memory.knowledge import KnowledgeStore
     from ..memory.paths import long_term_path, short_term_path
-    from ..memory.todos import TodosStore
     from ..runtime.events import (
-        mem_note_added,
-        mem_note_deleted,
-        mem_note_updated,
+        kb_deleted,
+        kb_moved,
+        kb_written,
         mem_paused,
         mem_resumed,
-        mem_todo_added,
-        mem_todo_deleted,
-        mem_todo_updated,
+        task_created,
+        task_deleted,
+        task_transitioned,
+        task_updated,
     )
+    from ..tasks import can_transition, mint_task_id
 
     # ── compact / pause / resume / show ──────────────────────────────────
     if method == "memory.compact":
@@ -543,13 +869,23 @@ async def _handle_memory_ipc(
                 "error": f"failed to build compaction provider: {cfg.compaction_model!r}",
             }
         compactor = LLMCompactor(prov)
+        # User-forced /compact is the "clean slate" full compaction (ADR-0006):
+        # the whole working window is summarized into STM and emptied.
         outcome = await run_tier1(
             memory_dir=runtime.memory_dir,
             store=runtime.store,
             cfg=cfg,
             compactor=compactor,
             record_event=runtime._record,
+            full=True,
         )
+        if outcome.ran and outcome.error is None:
+            # Emptying the working window ends the current episode and starts a
+            # fresh one carrying only the injected memory preamble.
+            from ..runtime.events import session_ended, session_started
+
+            await runtime._record(session_ended(reason="compact"))
+            await runtime._record(session_started(reason="compact"))
         return {
             "ok": outcome.error is None,
             "ran": outcome.ran,
@@ -577,163 +913,158 @@ async def _handle_memory_ipc(
         if store_name in ("ltm", "all"):
             p = long_term_path(md)
             out["ltm"] = p.read_text(encoding="utf-8") if p.exists() else ""
-        if store_name in ("notes", "all"):
-            notes_list = await NotesStore(md).list_notes()
-            out["notes"] = [
-                {
-                    "id": n.id,
-                    "title": n.title,
-                    "tags": n.tags,
-                    "body": n.body,
-                    "created_at": n.created_at,
-                }
-                for n in notes_list
+        if store_name in ("knowledge", "all"):
+            out["knowledge"] = [
+                {"path": e.path, "title": e.title, "hook": e.hook}
+                for e in await KnowledgeStore(md).list_entries()
             ]
-        if store_name in ("todos", "all"):
-            todos = await TodosStore(md).list_todos(status="all")
-            out["todos"] = [t.to_json() for t in todos]
         out["auto_compact_enabled"] = runtime.auto_compact_enabled
         return out
 
-    # ── notes ────────────────────────────────────────────────────────────
-    if method.startswith("memory.note."):
-        store = NotesStore(runtime.memory_dir)
-        sub = method.removeprefix("memory.note.")
-        if sub == "add":
-            content = str(params.get("content", "")).strip()
-            if not content:
-                return {"ok": False, "error": "content required"}
-            note_id = mint_note_id()
-            try:
-                note = await store.add(
-                    id=note_id,
-                    content=content,
-                    title=params.get("title"),
-                    tags=list(params.get("tags") or []),
-                )
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
-            await runtime._record(mem_note_added(id=note.id, title=note.title, tags=note.tags))
-            return {"ok": True, "id": note.id}
+    # ── knowledge (curated knowledge axis, ADR-0005) ──────────────────────
+    if method.startswith("memory.knowledge."):
+        kstore = KnowledgeStore(runtime.memory_dir)
+        sub = method.removeprefix("memory.knowledge.")
         if sub == "list":
-            tags = list(params.get("tags") or [])
-            notes = await store.list_notes(tags=tags or None)
+            entries = await kstore.list_entries()
             return {
                 "ok": True,
-                "notes": [
-                    {
-                        "id": n.id,
-                        "title": n.title,
-                        "tags": n.tags,
-                        "created_at": n.created_at,
-                        "body": n.body,
-                    }
-                    for n in notes
-                ],
+                "knowledge": [{"path": e.path, "title": e.title, "hook": e.hook} for e in entries],
             }
-        if sub == "get":
-            nid = str(params.get("id", ""))
-            got = await store.get(id=nid) if nid else None
-            if got is None:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            return {
-                "ok": True,
-                "note": {
-                    "id": got.id,
-                    "title": got.title,
-                    "tags": got.tags,
-                    "created_at": got.created_at,
-                    "body": got.body,
-                },
-            }
-        if sub == "update":
-            nid = str(params.get("id", ""))
-            content = str(params.get("content", ""))
-            if not nid or not content:
-                return {"ok": False, "error": "id and content required"}
+        if sub == "open":
+            path = str(params.get("path", ""))
+            body = await kstore.open(path) if path else None
+            if body is None:
+                return {"ok": False, "error": f"no such knowledge file: {path}"}
+            return {"ok": True, "path": path, "body": body}
+        if sub == "write":
+            path = str(params.get("path", "")).strip()
+            content = params.get("content")
+            if not path or content is None:
+                return {"ok": False, "error": "path and content required"}
             try:
-                await store.update(id=nid, content=content)
-            except KeyError:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            await runtime._record(mem_note_updated(id=nid))
-            return {"ok": True}
+                rel = await kstore.write(
+                    path=path, content=str(content), index_line=params.get("index_line")
+                )
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            await runtime._record(kb_written(path=rel, size=len(str(content)), action="write"))
+            return {"ok": True, "path": rel}
         if sub == "delete":
-            nid = str(params.get("id", ""))
-            if not nid:
-                return {"ok": False, "error": "id required"}
-            removed = await store.delete(id=nid)
-            if not removed:
-                return {"ok": False, "error": f"no such note: {nid}"}
-            await runtime._record(mem_note_deleted(id=nid))
+            path = str(params.get("path", ""))
+            if not path:
+                return {"ok": False, "error": "path required"}
+            try:
+                existed = await kstore.delete(path=path)
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            if not existed:
+                return {"ok": False, "error": f"no such knowledge file: {path}"}
+            await runtime._record(kb_deleted(path=path))
             return {"ok": True}
+        if sub == "move":
+            src = str(params.get("path", ""))
+            dst = str(params.get("new_path", ""))
+            if not src or not dst:
+                return {"ok": False, "error": "path and new_path required"}
+            try:
+                src_rel, dst_rel = await kstore.move(
+                    src=src, dst=dst, index_line=params.get("index_line")
+                )
+            except (KnowledgeError, KnowledgePathError) as e:
+                return {"ok": False, "error": str(e)}
+            await runtime._record(kb_moved(src=src_rel, dst=dst_rel))
+            return {"ok": True, "src": src_rel, "dst": dst_rel}
         return {"ok": False, "error": f"unknown method: {method}"}
 
-    # ── todos ────────────────────────────────────────────────────────────
-    if method.startswith("memory.todo."):
-        store_t = TodosStore(runtime.memory_dir)
-        sub = method.removeprefix("memory.todo.")
+    # ── tasks (workflow state — event-sourced forest, ADR-0007) ────────────
+    if method.startswith("task."):
+        forest = runtime.task_forest
+        sub = method.removeprefix("task.")
         if sub == "add":
             content = str(params.get("content", "")).strip()
             if not content:
                 return {"ok": False, "error": "content required"}
-            todo_id = mint_todo_id()
-            try:
-                todo = await store_t.add(
-                    id=todo_id,
+            parent_id = params.get("parent_id")
+            if parent_id and forest.get(str(parent_id)) is None:
+                return {"ok": False, "error": f"no such parent task: {parent_id}"}
+            from ..tasks import creation_guard_error
+
+            sched = runtime.definition.config.tasks.scheduling
+            guard = creation_guard_error(
+                forest,
+                str(parent_id) if parent_id else None,
+                max_depth=sched.max_tree_depth,
+                max_fanout=sched.max_fanout,
+            )
+            if guard is not None:
+                return {"ok": False, "error": guard}
+            tid = mint_task_id()
+            await runtime._record(
+                task_created(
+                    id=tid,
                     content=content,
+                    goal=str(params.get("goal") or ""),
+                    priority=int(params.get("priority") or 0),
+                    parent_id=str(parent_id) if parent_id else None,
+                    origin="user",
                     due=params.get("due"),
                     tags=list(params.get("tags") or []),
                 )
-            except ValueError as e:
-                return {"ok": False, "error": str(e)}
-            await runtime._record(
-                mem_todo_added(id=todo.id, content=todo.content, due=todo.due, tags=todo.tags)
             )
-            return {"ok": True, "id": todo.id}
+            return {"ok": True, "id": tid}
         if sub == "list":
             status_param = str(params.get("status", "pending"))
-            if status_param not in ("pending", "done", "cancelled", "all"):
+            valid = ("pending", "active", "suspended", "blocked", "done", "cancelled", "all")
+            if status_param not in valid:
                 return {"ok": False, "error": f"invalid status: {status_param}"}
-            todos = await store_t.list_todos(status=status_param)  # type: ignore[arg-type]
-            return {
-                "ok": True,
-                "todos": [t.to_json() for t in todos],
-            }
-        if sub == "done":
+            tasks = forest.by_status(status_param)  # type: ignore[arg-type]
+            return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
+        if sub in ("done", "cancel", "suspend", "resume"):
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            try:
-                todo = await store_t.mark_done(id=tid)
-            except KeyError:
-                return {"ok": False, "error": f"no such todo: {tid}"}
+            task = forest.get(tid)
+            if task is None:
+                return {"ok": False, "error": f"no such task: {tid}"}
+            # resume re-queues a suspended task (→ pending); the others map to
+            # their lifecycle state. ADR-0007 M4 CLI ops.
+            dst = {
+                "done": "done",
+                "cancel": "cancelled",
+                "suspend": "suspended",
+                "resume": "pending",
+            }[sub]
+            if not can_transition(task.status, dst):
+                return {"ok": False, "error": f"cannot {sub} task in state {task.status}"}
             await runtime._record(
-                mem_todo_updated(id=todo.id, status=todo.status, done_at=todo.done_at)
+                task_transitioned(id=tid, from_state=task.status, to_state=dst, reason=f"cli:{sub}")
             )
             return {"ok": True}
         if sub == "update":
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            try:
-                todo = await store_t.update(
+            if forest.get(tid) is None:
+                return {"ok": False, "error": f"no such task: {tid}"}
+            await runtime._record(
+                task_updated(
                     id=tid,
                     content=params.get("content"),
+                    goal=params.get("goal"),
+                    priority=params.get("priority"),
                     due=params.get("due"),
                     tags=list(params["tags"]) if "tags" in params else None,
                 )
-            except KeyError:
-                return {"ok": False, "error": f"no such todo: {tid}"}
-            await runtime._record(mem_todo_updated(id=todo.id, status=todo.status))
+            )
             return {"ok": True}
         if sub == "delete":
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            removed = await store_t.delete(id=tid)
-            if not removed:
-                return {"ok": False, "error": f"no such todo: {tid}"}
-            await runtime._record(mem_todo_deleted(id=tid))
+            if forest.get(tid) is None:
+                return {"ok": False, "error": f"no such task: {tid}"}
+            await runtime._record(task_deleted(id=tid))
             return {"ok": True}
         return {"ok": False, "error": f"unknown method: {method}"}
 

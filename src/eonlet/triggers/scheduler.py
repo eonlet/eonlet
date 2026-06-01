@@ -59,14 +59,18 @@ log = logging.getLogger("eonlet.triggers")
 class TriggerItem:
     """One unit of work for the main loop.
 
-    Two flavors:
+    Flavors:
     - ``kind="interactive"`` — a user message from IPC.
     - ``kind="cron"``        — a scheduled/manual cron fire. ``trigger_id`` set.
+    - ``kind="task_hatch"``  — a scheduled task-template fire (ADR-0007 M3):
+      ``task_template`` carries the fields for the fresh task instance to mint.
+    - ``kind="task_wake"``   — an internal poke to re-check the task scheduler.
     """
 
-    kind: str  # "interactive" | "cron"
+    kind: str  # "interactive" | "cron" | "task_hatch" | "task_wake"
     content: str
     trigger_id: str | None = None
+    task_template: dict[str, Any] | None = None
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────
@@ -335,17 +339,26 @@ class CronScheduler:
                 },
             )
         )
-        message = build_trigger_message(
-            s.trig,
-            tz=s.tz,
-            fired_at=fired_at,
-            last_success_at=state["last_success_at"],
-            eonlet_id=self._eonlet_id,
-            catchup=catchup,
-            override_message=None,
-        )
+        # A task-template trigger (ADR-0007 M3) hatches a fresh task instance
+        # instead of running a conversation turn.
+        template = getattr(s.trig, "task_template", None)
+        if isinstance(template, dict):
+            item = TriggerItem(
+                kind="task_hatch", content="", trigger_id=s.trig.id, task_template=template
+            )
+        else:
+            message = build_trigger_message(
+                s.trig,
+                tz=s.tz,
+                fired_at=fired_at,
+                last_success_at=state["last_success_at"],
+                eonlet_id=self._eonlet_id,
+                catchup=catchup,
+                override_message=None,
+            )
+            item = TriggerItem(kind="cron", content=message, trigger_id=s.trig.id)
         try:
-            self._send.send_nowait(TriggerItem(kind="cron", content=message, trigger_id=s.trig.id))
+            self._send.send_nowait(item)
         except anyio.WouldBlock:
             # Queue full → drop with an explicit event (TRIGGER_SPEC §4.2).
             self._store.append(

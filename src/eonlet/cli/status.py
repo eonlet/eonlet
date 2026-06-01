@@ -67,7 +67,7 @@ class MemorySection(BaseModel):
     working: MemoryTierInfo = Field(default_factory=MemoryTierInfo)
     stm: MemoryTierInfo = Field(default_factory=MemoryTierInfo)
     ltm: MemoryTierInfo = Field(default_factory=MemoryTierInfo)
-    notes: MemoryTierInfo = Field(default_factory=MemoryTierInfo)
+    knowledge: MemoryTierInfo = Field(default_factory=MemoryTierInfo)
     todos_active: int = 0
     todos_done: int = 0
     todos_cancelled: int = 0
@@ -264,13 +264,13 @@ def _collect_memory(eonlet_id: str, meta: dict[str, Any]) -> MemorySection:
             sections = stm_parse(text)
             section.stm = MemoryTierInfo(
                 estimated_tokens=estimate(text),
-                budget_tokens=mem_cfg.conversation.short_term_tokens,
+                budget_tokens=mem_cfg.episodic.short_term_tokens,
                 count=len(sections),
             )
         except Exception:
             section.stm = MemoryTierInfo(
                 estimated_tokens=estimate(stm_path.read_text(encoding="utf-8")),
-                budget_tokens=mem_cfg.conversation.short_term_tokens,
+                budget_tokens=mem_cfg.episodic.short_term_tokens,
             )
 
     # LTM
@@ -284,39 +284,38 @@ def _collect_memory(eonlet_id: str, meta: dict[str, Any]) -> MemorySection:
             text = ltm_path.read_text(encoding="utf-8")
             section.ltm = MemoryTierInfo(
                 estimated_tokens=estimate(text),
-                budget_tokens=mem_cfg.conversation.long_term_tokens,
+                budget_tokens=mem_cfg.episodic.long_term_tokens,
                 count=len(bullets),
             )
         except Exception:
             text = ltm_path.read_text(encoding="utf-8")
             section.ltm = MemoryTierInfo(
                 estimated_tokens=estimate(text),
-                budget_tokens=mem_cfg.conversation.long_term_tokens,
+                budget_tokens=mem_cfg.episodic.long_term_tokens,
             )
 
-    # Notes
-    notes_path = mem_dir / "notes.md"
-    if notes_path.exists():
+    # Knowledge (curated axis — index map size + file count)
+    index_md = mem_dir / "knowledge" / "index.md"
+    if index_md.exists():
         try:
-            from ..memory.notes import NotesStore
+            from ..memory.knowledge import KnowledgeStore
 
-            ns = NotesStore(mem_dir)
-            notes_list, _ = ns._read_all()
-            text = notes_path.read_text(encoding="utf-8")
-            section.notes = MemoryTierInfo(
+            ks = KnowledgeStore(mem_dir)
+            text = ks.index_text()
+            section.knowledge = MemoryTierInfo(
                 estimated_tokens=estimate(text),
-                budget_tokens=mem_cfg.notes.max_tokens,
-                count=len(notes_list),
+                budget_tokens=mem_cfg.knowledge.index_max_tokens,
+                count=len(text.splitlines()),
             )
         except Exception:
-            text = notes_path.read_text(encoding="utf-8")
-            section.notes = MemoryTierInfo(
+            text = index_md.read_text(encoding="utf-8")
+            section.knowledge = MemoryTierInfo(
                 estimated_tokens=estimate(text),
-                budget_tokens=mem_cfg.notes.max_tokens,
+                budget_tokens=mem_cfg.knowledge.index_max_tokens,
             )
 
-    # Todos
-    todos_jsonl = mem_dir / "todos.jsonl"
+    # Tasks (moved out of memory/ to tasks/ in ADR-0005)
+    todos_jsonl = mem_dir.parent / "tasks" / "todos.jsonl"
     if todos_jsonl.exists():
         try:
             import json
@@ -346,7 +345,7 @@ def _collect_working(eonlet_id: str, mem_cfg: MemoryConfig) -> MemoryTierInfo:
     """Estimate working memory token usage from recent events."""
     db = paths.state_db(eonlet_id)
     if not db.exists():
-        return MemoryTierInfo(budget_tokens=mem_cfg.conversation.working_memory_tokens)
+        return MemoryTierInfo(budget_tokens=mem_cfg.episodic.working_memory_tokens)
     try:
         try:
             import apsw as _sqlite
@@ -400,11 +399,11 @@ def _collect_working(eonlet_id: str, mem_cfg: MemoryConfig) -> MemoryTierInfo:
 
         return MemoryTierInfo(
             estimated_tokens=total_tokens,
-            budget_tokens=mem_cfg.conversation.working_memory_tokens,
+            budget_tokens=mem_cfg.episodic.working_memory_tokens,
             count=msg_count,
         )
     except Exception:
-        return MemoryTierInfo(budget_tokens=mem_cfg.conversation.working_memory_tokens)
+        return MemoryTierInfo(budget_tokens=mem_cfg.episodic.working_memory_tokens)
 
 
 def _is_compact_paused(eonlet_id: str) -> bool:
@@ -677,7 +676,7 @@ def _render_memory(m: MemorySection, console: Console) -> None:
     tier_row("working", m.working, "msgs")
     tier_row("STM", m.stm, "sections")
     tier_row("LTM", m.ltm, "bullets")
-    tier_row("notes", m.notes, "notes")
+    tier_row("knowledge", m.knowledge, "files")
 
     todo_parts = [f"  todos    {m.todos_active} active"]
     if m.todos_done:

@@ -68,24 +68,28 @@ class ForgettingOutcome:
 # ── Prompt ──────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
-    "You compact a long-term memory document by removing or merging low-value entries.\n"
+    "You compact a long-term EPISODIC timeline by dropping or merging stale entries.\n"
+    "\n"
+    "Long-term memory is a single uniform population: dated episodic summaries of\n"
+    "what happened, when. It naturally decays — older, low-salience entries are\n"
+    "less useful than recent ones. There is no protected class of bullet; every\n"
+    "entry is eligible for forgetting by recency and salience.\n"
     "\n"
     "Return ONE JSON object:\n"
     "{\n"
     '  "kept_bullets": [\n'
-    '    {"section": "...", "content": "...", "src": "...", "ts": "...", "merged_from": ["..."]}\n'
+    '    {"section": "episodic", "content": "...", "src": "...", "ts": "...", "merged_from": ["..."]}\n'
     "  ],\n"
     '  "dropped_bullets": [\n'
-    '    {"section": "...", "preview": "first 80 chars", "reason": "duplicate|stale|low-salience"}\n'
+    '    {"section": "episodic", "preview": "first 80 chars", "reason": "duplicate|stale|low-salience"}\n'
     "  ]\n"
     "}\n"
     "\n"
     "Rules:\n"
-    "- Bullets tagged src:explicit (and categories user/feedback/project/reference) are important:\n"
-    "  only merge them into a consolidated bullet, never drop unless truly contradicted.\n"
-    "- Bullets tagged src:implicit (auto-compaction) may be dropped if stale or low-salience.\n"
-    "- When merging, preserve the earliest 'ts' of the source bullets.\n"
-    "- Minimise information loss. When in doubt, keep.\n"
+    "- Prefer keeping recent and high-salience summaries; drop old, redundant, or\n"
+    "  low-salience ones to fit the budget.\n"
+    "- When merging adjacent or duplicate summaries, preserve the earliest 'ts'.\n"
+    "- Minimise information loss. When in doubt about a recent entry, keep it.\n"
     "- Every kept bullet MUST have: section, content, src, ts.\n"
     "- 'merged_from' lists the original content strings that were combined.\n"
 )
@@ -156,7 +160,7 @@ async def run_tier3(
             return ForgettingOutcome(ran=False)
 
         ltm_tokens = estimate(ltm_raw)
-        if ltm_tokens < cfg.conversation.long_term_tokens:
+        if ltm_tokens < cfg.episodic.long_term_tokens:
             return ForgettingOutcome(ran=False)
 
         prompt = build_tier3_prompt(ltm_raw)

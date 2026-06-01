@@ -1,6 +1,6 @@
 [project]
 name = "eonlet"
-version = "0.0.0"
+dynamic = ["version"]
 description = "A local-first runtime for stateful AI agents — the systemd for agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,7 @@ dependencies = [
     "anyio>=4.4",
     # HTTP
     "httpx>=0.27",
+    "h2>=4.1",                       # HTTP/2 transport for HTTPFetcher (ADR-0004)
     # Data validation
     "pydantic>=2.7",
     # SQLite with extended features
@@ -44,6 +45,8 @@ dependencies = [
     "watchdog>=4.0",
     # Cron-style scheduling
     "croniter>=2.0",
+    # HTML → markdown extraction for web_fetch (ADR-0004)
+    "trafilatura>=2.0",
     # Time zone handling
     "tzdata>=2024.1; sys_platform == 'win32'",
     # Serialization
@@ -51,7 +54,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-search = ["tavily-python>=0.3"]                  # web_search backend
 mcp = ["mcp>=0.5"]                                # v0.2: MCP integration
 otel = ["opentelemetry-api", "logfire"]           # v0.2: tracing
 tui = ["textual>=0.70"]                           # v0.2: TUI
@@ -82,11 +84,11 @@ Issues = "https://github.com/eonlet/eonlet/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/eonlet/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/eonlet"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/eonlet/templates" = "eonlet/templates"
 
 [tool.ruff]
 line-length = 100
@@ -145,17 +147,18 @@ disable_error_code = [
 
 # Third-party deps without published stubs.
 [[tool.mypy.overrides]]
-module = ["croniter", "apsw", "msgpack", "yaml"]
+module = ["croniter", "apsw", "msgpack", "yaml", "trafilatura"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-# Coverage is enabled but the floor is set at the v0.0.4 baseline. Raise this
-# as new tests land; v0.1.0 target is 70% per SPEC §12.
-# (CI invokes pytest with --cov-fail-under explicitly so dev-local runs don't
-# break when running a subset of tests.)
+# Coverage gates (CI enforces these via explicit --cov-fail-under flags so
+# dev-local subset runs don't break):
+#   project total:        ≥ 70%   (SPEC §12; v0.1.0 target)
+#   src/eonlet/web/:      ≥ 80%   (ADR-0004 §Validation #7)
+#   src/eonlet/memory/:   ≥ 75%   (MEMORY_SPEC §12)
 
 [tool.coverage.run]
 branch = true

@@ -13,12 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..errors import ConfigError
 
-# Legacy field names that v0.0.x agents shipped. Refused outright by the
-# loader; the migration tool (`eonlet memory migrate`) handles conversion.
+# Legacy field names that early v0.0.x agents shipped. Refused outright by the
+# loader — pre-alpha has no migration path, just rewrite the agent.yaml.
 _LEGACY_FIELDS: frozenset[str] = frozenset({"notes_files", "recent_messages_in_context"})
 
 
-class ConversationMemoryConfig(BaseModel):
+class EpisodicMemoryConfig(BaseModel):
     """Working/STM/LTM token budgets and compaction thresholds."""
 
     model_config = ConfigDict(extra="forbid")
@@ -29,25 +29,28 @@ class ConversationMemoryConfig(BaseModel):
     long_term_tokens: int = Field(default=8_000, ge=64)
     auto_compact: bool = True
 
+    # Agent-proposed semantic compaction (ADR-0006). These are validated and
+    # defaulted now (v0.0.9 M1) but only consumed once the propose_compact
+    # action + consent round-trip land (M3).
+    propose_semantic: bool = True
+    propose_floor_tokens: int = Field(default=5_000, ge=64)
+    propose_min_interval_seconds: int = Field(default=1_800, ge=0)
+    propose_min_turns: int = Field(default=3, ge=0)
 
-class NotesMemoryConfig(BaseModel):
-    """Notes (user-curated, never auto-deleted) budget."""
+
+class KnowledgeMemoryConfig(BaseModel):
+    """Curated-knowledge axis (ADR-0005, axis 2).
+
+    The knowledge tree's bodies stay on disk; only ``index.md`` is injected
+    into context. ``index_max_tokens`` / ``warn_file_tokens`` drive non-fatal
+    warnings when the map or a single file grows past a sane size.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    max_tokens: int = Field(default=4_000, ge=128)
-    inject: bool = True
-
-
-class TodosMemoryConfig(BaseModel):
-    """TODOs injection and archival policy."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    inject_active: bool = True
-    # 0 disables archival; otherwise done items older than N days are moved
-    # to todos.archive.jsonl on the periodic sweep (MEMORY_SPEC §10).
-    archive_done_after_days: int = Field(default=30, ge=0)
+    inject_index: bool = True
+    index_max_tokens: int = Field(default=2_000, ge=128)
+    warn_file_tokens: int = Field(default=4_000, ge=128)
 
 
 class MemoryConfig(BaseModel):
@@ -62,9 +65,13 @@ class MemoryConfig(BaseModel):
     enabled: bool = True
     compaction_model: str = "claude-haiku-4-5@anthropic"
 
-    conversation: ConversationMemoryConfig = Field(default_factory=ConversationMemoryConfig)
-    notes: NotesMemoryConfig = Field(default_factory=NotesMemoryConfig)
-    todos: TodosMemoryConfig = Field(default_factory=TodosMemoryConfig)
+    # Prefix every user message rendered into the working window with its local
+    # datetime (ADR-0006), giving the model temporal awareness of when episodes
+    # happened. Render-time only — never written into event payloads.
+    inject_turn_timestamps: bool = True
+
+    episodic: EpisodicMemoryConfig = Field(default_factory=EpisodicMemoryConfig)
+    knowledge: KnowledgeMemoryConfig = Field(default_factory=KnowledgeMemoryConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -75,8 +82,7 @@ class MemoryConfig(BaseModel):
                 raise ConfigError(
                     "agent.yaml: memory."
                     f"{offenders[0]} is no longer supported "
-                    "(MEMORY_SPEC §5.7). Remove it and migrate notes/todos via "
-                    "`eonlet memory migrate`. Offending fields: " + ", ".join(offenders)
+                    "(MEMORY_SPEC §5.7). Remove it. Offending fields: " + ", ".join(offenders)
                 )
         return data
 
@@ -86,5 +92,5 @@ class MemoryConfig(BaseModel):
         configured floor. Roughly 250 tokens per message is a generous heuristic
         for mixed user/assistant/tool turns.
         """
-        budget_estimate = max(self.conversation.working_memory_tokens // 250, 1)
-        return max(self.conversation.keep_recent_messages_min, min(budget_estimate, 200))
+        budget_estimate = max(self.episodic.working_memory_tokens // 250, 1)
+        return max(self.episodic.keep_recent_messages_min, min(budget_estimate, 200))

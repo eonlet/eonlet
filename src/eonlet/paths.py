@@ -72,6 +72,11 @@ def memory_dir(eonlet_id: str) -> Path:
     return eonlet_dir(eonlet_id) / "memory"
 
 
+def tasks_dir(eonlet_id: str) -> Path:
+    """Workflow state (todos) — sibling of memory/, not part of it (ADR-0005)."""
+    return eonlet_dir(eonlet_id) / "tasks"
+
+
 def workspace_dir(eonlet_id: str) -> Path:
     return eonlet_dir(eonlet_id) / "workspace"
 

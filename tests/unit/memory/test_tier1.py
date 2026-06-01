@@ -10,7 +10,7 @@ import pytest
 from eonlet.memory.compactor import CompactionResult, StaticCompactor
 from eonlet.memory.config import MemoryConfig
 from eonlet.memory.stm import STMSection, STMStore
-from eonlet.memory.tier1 import compute_suggested_boundary, run_tier1
+from eonlet.memory.tier1 import compute_suggested_boundary, run_tier1, snap_boundary_safe
 from eonlet.memory.watermark import read_watermark
 from eonlet.runtime.events import (
     Event,
@@ -38,7 +38,7 @@ def _section(topic: str = "summary") -> STMSection:
 
 def test_suggested_boundary_keeps_min_messages() -> None:
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 1000, "keep_recent_messages_min": 2}}
+        {"episodic": {"working_memory_tokens": 1000, "keep_recent_messages_min": 2}}
     )
     events = []
     for i in range(1, 11):
@@ -53,7 +53,7 @@ def test_suggested_boundary_keeps_min_messages() -> None:
 def test_suggested_boundary_avoids_tool_pair() -> None:
     """The boundary must not land on a tool_call whose result is in the preserved tail."""
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 128, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 128, "keep_recent_messages_min": 1}}
     )
     # Pre-loaded with bulky early events so the preserved tail can't include
     # everything; the boundary will fall somewhere in the middle.
@@ -100,7 +100,7 @@ def store(tmp_path: Path) -> EventStore:
 def test_run_tier1_advances_watermark_and_writes_stm(tmp_path: Path, store: EventStore) -> None:
     events = _seed(store, n=6)
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 2}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 2}}
     )
     boundary = events[5].id  # compress up to event #6
     compactor = StaticCompactor(sections=[_section("topic-a")], boundary_event_id=boundary)
@@ -134,6 +134,96 @@ def test_run_tier1_advances_watermark_and_writes_stm(tmp_path: Path, store: Even
     assert any(e.kind == EventKind.MEM_COMPACTED for e in captured)
 
 
+class _CapturingCompactor:
+    """Compactor that records the suggested boundary it was handed."""
+
+    def __init__(self, sections: list, boundary_event_id: int) -> None:
+        self._sections = sections
+        self._boundary = boundary_event_id
+        self.suggested_seen: int | None = None
+
+    async def summarize(self, events: list[Event], suggested_boundary: int) -> CompactionResult:
+        self.suggested_seen = suggested_boundary
+        return CompactionResult(sections=list(self._sections), boundary_event_id=self._boundary)
+
+
+def test_run_tier1_full_empties_working_window(tmp_path: Path, store: EventStore) -> None:
+    """full=True suggests the latest event so the whole window is compacted away."""
+    from eonlet.memory.injection import select_recent_window
+
+    events = _seed(store, n=6)
+    last_id = events[-1].id
+    assert last_id is not None
+    # A small budget so the *default* boundary would keep a tail — proving full
+    # mode differs from bounded-auto.
+    cfg = MemoryConfig.model_validate(
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 2}}
+    )
+    assert compute_suggested_boundary(events, cfg) < last_id
+
+    compactor = _CapturingCompactor([_section("all")], boundary_event_id=last_id)
+    outcome = anyio.run(
+        lambda: run_tier1(
+            memory_dir=tmp_path,
+            store=store,
+            cfg=cfg,
+            compactor=compactor,
+            record_event=None,
+            full=True,
+        )
+    )
+
+    assert outcome.ran is True
+    # full mode suggested the latest event, not the ~30%-tail boundary.
+    assert compactor.suggested_seen == last_id
+    assert read_watermark(tmp_path) == last_id
+    # Working window is now empty: every seeded event sits at or below watermark.
+    window = select_recent_window(events, cfg, watermark=last_id)
+    assert window.events == []
+
+
+def test_snap_boundary_safe_avoids_tool_pairs() -> None:
+    events = [
+        user_message("u1").model_copy(update={"id": 1}),
+        assistant_message("a", tool_calls=[{"id": "c", "name": "x", "args": {}}]).model_copy(
+            update={"id": 2}
+        ),
+        tool_call("c", "x", {}).model_copy(update={"id": 3}),
+        tool_result("c", "x", "out").model_copy(update={"id": 4}),
+        user_message("u2").model_copy(update={"id": 5}),
+    ]
+    # A boundary on the tool_call or its result snaps back to the owning turn.
+    assert snap_boundary_safe(events, 4) == 2
+    assert snap_boundary_safe(events, 3) == 2
+    # A clean message boundary is unchanged; unknown ids pass through.
+    assert snap_boundary_safe(events, 5) == 5
+    assert snap_boundary_safe(events, 999) == 999
+
+
+def test_run_tier1_explicit_boundary(tmp_path: Path, store: EventStore) -> None:
+    """boundary=<id> compacts up to exactly that (tool-pair-snapped) point."""
+    events = _seed(store, n=6)
+    target = events[3].id  # an assistant_message — a clean cut
+    assert target is not None
+    cfg = MemoryConfig.model_validate(
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 2}}
+    )
+    compactor = _CapturingCompactor([_section("mid")], boundary_event_id=target)
+    outcome = anyio.run(
+        lambda: run_tier1(
+            memory_dir=tmp_path,
+            store=store,
+            cfg=cfg,
+            compactor=compactor,
+            record_event=None,
+            boundary=target,
+        )
+    )
+    assert outcome.ran is True
+    assert compactor.suggested_seen == target
+    assert read_watermark(tmp_path) == target
+
+
 def test_run_tier1_no_op_when_no_events_past_watermark(tmp_path: Path, store: EventStore) -> None:
     cfg = MemoryConfig()
     compactor = StaticCompactor(sections=[_section()], boundary_event_id=1)
@@ -149,7 +239,7 @@ def test_run_tier1_no_op_when_no_events_past_watermark(tmp_path: Path, store: Ev
 def test_run_tier1_handles_compactor_failure(tmp_path: Path, store: EventStore) -> None:
     _seed(store, n=4)
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
     )
 
     class _Boom:
@@ -178,7 +268,7 @@ def test_run_tier1_invalid_boundary_short_circuits(tmp_path: Path, store: EventS
     surfaces as an error (no state change)."""
     _seed(store, n=4)
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
     )
 
     class _BadBoundary:
@@ -223,7 +313,7 @@ def test_run_tier1_zero_tokens_before_no_op(tmp_path: Path, store: EventStore) -
     # Append only a session_started event (no token content)
     store.append(Event(kind=EventKind.SESSION_STARTED, payload={"mode": "scheduled"}))
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
     )
     compactor = StaticCompactor(sections=[_section()], boundary_event_id=1)
     out = anyio.run(
@@ -242,7 +332,7 @@ def test_run_tier1_compactor_failure_with_record_event(tmp_path: Path, store: Ev
     """Compactor failure with record_event set emits an error event."""
     _seed(store, n=4)
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
+        {"episodic": {"working_memory_tokens": 100, "keep_recent_messages_min": 1}}
     )
 
     class _Boom:
@@ -283,7 +373,7 @@ def test_run_tier1_suggested_at_or_before_watermark(tmp_path: Path, store: Event
 
     # Use a tiny budget so all events are "preserved" (suggested == 0 or <= watermark)
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100_000, "keep_recent_messages_min": 100}}
+        {"episodic": {"working_memory_tokens": 100_000, "keep_recent_messages_min": 100}}
     )
     compactor = StaticCompactor(sections=[_section()], boundary_event_id=1)
     out = anyio.run(
@@ -303,7 +393,7 @@ def test_run_tier1_suggested_at_or_before_watermark(tmp_path: Path, store: Event
 def test_compute_suggested_boundary_empty_events() -> None:
     """Empty event list returns 0 immediately."""
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 1000, "keep_recent_messages_min": 2}}
+        {"episodic": {"working_memory_tokens": 1000, "keep_recent_messages_min": 2}}
     )
     result = compute_suggested_boundary([], cfg)
     assert result == 0
@@ -312,7 +402,7 @@ def test_compute_suggested_boundary_empty_events() -> None:
 def test_compute_suggested_boundary_all_preserved() -> None:
     """When min_keep covers all events, boundary should be before the first event."""
     cfg = MemoryConfig.model_validate(
-        {"conversation": {"working_memory_tokens": 100_000, "keep_recent_messages_min": 100}}
+        {"episodic": {"working_memory_tokens": 100_000, "keep_recent_messages_min": 100}}
     )
     events = [user_message(f"u{i}").model_copy(update={"id": i + 1}) for i in range(3)]
     result = compute_suggested_boundary(events, cfg)

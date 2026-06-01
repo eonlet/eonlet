@@ -32,6 +32,9 @@ class Message:
     # Source event id — used by the injection pipeline to filter out
     # messages already represented by short-term memory (id ≤ watermark).
     event_id: int | None = None
+    # Source event timestamp (unix microseconds). Used to prefix user turns
+    # with their local datetime at render time (ADR-0006).
+    ts: int | None = None
     # Chain-of-thought from thinking-mode providers (e.g. DeepSeek).
     # Persisted so it can be echoed back on subsequent turns with tool_calls.
     reasoning_content: str | None = None
@@ -63,6 +66,7 @@ def reduce(state: AgentState, event: Event) -> AgentState:
                 role="user",
                 content=event.payload.get("content", ""),
                 event_id=event.id,
+                ts=event.ts,
             )
         )
     elif kind == EventKind.ASSISTANT_MESSAGE:

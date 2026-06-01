@@ -1,16 +1,22 @@
-"""LTM document management (MEMORY_SPEC §2.2).
+"""LTM document management (ADR-0005, episodic axis).
+
+As of ADR-0005 the long-term document holds a **single population**: dated
+episodic summaries produced by tier-2 compaction. The five semantic
+categories (user/feedback/project/reference/fact) moved to the curated
+knowledge axis (``memory/knowledge/``); durable facts are now written there
+deliberately via the ``knowledge`` tool rather than auto-promoted into LTM.
 
 Format::
 
     # Long-term memory
 
-    ## user
-    - preferred concise responses [src:explicit, ts:2026-04-12]
+    ## episodic
+    - 2026-05-22: shipped the web-tools upgrade [src:implicit, ts:2026-05-22]
+    - 2026-05-24: debugged the SSRF guard with the user [src:implicit, ts:2026-05-24]
 
-    ## feedback
-    - never mock the database in tests [src:explicit, ts:2026-02-18]
-
-Categories: user, feedback, project, reference, fact, episodic
+Because the document is now one uniform population, tier-3 forgetting applies
+a single recency/salience policy to every bullet — there is no ``src:explicit``
+"never drop" exemption (that was the special-casing ADR-0005 removed).
 """
 
 from __future__ import annotations
@@ -24,10 +30,10 @@ from typing import Literal
 from .paths import long_term_path
 from .storage import atomic_write_text, file_lock
 
-LTMCategory = Literal["user", "feedback", "project", "reference", "fact", "episodic"]
-CATEGORIES: tuple[str, ...] = ("user", "feedback", "project", "reference", "fact", "episodic")
+LTMCategory = Literal["episodic"]
+CATEGORIES: tuple[str, ...] = ("episodic",)
 
-# Matches trailing: [src:explicit, ts:2026-04-12]
+# Matches trailing: [src:implicit, ts:2026-05-22]
 _TRAILER_RE = re.compile(r"\s*\[src:([^,\]]+),\s*ts:([^\]]+)\]\s*$")
 
 
@@ -70,36 +76,6 @@ class LTMStore:
         """Replace the entire LTM document with *bullets* (canonical order)."""
         async with file_lock(self._path):
             atomic_write_text(self._path, _render_ltm(bullets))
-
-    def find_bullets(self, target: str) -> list[LTMBullet]:
-        """Find bullets matching *target*.
-
-        - ``"category:N"`` — zero-based index within that category
-          (e.g. ``"fact:0"`` → first fact bullet)
-        - anything else — partial case-insensitive content match
-        """
-        bullets = self.read_bullets()
-        if ":" in target:
-            cat, _, idx_str = target.partition(":")
-            if cat in CATEGORIES and idx_str.isdigit():
-                cat_bullets = [b for b in bullets if b.section == cat]
-                idx = int(idx_str)
-                return [cat_bullets[idx]] if 0 <= idx < len(cat_bullets) else []
-        lower = target.lower()
-        return [b for b in bullets if lower in b.content.lower()]
-
-    async def delete_bullets(self, to_delete: list[LTMBullet]) -> int:
-        """Delete *to_delete* from the document. Returns the count removed."""
-        if not to_delete:
-            return 0
-        raws = {b.raw for b in to_delete}
-        async with file_lock(self._path):
-            all_bullets = self.read_bullets()
-            remaining = [b for b in all_bullets if b.raw not in raws]
-            removed = len(all_bullets) - len(remaining)
-            if removed:
-                atomic_write_text(self._path, _render_ltm(remaining))
-        return removed
 
 
 # ── Format helpers ──────────────────────────────────────────────────────────

@@ -85,3 +85,14 @@ def test_ask_mode_allows_read_only_without_session() -> None:
     gate = PermissionGate("ask", extra_deny=[], session_attached=False)
     d = gate.evaluate(_NotesReadLike(), _NotesArgs(file="notes.md"))
     assert d.allowed and d.rule == "ask_non_destructive"
+
+
+def test_ask_mode_destructive_attached_needs_prompt() -> None:
+    # ADR-0006: with a session attached, a destructive tool in ask mode no
+    # longer auto-allows — it returns a tentative decision the runtime confirms
+    # interactively via the decision broker.
+    gate = PermissionGate("ask", extra_deny=[], session_attached=True)
+    d = gate.evaluate(_BashLike(), _BashArgs(command="echo hi"))
+    assert d.needs_prompt is True
+    assert d.allowed is False
+    assert d.rule == "ask_prompt"

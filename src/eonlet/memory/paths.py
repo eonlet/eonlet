@@ -24,20 +24,18 @@ def long_term_path(memory_dir: Path) -> Path:
     return memory_dir / "long_term.md"
 
 
-def notes_path(memory_dir: Path) -> Path:
-    return memory_dir / "notes.md"
-
-
-def todos_path(memory_dir: Path) -> Path:
-    return memory_dir / "todos.jsonl"
-
-
-def todos_archive_path(memory_dir: Path) -> Path:
-    return memory_dir / "todos.archive.jsonl"
-
-
 def index_db_path(memory_dir: Path) -> Path:
     return memory_dir / "index.sqlite"
+
+
+def knowledge_root(memory_dir: Path) -> Path:
+    """Root of the curated knowledge tree (ADR-0005, axis 2)."""
+    return memory_dir / "knowledge"
+
+
+def knowledge_index_path(memory_dir: Path) -> Path:
+    """The agent-curated map injected whole into every LLM call."""
+    return knowledge_root(memory_dir) / "index.md"
 
 
 def watermark_path(memory_dir: Path) -> Path:

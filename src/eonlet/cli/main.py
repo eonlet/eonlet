@@ -215,6 +215,29 @@ def tail(id_: str = typer.Argument(..., metavar="ID")) -> None:
 
 
 @app.command()
+def tasks(
+    id_: str = typer.Argument(..., metavar="ID"),
+    action: str = typer.Argument(
+        "ls", metavar="ACTION", help="ls | suspend | resume | cancel | prio"
+    ),
+    task_id: str | None = typer.Argument(None, metavar="TASK_ID"),
+    priority: int | None = typer.Argument(None, metavar="PRIORITY"),
+    status: str = typer.Option(
+        "all",
+        "--status",
+        "-s",
+        help="For 'ls': pending|active|suspended|blocked|done|cancelled|all.",
+    ),
+) -> None:
+    """Show an eonlet's task forest, or suspend/resume/cancel/reprioritize a task.
+
+    Examples: ``eonlet tasks acme.bot`` (tree); ``eonlet tasks acme.bot suspend
+    task-…``; ``eonlet tasks acme.bot prio task-… 9``.
+    """
+    commands.cmd_tasks(id_, action, task_id, priority, status)
+
+
+@app.command()
 def replay(
     id_: str = typer.Argument(..., metavar="ID"),
     from_: int | None = typer.Option(None, "--from", help="Starting event id."),
@@ -252,19 +275,6 @@ def import_cmd(
     from pathlib import Path
 
     commands.cmd_import(Path(archive), as_)
-
-
-@memory_app.command("migrate")
-def memory_migrate(
-    legacy_dir: str = typer.Argument(..., metavar="LEGACY_DIR"),
-    eonlet_id: str = typer.Option(..., "--eonlet", help="Target eonlet id."),
-    force: bool = typer.Option(False, "--force", help="Overwrite existing LTM."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
-) -> None:
-    """Migrate Claude Code auto-memory files into an eonlet's LTM."""
-    from pathlib import Path
-
-    commands.cmd_memory_migrate(Path(legacy_dir), eonlet_id, force=force, dry_run=dry_run)
 
 
 def cli_main() -> None:

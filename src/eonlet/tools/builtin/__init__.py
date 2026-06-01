@@ -1,23 +1,21 @@
 """Builtin tools shipped with Eonlet.
 
 Importing this package registers every offline-safe builtin via ``@tool``.
-Memory tools (``note`` / ``todo``) replace the legacy ``notes_read`` /
-``notes_append`` pair as of MEMORY_SPEC §5 (P2).
+The durable-knowledge write surface is the single ``knowledge`` tool
+(ADR-0005); it replaces the retired ``remember`` / ``note`` / ``forget`` trio.
 """
 
 from . import (  # noqa: F401
     bash,
     email,
     files,
-    forget,
+    knowledge,
     memory,
-    note,
     recall,
-    remember,
     schedule,
     skill_tool,
     sleep_tool,
-    todo,
+    task,
     web,
 )
 

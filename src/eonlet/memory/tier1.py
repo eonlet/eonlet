@@ -78,8 +78,8 @@ def compute_suggested_boundary(events: list[Event], cfg: MemoryConfig) -> int:
         return 0
     from .injection import _event_tokens
 
-    budget = cfg.conversation.working_memory_tokens
-    min_keep = cfg.conversation.keep_recent_messages_min
+    budget = cfg.episodic.working_memory_tokens
+    min_keep = cfg.episodic.keep_recent_messages_min
     floor_tokens = max(budget * 3 // 10, 1)
 
     preserved: list[Event] = []
@@ -114,6 +114,25 @@ def compute_suggested_boundary(events: list[Event], cfg: MemoryConfig) -> int:
     return boundary
 
 
+def snap_boundary_safe(events: list[Event], boundary: int) -> int:
+    """Pull ``boundary`` back to the nearest non-tool-pair event id ≤ boundary.
+
+    Used for the agent-proposed boundary (ADR-0006 M3): the model names a cut
+    point and we ensure it does not split a tool_call from its result. Unknown
+    ids pass through unchanged (validated by the caller).
+    """
+    idx = next((i for i, e in enumerate(events) if e.id == boundary), None)
+    if idx is None:
+        return boundary
+    while idx > 0 and events[idx].kind in (
+        EventKind.TOOL_CALL,
+        EventKind.TOOL_RESULT,
+        EventKind.TOOL_ERROR,
+    ):
+        idx -= 1
+    return events[idx].id or boundary
+
+
 # ── Orchestration ───────────────────────────────────────────────────────────
 
 
@@ -124,6 +143,8 @@ async def run_tier1(
     cfg: MemoryConfig,
     compactor: Compactor,
     record_event: RecordEventFn | None = None,
+    full: bool = False,
+    boundary: int | None = None,
 ) -> CompactionOutcome:
     """Run one tier-1 pass.
 
@@ -131,6 +152,18 @@ async def run_tier1(
     inside an agent; pass ``None`` for stand-alone invocation (tests / CLI
     that doesn't have a live AgentRuntime — though for v0.1 the worker
     always supplies it).
+
+    Boundary policy (ADR-0006), in precedence order:
+
+    - ``boundary`` set → use that explicit cut (tool-pair-snapped) — the
+      agent-proposed semantic compaction (M3).
+    - ``full=True`` → suggest the latest event so the whole working window is
+      summarized into STM and emptied — the user-forced "clean slate"
+      ``/compact``.
+    - otherwise → keep a ~30% tail (``compute_suggested_boundary``).
+
+    In all cases the compactor may move the boundary backwards, so the watermark
+    only ever advances to what was actually summarized (no data loss).
     """
     lock = _lock_for(memory_dir)
     async with lock:
@@ -150,7 +183,14 @@ async def run_tier1(
             # Nothing text-bearing to compact (e.g. only bookkeeping events).
             return CompactionOutcome(ran=False)
 
-        suggested = compute_suggested_boundary(events, cfg)
+        # Boundary policy (ADR-0006): explicit (agent-proposed) → full (clean
+        # slate) → tail (bounded auto).
+        if boundary is not None:
+            suggested = snap_boundary_safe(events, boundary)
+        elif full:
+            suggested = events[-1].id or 0
+        else:
+            suggested = compute_suggested_boundary(events, cfg)
         if suggested <= watermark:
             # Nothing on the non-tail side to compact.
             return CompactionOutcome(ran=False)

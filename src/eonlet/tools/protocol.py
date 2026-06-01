@@ -19,7 +19,9 @@ from typing import (
 
 if TYPE_CHECKING:
     from ..runtime.events import Event
+    from ..tasks import TaskForest
     from ..triggers.scheduler import CronScheduler
+    from ..web import HTTPFetcher
 
 import anyio
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,6 +46,11 @@ class ToolAnnotations(BaseModel):
 
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
 RecordEvent = Callable[["Event"], Awaitable["Event"]]
+# Read the live task-forest projection (ADR-0007). The runtime owns the forest
+# (folded from the event log) and exposes it read-only to tools so the ``task``
+# tool can answer ``list`` / validate parents / read current lifecycle without
+# re-reading the store. ``None`` outside the agent loop.
+ReadTasks = Callable[[], "TaskForest"]
 
 
 @dataclass(slots=True)
@@ -59,6 +66,21 @@ class ToolContext:
     memory_dir: Path
     skills: dict[str, Any]  # name -> Skill (for load_skill)
     env: dict[str, str]
+    # Workflow state dir (tasks/). Set by the worker; the `task` tool falls back
+    # to the memory-dir sibling when None (standalone tests).
+    tasks_dir: Path | None = None
+    # Read-only accessor for the live task forest (ADR-0007). Set by the runtime;
+    # ``None`` outside the agent loop (the `task` tool then can't list/transition).
+    read_tasks: ReadTasks | None = None
+    # The task this run is scoped to (ADR-0007 M2). Set by the scheduler while a
+    # task-scoped run is in flight; the `task` tool's done/cancel/update/add then
+    # default to it, so the agent says "done" without restating the id. ``None``
+    # for ordinary interactive/cron turns.
+    current_task_id: str | None = None
+    # Anti-runaway caps for `task` creation (ADR-0007 M4). 0 = unlimited. Set by
+    # the runtime from tasks.scheduling; bound subtree depth / children-per-node.
+    max_task_depth: int = 0
+    max_task_fanout: int = 0
     cancel_scope: anyio.CancelScope | None = None
     emit_event: EmitEvent | None = None
     # Append a memory/lifecycle event to the agent's store. Tools that mutate
@@ -67,6 +89,10 @@ class ToolContext:
     record_event: RecordEvent | None = None
     trigger_context: dict[str, Any] | None = None
     scheduler: CronScheduler | None = None  # set by worker; lets schedule tool mutate triggers
+    # Outbound HTTP client singleton — set by the worker for web_fetch /
+    # web_search. ``None`` in standalone tool tests; tools that need it
+    # assert and raise a project error on the ``None`` path.
+    http_fetcher: HTTPFetcher | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

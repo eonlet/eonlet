@@ -50,3 +50,56 @@ class BudgetExceededError(EonletError):
 
 class IPCError(EonletError):
     """JSON-RPC framing / transport error."""
+
+
+class WebError(EonletError):
+    """Root of web-subsystem errors (transport, extraction, SSRF)."""
+
+
+class SSRFRejectedError(WebError):
+    """Outbound HTTP target resolves to a forbidden network destination."""
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(f"{url}: {reason}")
+        self.url = url
+        self.reason = reason
+
+
+class UnsupportedSchemeError(WebError):
+    """URL scheme outside the allow-list (http / https only)."""
+
+    def __init__(self, url: str, scheme: str) -> None:
+        super().__init__(f"{url}: scheme {scheme!r} not allowed")
+        self.url = url
+        self.scheme = scheme
+
+
+class ResponseTooLargeError(WebError):
+    """Streaming response body exceeded ``max_bytes``."""
+
+    def __init__(self, url: str, max_bytes: int) -> None:
+        super().__init__(f"{url}: response exceeded {max_bytes} bytes")
+        self.url = url
+        self.max_bytes = max_bytes
+
+
+class HTTPFetchError(WebError):
+    """Wraps transport or status errors after retries are exhausted."""
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(f"{url}: {reason}")
+        self.url = url
+        self.reason = reason
+
+
+class KnowledgeError(EonletError):
+    """Root of knowledge-axis errors (ADR-0005)."""
+
+
+class KnowledgePathError(KnowledgeError):
+    """A knowledge path is absent, malformed, reserved, or escapes the tree root."""
+
+    def __init__(self, path: str, reason: str) -> None:
+        super().__init__(f"{path!r}: {reason}")
+        self.path = path
+        self.reason = reason

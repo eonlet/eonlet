@@ -294,8 +294,10 @@ tools:
   builtin:                              # list of builtin tool names
     - file_read
     - file_write
-    - notes_read
-    - notes_append
+    - knowledge
+    - task
+    - recall
+    - memory
     - web_search
     - web_fetch
     - send_email
@@ -305,7 +307,7 @@ tools:
   # mcp_servers: ./mcp.json             # v0.2+
 ```
 
-### Builtin tools (MVP — 13 tools)
+### Builtin tools
 
 | Tool | Annotations | Description |
 |---|---|---|
@@ -317,11 +319,14 @@ tools:
 | `grep` | read-only | Search file contents (ripgrep) |
 | `web_search` | read-only, network | Search the web |
 | `web_fetch` | read-only, network | Fetch a URL |
-| `notes_read` | read-only | Read from `memory/` markdown files |
-| `notes_append` | destructive | Append to `memory/` markdown files |
+| `recall` | read-only | Search event log / knowledge / tasks |
+| `memory` | — | Inspect/control episodic memory (show/compact/propose_compact/compact_ltm/pause/resume) |
+| `knowledge` | destructive | Curated knowledge base (open/list/write/edit/delete/move) |
+| `task` | destructive | Action items (add/list/done/cancel/update/delete) |
 | `send_email` | network | Send an email via configured SMTP |
 | `sleep` | read-only | Pause execution (for retry backoffs) |
 | `load_skill` | read-only | Load a skill's full body into context |
+| `schedule` | destructive | Create a one-off future trigger |
 
 See [`TOOL_SPEC.md`](TOOL_SPEC.md) for each tool's input schema and behavior.
 
@@ -403,19 +408,34 @@ Will add: `extra_allow` patterns, `read_only` mode, `plan` mode (no execution, j
 
 ---
 
-## 8. `memory` — optional
+## 8. `memory` — optional (dual-axis, ADR-0005)
 
-How the agent's memory subsystem is configured (see `MEMORY_SPEC.md` for the full spec).
+Memory has **two axes** (see ADR-0005). The **episodic** axis is the
+auto-compacted conversation timeline; the **knowledge** axis is a curated,
+never-auto-deleted tree of markdown files. Tasks are *not* memory — they have
+their own top-level `tasks` block (§8.1).
 
 ```yaml
 memory:
   enabled: true                          # set false to disable all memory (M-I8)
+  inject_turn_timestamps: true           # prefix each user message with its local datetime
 
-  conversation:
-    working_memory_tokens: 8000          # sliding window of raw events
+  episodic:                              # the conversation timeline (was `conversation`)
+    working_memory_tokens: 10000         # sliding window of raw events; tier-1 ceiling
     keep_recent_messages_min: 4          # always keep at least N turns
     short_term_tokens: 4000              # STM budget; tier-2 triggers when exceeded
     long_term_tokens: 8000               # LTM budget; tier-3 triggers when exceeded
+    auto_compact: true
+    # Agent-proposed semantic compaction (ADR-0006); interactive sessions only.
+    propose_semantic: true               # let the agent propose folding stale context
+    propose_floor_tokens: 5000           # don't propose below this working size
+    propose_min_interval_seconds: 1800   # cooldown (wall-clock) since the last compaction
+    propose_min_turns: 3                 # cooldown (turns) since the last compaction
+
+  knowledge:                             # the curated knowledge base
+    inject_index: true                   # inject knowledge/index.md (the map) every call
+    index_max_tokens: 2000               # warn if the map exceeds this
+    warn_file_tokens: 4000               # warn on an oversized single file
 
   compaction_model: claude-haiku-4-5-20251001  # model used for tier-1/2/3 compaction
 
@@ -429,28 +449,111 @@ memory:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `true` | Disable all memory writes and events (M-I8) |
-| `conversation.working_memory_tokens` | int | `8000` | Token budget for raw recent events injected as working memory |
-| `conversation.keep_recent_messages_min` | int | `4` | Minimum number of recent message turns always kept in working memory |
-| `conversation.short_term_tokens` | int | `4000` | STM token budget; tier-2 compaction runs when `tokens(short_term.md)` exceeds this |
-| `conversation.long_term_tokens` | int | `8000` | LTM token budget; tier-3 forgetting runs when `tokens(long_term.md)` exceeds this |
-| `compaction_model` | string | `"claude-haiku-4-5-20251001"` | Model used for tier-1, tier-2, and tier-3 compaction passes |
+| `inject_turn_timestamps` | bool | `true` | Prefix each user message rendered into the working window with its local datetime (render-time only; ADR-0006) |
+| `episodic.working_memory_tokens` | int | `10000` | Token budget for raw recent events injected as working memory; the tier-1 bounded-auto ceiling |
+| `episodic.keep_recent_messages_min` | int | `4` | Minimum number of recent message turns always kept in working memory |
+| `episodic.short_term_tokens` | int | `4000` | STM token budget; tier-2 compaction runs when `tokens(short_term.md)` exceeds this |
+| `episodic.long_term_tokens` | int | `8000` | LTM (episodic) budget; tier-3 forgetting runs when `tokens(long_term.md)` exceeds this |
+| `episodic.auto_compact` | bool | `true` | Whether tier-1 bounded-auto compaction fires automatically |
+| `episodic.propose_semantic` | bool | `true` | Let the agent propose a semantic compaction (interactive only; ADR-0006) |
+| `episodic.propose_floor_tokens` | int | `5000` | Below this working size, agent proposals are disallowed |
+| `episodic.propose_min_interval_seconds` | int | `1800` | Wall-clock cooldown since the last compaction before a new proposal |
+| `episodic.propose_min_turns` | int | `3` | Turn cooldown since the last compaction before a new proposal |
+| `knowledge.inject_index` | bool | `true` | Inject `knowledge/index.md` (the map) into every LLM call |
+| `knowledge.index_max_tokens` | int | `2000` | Warn when the injected map exceeds this |
+| `knowledge.warn_file_tokens` | int | `4000` | Warn when a single knowledge file exceeds this |
+| `compaction_model` | string | `"claude-haiku-4-5-20251001"` | Model used for tier-1/2/3 compaction passes |
 
 ### Memory layout per eonlet
 
 ```
-~/.eonlet/eonlets/<id>/memory/
-├── short_term.md       # compressed conversation summaries (STM)
-├── long_term.md        # durable knowledge (LTM)
-├── notes.md            # user-curated notes (never auto-deleted)
-├── todos.jsonl         # structured to-do items
-└── index.sqlite        # FTS5 recall index
+~/.eonlet/eonlets/<id>/
+├── memory/
+│   ├── short_term.md     # episodic STM (tier-1 target)
+│   ├── long_term.md      # episodic LTM — dated summaries only (tier-2/3 target)
+│   ├── knowledge/        # curated knowledge axis (never auto-deleted)
+│   │   ├── index.md      #   the agent-curated map; injected whole every call
+│   │   └── ...           #   one file per topic; bodies opened on demand
+│   └── index.sqlite      # FTS5 recall index over the event log
+└── tasks/
+    └── todos.jsonl       # action items — workflow state, NOT memory (§8.1)
 ```
 
 ### Removed legacy fields
 
-The fields `recent_messages_in_context` and `notes_files` (v0.0.x schema) are **removed**.
-The config loader raises `ConfigError` if either is present. Use `eonlet memory migrate` to
-convert Claude Code auto-memory files to the new LTM format.
+`recent_messages_in_context` and `notes_files` are removed (the loader raises
+`ConfigError`). The `memory.conversation` (→ `memory.episodic`), `memory.notes`,
+and `memory.todos` (→ top-level `tasks`) blocks are likewise gone. Pre-alpha
+has **no migration path** — rewrite `agent.yaml` to the current schema.
+
+---
+
+## 8.1. `tasks` — optional (ADR-0005 / ADR-0007)
+
+Action items / workflow state. A top-level block (not under `memory`) because
+tasks are *things the agent will do*, not *things it knows*. The forest is
+event-sourced (see [TASK_SPEC](TASK_SPEC.md)).
+
+```yaml
+tasks:
+  inject_pending: true                   # inject a <tasks> block of pending leaves each run
+  archive_done_after_days: 30            # 0 disables; else sweep done items to an archive
+  scheduling:                            # ADR-0007 — the task scheduler
+    enabled: false                       # run the task forest autonomously when idle
+    preempt: ask                         # off | ask | auto_by_priority
+    max_tree_depth: 5                    # anti-fork-bomb: max subtree depth (0 = unlimited)
+    max_fanout: 12                       # max children per task (0 = unlimited)
+    max_suspended: 8                     # cap the suspended backlog (0 = unlimited)
+    per_task_budget_tokens: 0            # 0 = inherit the run budget; else cap one task run
+    preempt_cooldown: 5m                 # anti-thrash window between preemptions
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `inject_pending` | bool | `true` | Inject pending leaf tasks as a `<tasks>` block (sibling of `<memory>`) |
+| `archive_done_after_days` | int | `30` | Archive done items older than N days (`0` disables) |
+| `scheduling.enabled` | bool | `false` | Drive the task forest autonomously (one task at a time) |
+| `scheduling.preempt` | enum | `ask` | Preemption policy: `off` / `ask` (consent) / `auto_by_priority` |
+| `scheduling.max_tree_depth` | int | `5` | Reject subtasks beyond this depth (`0` = unlimited) |
+| `scheduling.max_fanout` | int | `12` | Reject subtasks beyond this many children (`0` = unlimited) |
+| `scheduling.max_suspended` | int | `8` | Cancel a no-progress yield when this many are suspended (`0` = unlimited) |
+| `scheduling.per_task_budget_tokens` | int | `0` | Cap one task-scoped run's tokens (`0` = inherit run budget) |
+| `scheduling.preempt_cooldown` | duration | `5m` | Minimum interval between preemptions |
+
+Scheduled (cron/autonomous) agents should set `preempt: off`; interactive agents
+default to `preempt: ask`. See [TASK_SPEC](TASK_SPEC.md) for the full model.
+
+---
+
+## 8.5. `web` — optional (ADR-0004, v0.1)
+
+Per-agent overrides for the `web_fetch` tool's HTTP transport. The `web_search`
+tool has no config block — provider selection is by `TAVILY_API_KEY` env-var
+presence (Tavily when set, DuckDuckGo HTML scrape otherwise).
+
+```yaml
+web:
+  fetch:
+    max_bytes: 10485760              # 10 MB cap on the raw response body
+    max_tokens_per_call: 4000        # default pagination window (200–20000)
+    timeout_seconds: 30              # per-request HTTP timeout
+    allow_private_networks: false    # SSRF escape hatch — see SECURITY.md
+    user_agent: null                 # null → "Eonlet/<version> (+https://eonlet.dev)"
+```
+
+### Field reference
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `max_bytes` | int | `10485760` | Raw response cap; streaming aborts past it. |
+| `max_tokens_per_call` | int (200–20000) | `4000` | Default `max_tokens` arg on `web_fetch`. |
+| `timeout_seconds` | float | `30.0` | Per-request HTTP timeout. |
+| `allow_private_networks` | bool | `false` | When `true`, accepts loopback / RFC1918 / CGNAT targets. **Cloud-metadata endpoints (169.254.169.254, etc.) and link-local addresses remain blocked regardless** — they're load-bearing for SSRF defence. |
+| `user_agent` | string \| null | `null` | Override the default Eonlet User-Agent header. |
+
+The SSRF guard, retry policy (3 attempts on 5xx / transport errors with
+0.5 / 1 / 2 s backoff; no retry on 4xx), and scheme allow-list (`http`,
+`https`) are hardcoded — there's no knob to disable them.
 
 ---
 
@@ -558,7 +661,7 @@ metadata:
   specialty: general_assistance
   capabilities:
     - "general.conversation"
-    - "manage.notes"
+    - "manage.knowledge"
 
 runtime:
   model: claude-sonnet-4-6
@@ -568,17 +671,22 @@ runtime:
 
 tools:
   builtin: [bash, file_read, file_write, file_edit, glob, grep,
-            web_search, web_fetch, note, todo, recall, remember, forget, load_skill]
+            web_search, web_fetch, knowledge, task, recall, memory, load_skill]
 
 permissions:
   mode: ask
 
 memory:
   enabled: true
-  conversation:
-    working_memory_tokens: 8000
+  episodic:
+    working_memory_tokens: 10000
     short_term_tokens: 4000
     long_term_tokens: 8000
+  knowledge:
+    inject_index: true
+
+tasks:
+  inject_pending: true
 ```
 
 Plus `system.md` with the agent's instructions.
@@ -617,7 +725,7 @@ triggers:
       and email me.
 
 tools:
-  builtin: [file_read, file_write, note, recall, send_email]
+  builtin: [file_read, file_write, knowledge, task, recall, send_email]
   custom:
     - ./tools/x_timeline.py
 
@@ -655,7 +763,7 @@ lifecycle:
 - All `tools.custom` paths exist and are valid Python
 - All `tools.builtin` names are in the registry
 - Permission patterns syntactically valid
-- Memory `notes_files` are paths (no traversal)
+- Knowledge tool paths stay within `memory/knowledge/` (no `..` traversal)
 - Env-referenced variables (`${VAR}`) exist somewhere in `env.required + env.optional`
 
 Errors are reported with file:line where possible.
