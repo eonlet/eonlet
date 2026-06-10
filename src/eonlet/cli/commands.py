@@ -699,6 +699,12 @@ async def _event_printer(client: IPCClient, pending: _DecisionPrompt, scope: _Vi
                 continue
             show_tools = scope.task_id is not None or scope.verbose_tools
             if kind == "user_message":
+                # A <task_result> envelope (a completed root's result, surfaced
+                # into chat as a user-role event) triggers no run — show no
+                # thinking spinner (the outcome is already printed via the
+                # task_transitioned line). Just record that work finished.
+                if str(payload.get("content", "")).startswith("<task_result"):
+                    continue
                 # Show thinking indicator as soon as the worker accepts the
                 # message — before the first token arrives.
                 _ensure_thinking_line()

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -544,7 +544,7 @@ class AgentRuntime:
                     reasoning_content=m.reasoning_content,
                 )
             )
-        return out
+        return _coalesce_user_messages(out)
 
     def _build_system_prompt(self) -> str:
         parts = [self.definition.system_prompt.rstrip()]
@@ -623,6 +623,30 @@ class AgentRuntime:
 
 
 # ── module helpers ───────────────────────────────────────────────────────────
+
+
+def _coalesce_user_messages(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """Merge adjacent plain-user messages so role strictly alternates.
+
+    Most providers (Anthropic in particular) require user/assistant turns to
+    alternate. Normally they do — every user turn draws an assistant reply —
+    but a user-role event can land with no assistant turn after it: a
+    ``<task_result>`` envelope (recorded when a background task completes), or
+    a user message whose run aborted on an LLM error. Two such in a row (or one
+    followed by a real user message) would be consecutive user turns and 400 on
+    Anthropic. A plain user message carries no tool_calls / tool_call_id, so
+    merging their text is lossless.
+    """
+    out: list[LLMMessage] = []
+    for m in messages:
+        plain_user = m.role == "user" and not m.tool_calls and m.tool_call_id is None
+        if plain_user and out:
+            prev = out[-1]
+            if prev.role == "user" and not prev.tool_calls and prev.tool_call_id is None:
+                out[-1] = replace(prev, content=f"{prev.content}\n\n{m.content}")
+                continue
+        out.append(m)
+    return out
 
 
 def _args_preview(args: Any, limit: int = 120) -> str:

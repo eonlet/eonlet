@@ -616,3 +616,30 @@ def test_task_scoped_run_skips_tasks_block(tmp_path: Path) -> None:
 
     anyio.run(chat)
     assert "<tasks>" in rec.last_system and "OTHER-BACKLOG-ITEM" in rec.last_system
+
+
+def test_consecutive_user_messages_coalesced(tmp_path: Path) -> None:
+    # A <task_result> envelope is a user message with no assistant turn after
+    # it; two in a row (or one + a real user message) must not reach the
+    # provider as consecutive user turns (Anthropic 400s). They're merged.
+    from eonlet.runtime.events import user_message
+
+    runtime, rec = _build_runtime(tmp_path)
+
+    async def go() -> None:
+        # Simulate two completed-root envelopes landing with no run between.
+        await runtime._record(user_message('<task_result id="a">A</task_result>'))
+        await runtime._record(user_message('<task_result id="b">B</task_result>'))
+        async for _ in runtime.handle_user_message("now the user speaks"):
+            pass
+
+    anyio.run(go)
+    # No two adjacent user-role messages in what the provider received.
+    roles = [m.role for m in rec.last_messages]
+    for i in range(len(roles) - 1):
+        assert not (roles[i] == "user" and roles[i + 1] == "user"), roles
+    # And the merged content carries all three pieces.
+    merged = "\n".join(m.content for m in rec.last_messages if m.role == "user")
+    assert "task_result id=\"a\"" in merged
+    assert "task_result id=\"b\"" in merged
+    assert "now the user speaks" in merged
