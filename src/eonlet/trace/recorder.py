@@ -82,6 +82,8 @@ def fold_line(records: list[dict[str, Any]], line_id: str) -> dict[str, Any]:
     Returns ``{"line", "parent", "system", "messages", "hashes", "records"}``
     where ``messages``/``hashes`` are the concatenation up to the line's last
     record and ``system`` is the last non-null system prompt seen on the line.
+    ``response`` records stay in ``records`` but never enter the context fold
+    — they describe what came *back*, not what was sent.
     """
     own = [r for r in records if r.get("line") == line_id]
     messages: list[dict[str, Any]] = []
@@ -89,6 +91,8 @@ def fold_line(records: list[dict[str, Any]], line_id: str) -> dict[str, Any]:
     system = ""
     parent: dict[str, Any] | None = None
     for r in own:
+        if r.get("kind") == "response":
+            continue
         if r.get("kind") == "root":
             messages = list(r.get("messages") or [])
             hashes = list(r.get("hashes") or [])
@@ -126,6 +130,7 @@ class ContextTracer:
         self._line: str | None = None
         self._hashes: list[str] = []
         self._system_hash: str | None = None
+        self._request_seq: int | None = None
         self._restore()
 
     # ── public API ────────────────────────────────────────────────────────
@@ -188,6 +193,32 @@ class ContextTracer:
         self._line = line
         self._hashes = hashes
         self._system_hash = system_hash
+        self._request_seq = self._seq
+        return rec
+
+    def record_response(self, message: LLMMessage) -> dict[str, Any] | None:
+        """Record the assistant reply to the last recorded request.
+
+        A ``response`` record is pure observability glue: it carries the reply
+        that would otherwise only surface in the *next* request's delta — and
+        never surfaces at all for the final turn of a run. It does not touch
+        the lineage state (``_hashes``), so it can never cause a fork; viewers
+        dedupe the same reply out of the following delta by ``hash``.
+        """
+        if self._line is None or self._request_seq is None:
+            return None  # no request on file to attach to
+        serialized = serialize_message(message)
+        self._seq += 1
+        rec: dict[str, Any] = {
+            "seq": self._seq,
+            "ts": datetime.now(UTC).isoformat(),
+            "line": self._line,
+            "kind": "response",
+            "for_seq": self._request_seq,
+            "message": serialized,
+            "hash": _fingerprint(serialized),
+        }
+        self._append(rec)
         return rec
 
     # ── internal ──────────────────────────────────────────────────────────
@@ -196,16 +227,22 @@ class ContextTracer:
         records = read_trace(self.path)
         if not records:
             return
-        last = records[-1]
         self._seq = max(int(r.get("seq") or 0) for r in records)
-        line_id = last.get("line")
+        # Anchor the cursor on the last *request* record — a trailing response
+        # carries no line context or system hash of its own.
+        last_req = next((r for r in reversed(records) if r.get("kind") in ("root", "delta")), None)
+        if last_req is None:
+            return
+        line_id = last_req.get("line")
         if not isinstance(line_id, str):
             return
         folded = fold_line(records, line_id)
         self._line = line_id
         self._hashes = list(folded["hashes"])
-        sys_hash = last.get("system_hash")
+        sys_hash = last_req.get("system_hash")
         self._system_hash = sys_hash if isinstance(sys_hash, str) else None
+        seq = last_req.get("seq")
+        self._request_seq = seq if isinstance(seq, int) else None
 
     def _append(self, rec: dict[str, Any]) -> None:
         # Plain append, not atomic_write_text: this is an append-only log like

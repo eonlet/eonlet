@@ -2373,7 +2373,8 @@ def cmd_trace(
 
         out = Path(html_path)
         out.write_text(render_html(records, title=f"{eid} · context trace"), encoding="utf-8")
-        console.print(f"wrote {out} — {len(records)} call(s); open it in a browser")
+        n_calls = sum(1 for r in records if r.get("kind") != "response")
+        console.print(f"wrote {out} — {n_calls} call(s); open it in a browser")
         return
     if json_out:
         for r in records:
@@ -2411,13 +2412,15 @@ def _trace_print_tree(records: list[dict[str, Any]]) -> None:
 
     def label(ln: str) -> str:
         recs = by_line[ln]
+        reqs = [r for r in recs if r.get("kind") != "response"]
         first, last = recs[0], recs[-1]
+        last_req = reqs[-1] if reqs else last
         span = f"seq {first['seq']}-{last['seq']}" if len(recs) > 1 else f"seq {first['seq']}"
         when = str(first.get("ts", ""))[:19]
-        scope = f" · task {last['task_id']}" if last.get("task_id") else ""
+        scope = f" · task {last_req['task_id']}" if last_req.get("task_id") else ""
         return (
-            f"[bold]{ln}[/]  {len(recs)} call(s) · {span} · "
-            f"{last.get('n_messages', '?')} msgs · {when}{scope}"
+            f"[bold]{ln}[/]  {len(reqs)} call(s) · {span} · "
+            f"{last_req.get('n_messages', '?')} msgs · {when}{scope}"
         )
 
     tree = Tree(f"context trace — {len(records)} calls, {len(by_line)} lines")
@@ -2444,9 +2447,9 @@ def _trace_print_line(records: list[dict[str, Any]], line_id: str) -> None:
     if parent:
         console.print(f"[dim]forked from {parent.get('line')} at seq {parent.get('seq')}[/]")
     console.print(f"[bold cyan]── system ──[/]\n{folded['system']}")
-    for i, m in enumerate(folded["messages"], start=1):
-        role = m.get("role", "?")
-        console.print(f"\n[bold cyan]── {i}. {role} ──[/]")
+
+    def print_message(m: dict[str, Any], heading: str) -> None:
+        console.print(f"\n[bold cyan]── {heading} ──[/]")
         if m.get("content"):
             console.print(m["content"], markup=False)
         for tc in m.get("tool_calls") or []:
@@ -2454,6 +2457,14 @@ def _trace_print_line(records: list[dict[str, Any]], line_id: str) -> None:
         if m.get("tool_call_id"):
             err = " [red](error)[/]" if m.get("is_error") else ""
             console.print(f"[dim]↳ result for {m['tool_call_id']}{err}[/]")
+
+    for i, m in enumerate(folded["messages"], start=1):
+        print_message(m, f"{i}. {m.get('role', '?')}")
+    # The line's trailing reply (a ``response`` record) is not part of any
+    # request context yet — without this, the run's last turn is invisible.
+    tail = folded["records"][-1]
+    if tail.get("kind") == "response" and isinstance(tail.get("message"), dict):
+        print_message(tail["message"], f"reply to seq {tail.get('for_seq')}")
 
 
 def _parse_env_lines(lines: list[str]) -> dict[str, str]:

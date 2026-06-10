@@ -7,6 +7,12 @@ token contexts, jump between fork points, and diff a line against where it
 forked from. This mirrors the claude-trace deliverable (a single HTML file
 you open locally) while staying inside the project's minimal-deps rule.
 
+Rendering layout per line: system-prompt versions live in their own section
+at the top (one collapsible entry per change), the conversation below shows
+each call's delta with the reply (``response`` record) inline — deduped by
+hash against the next delta — and tool results nested under the tool call
+they answer.
+
 The only subtle part is embedding: record content is user/model text and may
 contain ``</script>``. The JSON payload therefore escapes every ``</`` as
 ``<\\/`` (legal, identical JSON) so the data block can never terminate the
@@ -51,6 +57,10 @@ h1 { font-size:15px; margin:0 0 4px; }
 .ln .id { color:var(--accent); }
 .ln .meta { color:var(--dim); font-size:11.5px; }
 .fork { border-left:1px dashed var(--line); margin-left:11px; padding-left:9px; }
+.syssec { border:1px solid var(--line); border-radius:6px; background:var(--panel);
+          padding:8px 12px; margin:14px 0 4px; }
+.syssec .sechdr { font-size:11.5px; color:var(--dim); text-transform:uppercase;
+                  letter-spacing:.04em; }
 .sep { display:flex; align-items:center; gap:8px; color:var(--dim); font-size:11.5px; margin:22px 0 8px; }
 .sep::after { content:""; flex:1; border-top:1px dashed var(--line); }
 .sep b { color:var(--fg); }
@@ -63,9 +73,13 @@ h1 { font-size:15px; margin:0 0 4px; }
 .msg.assistant { border-left-color:var(--assistant); }
 .msg.tool { border-left-color:var(--tool); }
 .msg.error { border-left-color:var(--err); }
+.msg.reply { border-style:dashed; border-left-style:solid; }
 .tc { margin-top:6px; padding:6px 8px; background:#11131a; border-radius:5px;
       font-size:12.5px; white-space:pre-wrap; word-break:break-word; }
 .tc .name { color:var(--tool); }
+.tr { border-top:1px dashed var(--line); margin-top:6px; padding-top:6px; }
+.tr .trh { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em; }
+.tr.err .trh { color:var(--err); }
 details { margin:6px 0; }
 summary { cursor:pointer; color:var(--dim); font-size:12.5px; }
 details > pre { background:#11131a; border:1px solid var(--line); border-radius:6px;
@@ -84,6 +98,7 @@ details > pre { background:#11131a; border:1px solid var(--line); border-radius:
 <div id="main"><div id="linehdr"></div><div id="content"></div></div>
 <script>
 const RECORDS = __DATA__;
+const isRequest = (r) => r.kind === "root" || r.kind === "delta";
 
 // ── group records into lines, derive the fork tree ──────────────────────────
 const byLine = new Map();
@@ -101,8 +116,9 @@ for (const [ln, recs] of byLine) {
     roots.push(ln);
   }
 }
+const nCalls = RECORDS.filter(isRequest).length;
 document.getElementById("stats").textContent =
-  RECORDS.length + " calls \\u00b7 " + byLine.size + " lines";
+  nCalls + " calls \\u00b7 " + byLine.size + " lines";
 
 // ── tiny DOM helpers (textContent only — record data is never HTML) ─────────
 function el(tag, cls, text) {
@@ -114,22 +130,24 @@ function el(tag, cls, text) {
 function fmtTs(ts) { return (ts || "").slice(0, 19).replace("T", " "); }
 function lineInfo(ln) {
   const recs = byLine.get(ln);
+  const reqs = recs.filter(isRequest);
   const first = recs[0], last = recs[recs.length - 1];
+  const lastReq = reqs.length ? reqs[reqs.length - 1] : last;
   const span = first.seq === last.seq
     ? "seq " + first.seq
     : "seq " + first.seq + "-" + last.seq;
-  return { recs, first, last, span };
+  return { recs, reqs, first, last, lastReq, span };
 }
 
 // ── sidebar tree ─────────────────────────────────────────────────────────────
 function buildTree(ln, container) {
-  const { recs, first, last, span } = lineInfo(ln);
+  const { reqs, first, lastReq, span } = lineInfo(ln);
   const node = el("div", "ln");
   node.id = "side-" + ln;
   node.appendChild(el("div", "id", ln));
-  let meta = recs.length + " call(s) \\u00b7 " + span + " \\u00b7 "
-           + last.n_messages + " msgs \\u00b7 " + fmtTs(first.ts);
-  if (last.task_id) meta += " \\u00b7 task " + last.task_id;
+  let meta = reqs.length + " call(s) \\u00b7 " + span + " \\u00b7 "
+           + lastReq.n_messages + " msgs \\u00b7 " + fmtTs(first.ts);
+  if (lastReq.task_id) meta += " \\u00b7 task " + lastReq.task_id;
   node.appendChild(el("div", "meta", meta));
   node.onclick = () => show(ln);
   container.appendChild(node);
@@ -144,13 +162,36 @@ const tree = document.getElementById("tree");
 for (const r of roots) buildTree(r, tree);
 
 // ── line view ────────────────────────────────────────────────────────────────
-function renderMessage(m, idx) {
-  const box = el("div", "msg " + (m.is_error ? "error" : m.role));
+function renderToolResult(m, chip) {
+  const wrap = el("div", "tr" + (m.is_error ? " err" : ""));
+  const content = m.content || "";
+  wrap.appendChild(el("div", "trh", "result" + (m.is_error ? " \\u00b7 ERROR" : "")));
+  if (content.length > 1200) {
+    const d = el("details");
+    d.appendChild(el("summary", null, content.length + " chars (click to expand)"));
+    d.appendChild(el("pre", null, content));
+    wrap.appendChild(d);
+  } else if (content) {
+    wrap.appendChild(el("pre", null, content));
+  }
+  chip.appendChild(wrap);
+}
+
+function renderMessage(m, idx, chips, replyFor) {
+  const box = el("div", "msg " + (m.is_error ? "error" : m.role)
+                        + (replyFor ? " reply" : ""));
   let hdr = "#" + idx + " " + m.role;
+  if (replyFor) hdr += " \\u00b7 reply to seq " + replyFor;
   if (m.tool_call_id) {
     hdr += " \\u00b7 result for " + m.tool_call_id + (m.is_error ? " \\u00b7 ERROR" : "");
   }
   box.appendChild(el("div", "hdr", hdr));
+  if (m.reasoning_content) {
+    const d = el("details");
+    d.appendChild(el("summary", null, "reasoning (" + m.reasoning_content.length + " chars)"));
+    d.appendChild(el("pre", null, m.reasoning_content));
+    box.appendChild(d);
+  }
   const content = m.content || "";
   const isResult = m.role === "tool" || m.tool_call_id;
   if (content.length > 1200 && isResult) {
@@ -166,6 +207,7 @@ function renderMessage(m, idx) {
     t.appendChild(el("span", "name", tc.name));
     t.appendChild(document.createTextNode("(" + JSON.stringify(tc.arguments) + ")"));
     box.appendChild(t);
+    if (tc.id) chips.set(tc.id, t);
   }
   return box;
 }
@@ -185,11 +227,11 @@ function show(ln) {
   hdr.textContent = "";
   content.textContent = "";
 
-  const { recs, first, last, span } = lineInfo(ln);
+  const { recs, reqs, first, last, lastReq, span } = lineInfo(ln);
   hdr.appendChild(el("h1", null, ln));
   const meta = el("div", "dim");
-  meta.append(recs.length + " call(s) \\u00b7 " + span + " \\u00b7 model "
-              + (last.model || "?") + " \\u00b7 " + fmtTs(first.ts) + " \\u2192 " + fmtTs(last.ts));
+  meta.append(reqs.length + " call(s) \\u00b7 " + span + " \\u00b7 model "
+              + (lastReq.model || "?") + " \\u00b7 " + fmtTs(first.ts) + " \\u2192 " + fmtTs(last.ts));
   const p = recs[0].parent;
   if (p && p.line) {
     meta.append(" \\u00b7 ");
@@ -199,25 +241,56 @@ function show(ln) {
   }
   hdr.appendChild(meta);
 
+  // System prompt versions — their own section, outside the conversation.
+  const sysVersions = recs.filter((r) => r.system != null);
+  if (sysVersions.length) {
+    const sec = el("div", "syssec");
+    sec.appendChild(el("div", "sechdr",
+                       "system prompt \\u00b7 " + sysVersions.length + " version(s)"));
+    sysVersions.forEach((r, i) => {
+      const d = el("details");
+      d.appendChild(el("summary", null, "v" + (i + 1) + " @ seq " + r.seq
+                                        + " \\u00b7 " + r.system.length + " chars"));
+      d.appendChild(el("pre", null, r.system));
+      sec.appendChild(d);
+    });
+    content.appendChild(sec);
+  }
+
+  // Conversation: deltas + inline replies; tool results nest under their call.
+  const chips = new Map();      // tool_call_id → .tc element
+  let lastReplyHash = null;     // dedupe the reply out of the next delta
   let idx = 0;
   for (const r of recs) {
+    if (r.kind === "response") {
+      idx += 1;
+      content.appendChild(renderMessage(r.message, idx, chips, r.for_seq));
+      lastReplyHash = r.hash;
+      continue;
+    }
     const sep = el("div", "sep");
     const lbl = el("span");
     lbl.append("call ");
     lbl.appendChild(el("b", null, "seq " + r.seq));
-    lbl.append(" \\u00b7 " + r.kind + " \\u00b7 " + fmtTs(r.ts)
-               + " \\u00b7 context " + r.n_messages + " msgs");
+    let txt = " \\u00b7 " + r.kind + " \\u00b7 " + fmtTs(r.ts)
+            + " \\u00b7 context " + r.n_messages + " msgs";
+    if (r.system != null && r.kind === "delta") txt += " \\u00b7 system updated";
+    lbl.append(txt);
     sep.appendChild(lbl);
     content.appendChild(sep);
-    if (r.system != null) {
-      const d = el("details");
-      d.appendChild(el("summary", null, "system prompt (" + r.system.length + " chars)"
-                                        + (r.kind === "delta" ? " \\u2014 updated" : "")));
-      d.appendChild(el("pre", null, r.system));
-      content.appendChild(d);
-    }
-    const msgs = r.messages || [];
-    for (const m of msgs) { idx += 1; content.appendChild(renderMessage(m, idx)); }
+    const msgs = r.messages || [], hs = r.hashes || [];
+    msgs.forEach((m, i) => {
+      if (r.kind === "delta" && lastReplyHash && hs[i] === lastReplyHash) {
+        lastReplyHash = null;   // already on screen as the reply above
+        return;
+      }
+      if (m.tool_call_id && chips.has(m.tool_call_id)) {
+        renderToolResult(m, chips.get(m.tool_call_id));
+        return;
+      }
+      idx += 1;
+      content.appendChild(renderMessage(m, idx, chips));
+    });
     if (!msgs.length) {
       content.appendChild(el("div", "note", "(no new messages \\u2014 identical context)"));
     }

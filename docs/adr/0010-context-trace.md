@@ -74,11 +74,15 @@ it as prefix-breaking would fork a line per turn. Each record carries
 `system_hash`; the full text is stored only when the hash differs from the
 previous record on the same line.
 
-Responses are **not** recorded separately: along a line, turn N's assistant
-reply (and tool results) appear verbatim in record N+1's delta, and the final
-reply of a run is already persisted as an `assistant_message` event. Recording
-happens *before* the provider call, so the context survives even a crash
-mid-call.
+Each request is followed by a lightweight **`response` record** carrying the
+assistant reply. Along a line, turn N's reply does reappear in record N+1's
+delta — but the *final* reply of a run never would, so without response
+records the most interesting message of every run is invisible. Response
+records carry **no lineage state**: they never enter the prefix check (so a
+reply can never cause a fork), and readers dedupe the reply out of the
+following delta by its `hash`. Request recording still happens *before* the
+provider call, so the context survives even a crash mid-call; the response is
+appended when the stream completes.
 
 ### 3. Record schema (one JSON object per line)
 
@@ -88,7 +92,7 @@ mid-call.
 | `ts` | str | ISO-8601 UTC timestamp of the request |
 | `line` | str | Line id — `ln-<YYYY-MM-DD>-<4hex>` (ADR-0002 id shape) |
 | `parent` | `{line, seq}` \| null | Fork origin; null on the very first line |
-| `kind` | `"root"` \| `"delta"` | Full snapshot vs appended suffix |
+| `kind` | `"root"` \| `"delta"` \| `"response"` | Full snapshot vs appended suffix vs reply (see below) |
 | `model` | str | Provider model string |
 | `task_id` | str \| null | Scope of the run (ADR-0009), for filtering |
 | `n_messages` | int | Total messages in the full context of this request |
@@ -98,10 +102,18 @@ mid-call.
 | `messages` | list | Serialized `LLMMessage`s — all (root) or suffix (delta) |
 | `hashes` | list[str] | Fingerprints of exactly the messages in this record |
 
+`response` records are smaller:
+`{seq, ts, line, kind: "response", for_seq, message, hash}` — `for_seq` points
+at the request answered, `message` is the serialized assistant reply, and
+`hash` is its fingerprint (equal to the same message's hash in the following
+delta, which is how readers dedupe). They share the global `seq` counter but
+never enter the context fold.
+
 A line's full context at `seq` N = concatenation of its root record's messages
 plus every delta on the line up to N. Restart restore folds exactly this from
-the existing file; corrupt trailing lines (crash mid-append) are skipped with a
-warning and the next record simply roots a new line.
+the existing file (anchoring on the last *request* record); corrupt trailing
+lines (crash mid-append) are skipped with a warning and the next record simply
+roots a new line.
 
 ### 4. Configuration & surfaces
 
@@ -124,9 +136,12 @@ eonlet trace <id> --html PATH  # self-contained HTML viewer (embedded data +
 
 The HTML export is the human-scale reader (`trace/html.py`): reading
 multi-thousand-token contexts, comparing across forks, and scanning
-system-prompt changes outgrow the terminal quickly. Embedding is
-breakout-safe (`</` → `<\/` in the JSON payload; all record data rendered
-via ``textContent``, never as HTML).
+system-prompt changes outgrow the terminal quickly. Per line it renders
+system-prompt versions in their own section (one collapsible entry per
+change), the conversation with each call's reply inline (deduped against the
+next delta by hash), and tool results nested under the tool call they answer.
+Embedding is breakout-safe (`</` → `<\/` in the JSON payload; all record data
+rendered via ``textContent``, never as HTML).
 
 ## Alternatives considered
 

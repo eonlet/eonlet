@@ -34,6 +34,11 @@ context rewrites):
   loop), and `trace/` is deletable at any time. Recording happens *before*
   the provider call, so the context survives a crash mid-stream. A worker
   restart folds the existing file to continue the current line.
+- **`response` records** — each request is followed by a lightweight record
+  of the assistant reply (`for_seq`, serialized message, hash). Without it
+  the *final* turn of a run is invisible (it never appears in a following
+  delta). Responses carry no lineage state — they can never cause a fork;
+  viewers dedupe the reply out of the next delta by hash.
 - **`trace` config block** (`agent.yaml`, default `enabled: false`) and
   **`eonlet trace <id>`** offline viewer: lineage tree by default,
   `--line <ln>` folds one line into the full untruncated context, `--json`
@@ -41,12 +46,13 @@ context rewrites):
 - **`--html PATH` viewer export** (`trace/html.py`) — one self-contained,
   dependency-free HTML file (embedded JSON + vanilla JS/CSS, the claude-trace
   deliverable shape): sidebar lineage tree, per-call delta separators,
-  role-colored messages, collapsible system prompts / long tool results,
+  role-colored messages with each call's reply inline, tool results nested
+  under the tool call they answer, per-line system-prompt version section,
   clickable fork-origin links. Breakout-safe embedding (`</` → `<\/`;
   records rendered via `textContent` only).
-- **Tests**: new `tests/unit/trace/` (recorder lineage semantics, runtime
-  wiring incl. watermark-induced fork, HTML embedding + escaping).
-  Total: 683 tests; ruff + mypy clean.
+- **Tests**: new `tests/unit/trace/` (recorder lineage + response semantics,
+  runtime wiring incl. watermark-induced fork, HTML embedding + escaping).
+  Total: 690 tests; ruff + mypy clean.
 
 ### Fixed — plan-§5 leftover sweep ([docs/plans/task-context-management.md](docs/plans/task-context-management.md) §5)
 

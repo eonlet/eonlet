@@ -491,15 +491,17 @@ eonlet trace <id> --html out.html  # write a self-contained HTML viewer
 
 `--html` produces a single dependency-free file (embedded data + vanilla
 JS/CSS — the claude-trace deliverable shape): a sidebar lineage tree, per-call
-delta separators, role-colored messages, collapsible system prompts and long
-tool results, and clickable fork-origin links. Open it in any browser; share
-or archive it as one file.
+delta separators, role-colored messages, each call's reply inline, tool
+results nested under the tool call they answer, system-prompt versions in
+their own section per line, and clickable fork-origin links. Open it in any
+browser; share or archive it as one file.
 
 Each *line* is an unbroken run of requests where the context only grew at the
 tail. A fork in the tree is a context rewrite: episodic compaction, a
 user-forced `/compact`, a working-window slide, or a task-scope switch. The
 `--line` form answers "what exactly did the model see" — system prompt and
-every message, untruncated, in the order the provider received them.
+every message, untruncated, in the order the provider received them, plus the
+run's trailing reply (which is not part of any request context yet).
 
 ### `eonlet export <id>`
 

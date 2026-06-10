@@ -116,6 +116,71 @@ def test_tool_calls_participate_in_fingerprint(tmp_path: Path) -> None:
     assert r2["kind"] == "root"  # same shape, different arguments → rewrite
 
 
+# ── responses ────────────────────────────────────────────────────────────────
+
+
+def test_record_response_appends_on_current_line(tmp_path: Path) -> None:
+    t = _tracer(tmp_path)
+    req = t.record(system="sys", messages=_msgs("hi"))
+    rec = t.record_response(LLMMessage(role="assistant", content="hello!"))
+    assert rec is not None
+    assert rec["kind"] == "response"
+    assert rec["line"] == req["line"]
+    assert rec["for_seq"] == req["seq"]
+    assert rec["seq"] == req["seq"] + 1
+    assert rec["message"]["content"] == "hello!"
+    assert rec["hash"]
+
+
+def test_record_response_without_request_is_a_noop(tmp_path: Path) -> None:
+    t = _tracer(tmp_path)
+    assert t.record_response(LLMMessage(role="assistant", content="orphan")) is None
+    assert not (tmp_path / "trace" / TRACE_FILENAME).exists()
+
+
+def test_response_does_not_affect_lineage(tmp_path: Path) -> None:
+    # The reply reappears verbatim in the next request — the next record must
+    # still be a delta on the same line, never a fork caused by the response.
+    t = _tracer(tmp_path)
+    r1 = t.record(system="sys", messages=_msgs("hi"))
+    t.record_response(LLMMessage(role="assistant", content="yo"))
+    r2 = t.record(system="sys", messages=_msgs("hi", "yo"))
+    assert r2["kind"] == "delta"
+    assert r2["line"] == r1["line"]
+    assert [m["content"] for m in r2["messages"]] == ["yo"]
+
+
+def test_response_hash_matches_next_delta_hash(tmp_path: Path) -> None:
+    # Viewers dedupe the reply out of the following delta by this equality.
+    t = _tracer(tmp_path)
+    t.record(system="sys", messages=_msgs("hi"))
+    resp = t.record_response(LLMMessage(role="assistant", content="yo"))
+    r2 = t.record(system="sys", messages=_msgs("hi", "yo"))
+    assert resp is not None
+    assert r2["hashes"][0] == resp["hash"]
+
+
+def test_fold_line_excludes_responses_from_context(tmp_path: Path) -> None:
+    t = _tracer(tmp_path)
+    r1 = t.record(system="sys", messages=_msgs("hi"))
+    t.record_response(LLMMessage(role="assistant", content="tail reply"))
+    folded = fold_line(read_trace(t.path), r1["line"])
+    assert [m["content"] for m in folded["messages"]] == ["hi"]
+    assert folded["records"][-1]["kind"] == "response"
+
+
+def test_restart_after_trailing_response_keeps_cursor(tmp_path: Path) -> None:
+    t1 = _tracer(tmp_path)
+    r1 = t1.record(system="sys", messages=_msgs("hi"))
+    t1.record_response(LLMMessage(role="assistant", content="yo"))
+    t2 = _tracer(tmp_path)  # restore must anchor on the last *request*
+    r2 = t2.record(system="sys", messages=_msgs("hi", "yo"))
+    assert r2["kind"] == "delta"
+    assert r2["line"] == r1["line"]
+    assert r2["seq"] == 3
+    assert r2["system"] is None  # system unchanged — hash restored correctly
+
+
 # ── restart restore ──────────────────────────────────────────────────────────
 
 

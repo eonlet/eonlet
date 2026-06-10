@@ -368,6 +368,20 @@ class AgentRuntime:
                 final = chunk["response"]
         if final is None:
             raise RuntimeError("provider.stream ended without a DoneChunk")
+        # Trace the reply too (ADR-0010): without this, the last turn of a run
+        # would be invisible — it never shows up in a following delta.
+        if self.tracer is not None:
+            try:
+                self.tracer.record_response(
+                    LLMMessage(
+                        role="assistant",
+                        content=final.content,
+                        tool_calls=final.tool_calls,
+                        reasoning_content=final.reasoning_content,
+                    )
+                )
+            except Exception:
+                log.exception("context trace response record failed; continuing")
         return final
 
     async def _execute_tool_call(self, call: LLMToolCall) -> AsyncIterator[Event]:

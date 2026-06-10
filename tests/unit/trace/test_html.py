@@ -53,6 +53,17 @@ def test_title_is_html_escaped() -> None:
     assert "&lt;img" in page
 
 
+def test_page_embeds_trailing_reply(tmp_path: Path) -> None:
+    # The run's final reply exists only as a response record — it must still
+    # reach the page payload.
+    t = ContextTracer(tmp_path / "trace")
+    t.record(system="sys", messages=[LLMMessage(role="user", content="question")])
+    t.record_response(LLMMessage(role="assistant", content="FINAL-REPLY-ONLY-IN-RESPONSE"))
+    page = render_html(read_trace(t.path))
+    assert "FINAL-REPLY-ONLY-IN-RESPONSE" in page
+    assert '"kind": "response"' in page or '"kind":"response"' in page
+
+
 def test_cmd_trace_writes_html_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from eonlet.cli.commands import cmd_trace
 

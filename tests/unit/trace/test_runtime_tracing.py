@@ -119,21 +119,28 @@ def test_turns_trace_as_one_line_until_watermark_forks_it(tmp_path: Path) -> Non
         async for _ in runtime.handle_user_message(text):
             pass
 
-    # Two ordinary turns: the second request's window prefix-extends the first.
+    # Two ordinary turns: the second request's window prefix-extends the first;
+    # each request is followed by its reply (a response record).
     anyio.run(turn, "first message")
     anyio.run(turn, "second message")
     records = read_trace(trace_path)
-    assert [r["kind"] for r in records] == ["root", "delta"]
-    assert records[1]["line"] == records[0]["line"]
-    assert records[1]["task_id"] is None
-    assert records[1]["model"] == "recorder"
+    assert [r["kind"] for r in records] == ["root", "response", "delta", "response"]
+    assert records[2]["line"] == records[0]["line"]
+    assert records[2]["task_id"] is None
+    assert records[2]["model"] == "recorder"
+    # The reply is attached to its request, and its hash matches the same
+    # message's hash in the next delta — what viewers dedupe by.
+    assert records[1]["for_seq"] == records[0]["seq"]
+    assert records[1]["message"]["content"] == "ok"
+    assert records[1]["hash"] in records[2]["hashes"]
 
     # Compaction advances the watermark → the next window is rewritten → fork.
     write_watermark(runtime.memory_dir, runtime.store.latest_id())
     anyio.run(turn, "post-compaction message")
     records = read_trace(trace_path)
-    assert records[-1]["kind"] == "root"
-    assert records[-1]["parent"] == {"line": records[0]["line"], "seq": records[1]["seq"]}
+    assert records[-1]["kind"] == "response"  # the run's last reply is on file
+    assert records[-2]["kind"] == "root"
+    assert records[-2]["parent"] == {"line": records[0]["line"], "seq": records[3]["seq"]}
 
 
 def test_trace_failure_never_breaks_the_run(tmp_path: Path) -> None:
@@ -141,6 +148,9 @@ def test_trace_failure_never_breaks_the_run(tmp_path: Path) -> None:
 
     class _Boom:
         def record(self, **_: Any) -> None:
+            raise OSError("disk full")
+
+        def record_response(self, *_: Any) -> None:
             raise OSError("disk full")
 
     runtime.tracer = _Boom()  # type: ignore[assignment]
