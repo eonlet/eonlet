@@ -113,22 +113,47 @@ interaction; only work that needs the LLM time-slices on the core.
 
 ### 4.1 Per-task run + outcomes
 
-Running a task: transition `→ active`, assemble a prompt (`goal` + parent-chain
-summaries + `progress_summary` + child results for synthesis; knowledge/recall
-come from the memory preamble), run it task-scoped. The agent signals its outcome
-through the ordinary `task` tool; the scheduler then **classifies** the result:
+Running a task: transition `→ active`, assemble a **kickoff message** (`goal` +
+parent-chain summaries + child results for synthesis; the decision trace and
+resume brief ride the system prompt — §4.2 — and knowledge comes from the
+preamble), run it task-scoped. The agent signals its outcome through the
+ordinary `task` tool; the scheduler then **classifies** the result:
 
 | Outcome | Detected by | Next move |
 |---|---|---|
-| **DONE** | task is terminal | move on |
+| **DONE** | task is terminal | surface a root's result into chat (below); move on |
 | **DECOMPOSED** | task gained children | `→ blocked`; run children, then synthesize |
 | **YIELDED** | active, no children, not terminal | checkpoint + `→ suspended` |
 | **PREEMPTED** | paused mid-run (§5) | checkpoint + `→ pending` (re-queue) |
+| **GONE** | cancelled/deleted out from under the run (control plane) | run ends at the next turn boundary; nothing to checkpoint |
 
 **Implicit current task.** During a task-scoped run the runtime sets a *current
 task id*; `task(done)` / `task(add)` default to it, so the agent finishes or
 decomposes without restating the id, and `task(add)` without a parent becomes a
-subtask (the decomposition signal).
+subtask (the decomposition signal). `task(done)` for the run's **own** task
+requires a non-empty `result` — it is the only payload that flows up.
+
+**`<task_result>` envelope.** When a **root** reaches a terminal state in a
+scheduler-driven run (including a backlog-cap cancellation), the worker records
+a chat-scope user-role envelope —
+
+```
+<task_result id="…" status="done|cancelled">
+Goal: …
+Result: …
+</task_result>
+```
+
+— mirroring the `<trigger>` convention. The conversation (and, via tier-1,
+episodic memory) thereby learns what background work produced; subtask results
+are *not* enveloped (they flow up through the parent's synthesis turn).
+
+**Suspended visibility & crash recovery.** Suspended tasks are injected into
+the `<tasks>` block (they only resume by an explicit `resume` — the `task` tool
+action or `eonlet tasks resume`); hiding them would make yielded work silently
+vanish. At worker startup any task replaying as `active` is re-queued to
+`pending` (`reason="crash_recovery"`) — a crashed worker must not wedge its
+task forever.
 
 ### 4.2 Scoped working context (ADR-0009)
 
@@ -137,36 +162,43 @@ event (`USER_MESSAGE`/`ASSISTANT_MESSAGE`/`TOOL_CALL`/`TOOL_RESULT`/`TOOL_ERROR`
 is tagged with the **task scope** it was produced in (`Event.task_id`, stamped
 centrally by `runtime._record` from the *current task id*; chat/cron turns are the
 **chat scope**, `task_id = None`). The LLM window is filtered to the **current
-scope**: a run of task `T` sees only `T`'s own turns plus the assembled framing
-(§4.1) and the `<memory>`/`<tasks>` preambles; a chat turn sees only chat-scope
-turns. This realizes the **asymmetric context-flow model**:
+scope**: a run of task `T` sees only `T`'s own turns plus the kickoff message
+(§4.1), the **knowledge index** (STM/LTM are the chat timeline and are *not*
+injected into task runs), and the `<tasks>` block; a chat turn sees only
+chat-scope turns. This realizes the **asymmetric context-flow model**:
 
-- **Down the tree** (parent → child, and chat → root): the child's framing carries
-  a compressed *decision trace* (`Task.framing`), not just the `goal` — a child must
+- **Down the tree** (parent → child, and chat → root): the child inherits a
+  compressed *decision trace* (`Task.framing`), not just the `goal` — a child must
   understand how it was decomposed. Computed once on the child's first dispatch by
   compressing the parent's (or, for a user-origin root, the chat's) scope via the
-  compaction LLM, stored on the task, and injected as a "Context from above"
-  section. Trigger-origin roots and trivial sources stay goal-only; any failure is
-  non-fatal (goal-only). (ADR-0009 M3.)
+  compaction LLM, stored on the task, and injected into the **system prompt** as
+  `<task_context>` (rebuilt each turn, so it never goes stale and repeated pauses
+  don't pile copies into the window). Trigger-origin roots and trivial sources
+  stay goal-only; any failure is non-fatal (goal-only). (ADR-0009 M3.)
 - **Up the tree** (child → parent): only the child's `result` returns; its internal
   turns never enter the parent's synthesis window.
 - **Across siblings**: no direct sharing — siblings coordinate only through the
   parent. (Serial execution means there is never a concurrent conflict anyway.)
 
-**Checkpoint brief is LLM-compressed (M2).** On suspend/yield/preempt the
-`progress_summary` is produced by compressing the task's own-scope events into key
-details, events, and **decisions** via the compaction LLM (decision continuity —
-the basis for a coherent resume and, in M3, the down-tree trace). It falls back to
-a structural summary (the task's last assistant turn) when memory is disabled, no
-compaction provider resolves, or the call fails — a checkpoint is never blocked.
+**Checkpoint brief is LLM-compressed (M2).** On suspend/yield/cross-tree preempt
+the `progress_summary` is produced by compressing the task's own-scope events into
+key details, events, and **decisions** via the compaction LLM (decision continuity
+— the basis for a coherent resume and, in M3, the down-tree trace). It falls back
+to a structural summary (the task's last assistant turn) when memory is disabled,
+no compaction provider resolves, or the call fails — a checkpoint is never
+blocked. A **user-input pause takes the structural checkpoint directly** (no LLM
+call): it resumes promptly, and the structural path never advances the brief
+watermark, so the raw scoped window survives intact — chatting while a task runs
+must not cost an LLM compression per message.
 
 **Episodic memory is the chat scope only.** Tier-1/2/3 (STM/LTM, the `<memory>`
 preamble) compact the conversation timeline; a task's turns are never promoted to
-STM/LTM. A task's durable residue is its `result` (which surfaces into chat on
-completion, and thereby into episodic memory), its `progress_summary` checkpoint
-brief, and the full **recall-indexed** event log. The curated `knowledge/` axis is
-global and injected into every scope. The chat compaction watermark applies to the
-chat scope only; each task carries its **own brief watermark** (M4 below).
+STM/LTM. A task's durable residue is its `result` (surfaced into chat by the
+`<task_result>` envelope on root completion, and thereby into episodic memory),
+its `progress_summary` checkpoint brief, and the full **recall-indexed** event
+log. The curated `knowledge/` axis is global and injected into every scope. The
+chat compaction watermark applies to the chat scope only; each task carries its
+**own brief watermark** (M4 below).
 
 **Task-scope compaction (M4, reversible→irreversible).** While a task runs, recent
 turns stay raw in its window; when the un-folded own-scope window exceeds

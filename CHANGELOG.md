@@ -14,6 +14,36 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — design-review fixes ([docs/plans/design-review-fixes.md](docs/plans/design-review-fixes.md))
+
+A full design review (context organization / memory / scheduling) of the
+post-ADR-0009 codebase; fifteen findings (P1–P15), all landed:
+
+- **Upward flow closed (P1/P13).** A terminal **root** task now records a
+  chat-scope `<task_result>` envelope (mirrors `<trigger>`): the conversation —
+  and tier-1 → episodic memory — finally learns what background work produced.
+  `task(done)` inside a task's own run requires a non-empty `result`.
+- **No more black holes (P2/P3/P10).** Worker startup re-queues tasks left
+  `active` by a crash; suspended tasks are injected into `<tasks>` and the
+  `task` tool gained `resume`; cancelling/deleting a running task now ends its
+  run at the next turn boundary instead of burning tokens to the natural end.
+- **Task-scope injection tightened (P5/P12).** Task runs get the knowledge
+  index only (STM/LTM are the chat timeline); the down-tree trace moved into
+  the system prompt as `<task_context>` beside `<task_progress>` — rebuilt
+  every turn, so repeated pauses no longer pile stale copies into the window.
+- **Knowledge is event-sourced (P4/P6).** `kb_written` events carry the
+  resulting full file body (the log can now reconstruct the never-auto-deleted
+  knowledge axis — Invariant #1 restored); knowledge writes warn visibly when
+  the always-injected index exceeds `index_max_tokens`.
+- **Cheaper steady state (P8/P9/P11).** User-input pauses take the structural
+  checkpoint (no LLM call per chat message mid-task); the idle scheduler poll
+  went 1 s → 30 s (wake sentinels are the primary signal); the per-task budget
+  check accumulates incrementally instead of re-reading the log every turn.
+- **Audit & docs (P7/P14/P15).** `mem_compacted.model` records the real model
+  id; cron-in-chat-scope is documented as deliberate; **MEMORY_SPEC rewritten
+  to 0.2.0** (dual-axis reality — the 0.1.0 notes/todos/`remember`/`forget`
+  surfaces are gone from the spec).
+
 ### Changed — scheduling refinement ([ADR-0008](docs/adr/0008-user-input-preemption.md))
 
 Refines the ADR-0007 scheduler (revises TASK_SPEC §4–§5; no new `EventKind`).

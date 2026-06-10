@@ -2,52 +2,21 @@
 
 | Field | Value |
 |---|---|
-| Status | **Partially superseded by [ADR-0005](adr/0005-dual-axis-memory.md)** (dual-axis memory, v0.0.8) |
-| Spec version | 0.1.0 |
-| Depends on | `SPEC.md`, `AGENT_CONFIG_SPEC.md`, `TOOL_SPEC.md`, `TRIGGER_SPEC.md`, `adr/0003-memory-system.md`, `adr/0005-dual-axis-memory.md` |
-| Implements | ADR-0003, then ADR-0005 |
-
-> ## ⚠️ Superseding notice (ADR-0005, v0.0.8)
->
-> The shipped memory subsystem now follows the **dual-axis** model of
-> [ADR-0005](adr/0005-dual-axis-memory.md) and its implementation plan
-> ([plans/dual-axis-memory.md](plans/dual-axis-memory.md)), which are the
-> **authoritative design record**. This document predates that change; the
-> mechanics below (compaction tiers, watermark, FTS5 recall, injection,
-> events, invariants) remain accurate, but the following are **out of date**
-> — defer to the ADR/plan and the code:
->
-> - **Two axes, not one store.** `long_term.md` holds only the **`episodic`**
->   category (dated summaries). The five semantic categories
->   (`user`/`feedback`/`project`/`reference`/`fact`) moved to a separate,
->   **never-auto-deleted curated knowledge axis** at `memory/knowledge/`
->   (a tree of markdown files + an injected `index.md` map), written via the
->   `knowledge` tool. Tier-3 forgetting applies uniformly — the `src:explicit`
->   "never drop" exemption is **removed**.
-> - **Tasks are no longer memory.** `todos.jsonl` moved to a sibling
->   `tasks/` dir; the `todo` tool became `task`; pending tasks inject as a
->   `<tasks>` block **outside** `<memory>`. Config is the top-level `tasks`
->   block, not `memory.todos`.
-> - **Notes are gone.** `NotesStore`, `notes.md`, and the `note` / `remember`
->   / `forget` tools are retired — the knowledge axis subsumes them. The
->   single durable-write tool is `knowledge`.
-> - **Config:** `memory.conversation` → `memory.episodic`; new
->   `memory.knowledge` block; `memory.notes`/`memory.todos` removed.
-> - **Events:** `mem_remember` / `mem_note_*` retired; `mem_todo_*` →
->   `task_*`; new `kb_written` / `kb_deleted` / `kb_moved`.
-> - **No migration tool** — pre-alpha rewrites `agent.yaml` and starts fresh.
->
-> A full rewrite of this spec to the dual-axis model is tracked but not yet
-> done; until then, read §§ below for the *unchanged* compaction/recall
-> mechanics and the ADR for the *current* data model and tool surface.
+| Status | Active |
+| Spec version | 0.2.0 |
+| Depends on | `SPEC.md`, `AGENT_CONFIG_SPEC.md`, `TOOL_SPEC.md`, `TRIGGER_SPEC.md`, `TASK_SPEC.md` |
+| Implements | ADR-0003 (base), ADR-0005 (dual axis), ADR-0006 (compaction triggers), ADR-0009 (task scoping) |
 
 ## 0. Reader Guide
 
-This spec is the **normative reference** for the memory subsystem introduced
-by ADR-0003. The ADR records the *decision*; this spec records the *contract*
-the implementation must satisfy. When the two disagree, the spec wins (and
-the ADR should be amended). **For anything ADR-0005 changed (see the
-superseding notice above), ADR-0005 + the code win over this document.**
+This spec is the **normative reference** for the memory subsystem as shipped.
+The ADRs record the *decisions*; this spec records the *contract* the
+implementation satisfies. When the two disagree, this spec wins (and the ADR
+should be amended).
+
+Spec version 0.2.0 is a full rewrite to the **dual-axis model** (ADR-0005):
+the 0.1.0 document described notes/todos/`remember`/`forget` surfaces that no
+longer exist.
 
 Audience: implementers of `src/eonlet/memory/`, the related builtin tools,
 the runtime injection point, and the CLI slash commands.
@@ -59,43 +28,54 @@ the runtime injection point, and the CLI slash commands.
 | Term | Definition |
 |---|---|
 | **Working memory** | Raw conversation events not yet compacted; the runtime renders them verbatim into the LLM call. Sliding window. |
-| **Short-term memory (STM)** | A markdown document of compressed conversation summaries scoped to one eonlet. |
-| **Long-term memory (LTM)** | A markdown document of durable knowledge across conversations; subject to self-compaction ("forgetting"). |
-| **Notes** | User-curated explicit knowledge. The runtime never deletes notes on its own. |
-| **TODOs** | Action items with structured state. |
-| **Recall** | Tool-driven retrieval over the raw event log and the memory documents. |
-| **Compaction** | Background LLM-driven summarization that promotes content along the working → STM → LTM path. |
+| **Episodic axis** | The conversation timeline: working memory → STM → LTM. Subject to compaction and forgetting — it *decays*, which is correct for a timeline. |
+| **Short-term memory (STM)** | `short_term.md`: dated, compressed conversation summaries scoped to one eonlet. |
+| **Long-term memory (LTM)** | `long_term.md`: dated episodic summaries promoted from STM. Holds **only** the `episodic` category. |
+| **Knowledge axis** | `knowledge/`: durable facts/rules/preferences the agent curates deliberately via the `knowledge` tool. **Never auto-deleted.** |
+| **Knowledge index** | `knowledge/index.md`: the agent-curated map of the knowledge tree. Injected whole into every call; file bodies are opened on demand. |
+| **Recall** | Tool-driven FTS5 retrieval over the raw event log and the memory documents. |
+| **Compaction** | LLM-driven summarization along working → STM → LTM. |
 | **Forgetting** | Compaction restricted to LTM itself when LTM exceeds its budget. |
+| **Chat scope** | Events with `task_id = None` — the user conversation plus cron turns (see §3.2). Episodic memory operates on this scope only. |
+| **Task scope** | Events with `task_id` set — a task run's own turns (ADR-0009). Never promoted to STM/LTM. |
 
-Working memory is not a file on disk. STM, LTM, notes, and TODOs are.
+Tasks are **not** memory. They are event-sourced workflow state in
+`src/eonlet/tasks/` (see `TASK_SPEC.md`); this spec covers only how the
+`<tasks>` block is injected (§3.1) and how task scoping interacts with
+compaction (§3.2, §4).
 
 ---
 
 ## 2. Storage Layout
 
-Per eonlet:
+Per eonlet, under `~/.eonlet/eonlets/<eonlet_id>/memory/`:
 
 ```
-~/.eonlet/eonlets/<eonlet_id>/memory/
-├── short_term.md       # STM
-├── long_term.md        # LTM
-├── notes.md            # Notes
-├── todos.jsonl         # TODOs
-└── index.sqlite        # Recall FTS5 index over event log + memory docs
+memory/
+├── short_term.md       # episodic STM — dated sections
+├── long_term.md        # episodic LTM — dated summaries only
+├── knowledge/          # AXIS 2 — curated, hierarchical, never auto-deleted
+│   ├── index.md        #   the agent-curated map; injected whole every call
+│   └── …               #   one markdown file per topic (e.g. user.md, rules/…)
+├── index.sqlite        # recall FTS5 index over event log + memory docs
+└── watermark           # chat-scope compaction watermark (single integer)
 ```
 
 Invariants:
 
-- **I-S1.** Every file in `memory/` is **derived state**. Deleting the
-  directory MUST cause the runtime to rebuild it from the event store on
-  next idle without data loss. The event store is the source of truth.
+- **I-S1 (Reconstructability).** Every file in `memory/` is recoverable from
+  the event store. STM/LTM are *re-derivable*: deleting them resets the
+  watermark path to 0 and the raw history replays into the window (content can
+  be re-summarized, not byte-identically rebuilt). The **knowledge axis is
+  reconstructable exactly**: every `kb_written` event carries the resulting
+  full file body (§7), so the latest version of each file can be replayed from
+  the log. The recall index rebuilds automatically (§2.4).
 - **I-S2.** The worker is the only writer. CLI slash commands modify these
   files only by routing through the worker over IPC.
-- **I-S3.** All writes use the atomic `write-temp-then-rename` pattern. A
-  half-written file MUST NOT be observable.
-- **I-S4.** Writes are serialized by a per-eonlet `anyio.Lock` held across
-  the temp-write-and-rename of each file. There is one lock per file (four
-  locks total), not one global lock — recall does not block writes to LTM.
+- **I-S3.** All writes use the atomic `write-temp-then-rename` pattern
+  (`storage.atomic_write_text`). A half-written file MUST NOT be observable.
+- **I-S4.** Writes are serialized per file by `anyio.Lock` — recall reads do
+  not block LTM writes.
 
 ### 2.1 `short_term.md` format
 
@@ -118,82 +98,39 @@ topic_line:= "[topics: " comma_separated_keywords "]\n"
 body      := one or more lines, terminated by EOF or next "## ["
 ```
 
-Headers are machine-parseable by the runtime; the body is free text intended
-for the LLM. `topic` is a human-readable short phrase; `topics:` is the
-keyword list the recall index uses.
+Headers are machine-parseable; the body is free text intended for the LLM.
+`topics:` is the keyword list the recall index uses.
 
 ### 2.2 `long_term.md` format
 
-Top-level structure:
+LTM holds **only the `episodic` category** (ADR-0005 M2): dated, roughly
+chronological summaries promoted from STM.
 
 ```markdown
 # Long-term memory
 
-## user
-- preferred concise responses; dislikes hedging language [src:feedback, ts:2026-04-12]
-- works in finance, focused on portfolio automation [src:user, ts:2026-03-30]
-
-## feedback
-- never mock the database in tests [src:feedback, ts:2026-02-18]
-
-## project
-- legal compliance is the real driver of the auth rewrite [src:project, ts:2026-05-01]
-
-## reference
-- pipeline bugs tracked in Linear "INGEST" [src:reference, ts:2026-04-22]
-
-## fact
-- ...
-
 ## episodic
-- 2026-05-22: spent the morning on the portfolio rebalance flow; ended with AAPL trim approved
+- 2026-05-22: spent the morning on the portfolio rebalance flow; ended with AAPL trim approved [src:implicit, ts:2026-05-23]
 ```
 
-The six categories (`user` / `feedback` / `project` / `reference` / `fact` /
-`episodic`) are fixed. `episodic` is special: it holds compressed summaries
-promoted from STM, dated and roughly chronological. The other five hold
-durable atomic facts written either by promotion (auto) or by `remember`
-(explicit).
+The five semantic categories of the 0.1.0 spec (`user`/`feedback`/`project`/
+`reference`/`fact`) live in the knowledge axis now. Tier-3 forgetting applies
+uniformly to LTM bullets — there is **no** `src:explicit` exemption.
 
-Each bullet ends with a trailer `[src:<source>, ts:<ISO date>]` where
-`source ∈ {user, feedback, project, reference, fact, implicit, explicit}`:
+### 2.3 `knowledge/` format
 
-- `implicit` — produced by STM→LTM promotion
-- `explicit` — produced by `remember()` or by user `/remember`
-- the rest — category-matched source from the explicit writer
+A tree of small markdown files, one topic per file, plus the `index.md` map.
+Each index entry is one line: a markdown link plus a relevance hook, e.g.
 
-The trailer drives LTM compaction priorities (see §5.3).
-
-### 2.3 `notes.md` format
-
-Free-form markdown. No required structure. The runtime preserves whatever
-the user writes; it appends new entries from `note add` at the bottom under
-an `## YYYY-MM-DD HH:MM` header.
-
-### 2.4 `todos.jsonl` format
-
-One JSON object per line, UTF-8, no trailing comma:
-
-```json
-{"id":"todo-2026-05-22-a1b2","content":"...","status":"pending","created_at":"2026-05-22T14:03:11+08:00","due":null,"done_at":null,"tags":["..."]}
+```markdown
+- [Testing](rules/testing.md) — never mock the DB in tests
 ```
 
-Schema:
+Written exclusively through the `knowledge` tool (§5.2) / `memory.knowledge.*`
+IPC. The runtime **never** deletes, compacts, or rewrites knowledge files on
+its own. Paths are validated (no traversal outside `knowledge/`).
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `id` | string | yes | `todo-YYYY-MM-DD-<4hex>` |
-| `content` | string | yes | freeform |
-| `status` | `"pending" \| "done" \| "cancelled"` | yes | |
-| `created_at` | ISO-8601 string | yes | |
-| `due` | ISO-8601 string \| null | no | |
-| `done_at` | ISO-8601 string \| null | no | set when status transitions to `done` |
-| `tags` | array of strings | no | |
-
-Done/cancelled items remain in-file for audit. `archive_done_after_days`
-(from `agent.yaml`) optionally moves them out (see §10).
-
-### 2.5 `index.sqlite` schema
+### 2.4 `index.sqlite` schema
 
 ```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
@@ -204,13 +141,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
 CREATE TABLE IF NOT EXISTS msg_meta (
   event_id   INTEGER PRIMARY KEY,
   ts         INTEGER NOT NULL,         -- microseconds since epoch
-  role       TEXT NOT NULL,            -- 'user' | 'assistant' | 'tool' | 'system'
-  kind       TEXT NOT NULL,            -- event kind string
-  fts_rowid  INTEGER NOT NULL          -- rowid in msg_fts
+  role       TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  fts_rowid  INTEGER NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS msg_meta_ts ON msg_meta(ts);
-CREATE INDEX IF NOT EXISTS msg_meta_kind ON msg_meta(kind);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   doc, section_id, content,
@@ -218,15 +152,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 );
 ```
 
-- `msg_fts` indexes raw events from the event store (one row per event with
-  text-bearing payload).
-- `memory_fts` indexes sections of the memory documents (`doc` ∈
-  `{'stm','ltm','notes'}`, `section_id` is the section header for STM/LTM
-  or the heading anchor for notes).
-- The recall index is **derived state**, rebuildable from the event store
-  and memory docs. If `index.sqlite` is missing, corrupt, or stale, the
-  runtime MUST rebuild it on startup (background task) without blocking the
-  agent loop.
+- `msg_fts` indexes raw events (one row per text-bearing event) — **all
+  scopes**, task turns included; recall is the escape hatch back into pruned
+  task history (ADR-0009).
+- `memory_fts` indexes sections of the memory documents.
+- The index is **derived state**: if missing, corrupt, or lagging the event
+  log, the worker catches up / rebuilds at startup without blocking the loop.
 
 ---
 
@@ -235,33 +166,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 When the runtime builds an LLM request, it produces:
 
 ```
-[ system prompt (definition.system_prompt + memory preamble) ]
-[ recent_messages_window (raw events, oldest→newest) ]
-[ current trigger envelope or user message ]
+[ system prompt = system.md + skills block + <memory> preamble + <tasks> block
+                  (+ <task_context>/<task_progress> during a task run) ]
+[ recent_messages_window (raw events, oldest→newest, scope-filtered) ]
 ```
 
 ### 3.1 System prompt assembly
 
-The system message sent to the LLM is the concatenation, in order, of:
+The system message is the concatenation, in order, of:
 
 1. `definition.system_prompt` (from `system.md`)
-2. Skills block (existing behavior, unchanged)
-3. **Memory preamble** (new), each block omitted if its store is empty or
-   `inject: false`:
+2. Skills block
+3. **Memory preamble** — built once per run, sub-blocks omitted when empty:
 
    ```
    <memory>
+   <knowledge_index>
+   {knowledge/index.md contents — the map; bodies never injected}
+   </knowledge_index>
+
    <long_term>
-   {long_term.md contents, trimmed to long_term_tokens}
+   {long_term.md contents}
    </long_term>
-
-   <notes>
-   {notes.md contents, trimmed to notes.max_tokens with "(truncated)" marker}
-   </notes>
-
-   <todos>
-   {pending todos as a bullet list, one per line: "- [id] content (due: ...)"}
-   </todos>
 
    <short_term>
    {short_term.md contents}
@@ -269,649 +195,412 @@ The system message sent to the LLM is the concatenation, in order, of:
    </memory>
    ```
 
-The outer `<memory>` element MUST appear iff at least one inner block does.
-Empty stores produce no element at all.
+   **Scope rule (ADR-0009 §5):** during a **task-scoped run** only
+   `<knowledge_index>` is injected. The knowledge axis is global; STM/LTM are
+   the *chat* timeline — a task gets its context from its down-tree trace
+   (`<task_context>`), its resume brief (`<task_progress>`), and its own scope
+   window, not the whole conversation history.
+
+4. **`<tasks>` block** — a sibling of `<memory>`, never nested inside it
+   (tasks are workflow state, not memory). Lists pending **leaves**
+   (actionable items, highest priority first) plus a `suspended` section —
+   suspended tasks only resume by an explicit `resume`, so hiding them would
+   make yielded work silently vanish.
+
+5. During a task-scoped run: `<task_context>` (the down-tree decision trace)
+   and `<task_progress>` (the cumulative resume brief). Both live **here**, not
+   in the kickoff message, because the system prompt is rebuilt every turn —
+   they stay present and current as the window prunes, with no stale copies
+   accumulating as messages. See `TASK_SPEC.md` §4.
+
+If the knowledge index exceeds `knowledge.index_max_tokens` it is still
+injected (never silently truncated), but the `knowledge` tool appends a
+visible warning to its write/move results so the agent — the only entity that
+can prune its own index — gets the signal.
 
 ### 3.2 Recent-messages window
 
-After the memory preamble, the runtime appends raw events as normal LLM
-messages (user / assistant / tool roles).
-
 Selection algorithm:
 
-1. Start from the most recent event.
-2. Walk backwards accumulating events while the rolling token estimate stays
-   below `working_memory_tokens` and the message count stays below an
-   internal hard cap (1000, to bound DB reads).
-3. STOP at the **compaction watermark** (see §4.2): events older than the
-   watermark MUST NOT appear in the window — they are represented by STM.
-4. The window MUST NOT split a `tool_call` / `tool_result` pair. If the
-   walk-back would land inside a pair, extend it backwards to the
-   originating `assistant_message`.
+1. Filter to the **current scope**: a task-scoped run sees only events with
+   `task_id == current task`; a chat/cron turn sees only `task_id is None`.
+2. Walk backwards from the newest eligible message, accumulating events while
+   the rolling token estimate stays below `episodic.working_memory_tokens`
+   (always keeping at least `keep_recent_messages_min`; hard cap 1000).
+3. STOP at the **watermark**: for the chat scope, the compaction watermark
+   (§4.2); for a task scope, that task's **brief watermark** (`TASK_SPEC` §4.2).
+   The two are never mixed — applying the chat watermark to a task scope would
+   silently hide task turns that no STM section represents.
+4. Never split a `tool_call`/`tool_result` pair: a window must not start with
+   an orphan tool result.
 
-The resulting list is reversed to chronological order and emitted as the
-message history.
+**Cron turns are chat scope — deliberately.** Scheduled/cron conversations
+carry `task_id = None`, interleave into the chat window, and are compacted
+into STM like any chat turn. Scheduled activity *is* part of the agent's
+episodic timeline (a purely-cron agent would otherwise accumulate no episodic
+memory at all). If cron↔chat cross-talk proves painful in practice, trigger
+scoping can reuse the same `Event.task_id`-style mechanism — a deliberate
+deferral, not an oversight.
 
-**Task scoping (ADR-0009).** The window is filtered to the **current task scope**
-before the walk-back: a task-scoped run sees only its own turns (`Event.task_id`
-== the running task), a chat/cron turn sees only chat-scope turns (`task_id` is
-`None`). The compaction watermark (step 3) applies to the **chat scope only** —
-task turns are never summarized into STM, so the watermark must not hide them;
-task scopes are bounded by the working-memory budget alone. Episodic memory
-(STM/LTM, tier-1/2/3) is therefore the *conversation* timeline; a task's durable
-residue is its `result` + checkpoint brief + the recall-indexed log. See
-TASK_SPEC §4.2.
+When `memory.inject_turn_timestamps` is true, each user message is prefixed at
+render time with its local datetime (e.g. `[2026-05-30 14:23 +08:00] …`).
+Render-time only — event payloads stay immutable.
 
 ### 3.3 Trigger envelope interaction
 
-`TRIGGER_SPEC.md §2.3` defines the `<trigger>...</trigger>` envelope. The
-envelope is **not** part of the memory preamble — it is appended as a
-user-role message at the end of the recent window. The envelope's tokens
-count toward `working_memory_tokens` like any other event.
+The `<trigger>…</trigger>` envelope (TRIGGER_SPEC §2.3) is appended as a
+user-role message at the end of the window and counts toward the budget like
+any other event. The `<task_result>` envelope (TASK_SPEC §4.1) follows the
+same convention: a completed root task's result is recorded as a chat-scope
+user message, entering the window — and, via tier-1, episodic memory —
+naturally.
 
-### 3.4 Budget contract
+### 3.4 Budget posture
 
-The runtime MUST ensure that, after assembly:
-
-```
-tokens(system_prompt) + tokens(recent_window) ≤ runtime.max_context_tokens − reserved_output
-```
-
-where `reserved_output = max_tokens_per_response + safety_margin` and
-`safety_margin = 1024`. If the budget cannot be satisfied even after STM
-is fully populated, the runtime:
-
-1. Logs a `BUDGET_WARNING` event.
-2. Drops oldest events from the recent window until budget is satisfied.
-3. If still over budget, drops the `<notes>` block (notes are dropped before
-   LTM because LTM is already maximally compressed).
-
-The runtime MUST NOT silently truncate STM or LTM mid-content — they are
-either fully included or fully omitted.
+The **window** is hard-bounded by `working_memory_tokens` per scope. The
+**system prompt** is soft-bounded: STM/LTM are bounded post-hoc by tiers 2/3,
+the knowledge index by the §3.1 feedback warning. There is currently **no**
+single end-to-end clamp `tokens(system) + tokens(window) ≤ max_context −
+reserved_output`; if a model-side overflow is ever observed in practice, add
+the clamp at assembly time (drop oldest window events first, never truncate a
+memory block mid-content).
 
 ---
 
 ## 4. Compaction Pipeline
 
-Three tiers. All three are LLM-driven, run in the background, and respect
-snapshot semantics.
+Three tiers. All are LLM-driven (`memory.compaction_model`), run inline after
+a run completes, and respect snapshot semantics.
 
 ### 4.0 Tier-1 trigger model (ADR-0006)
 
-There is **one tier-1 mechanism** (summarize the older portion of the working
-window into STM) with **three triggers**, and the trigger decides the boundary:
+There is **one tier-1 mechanism** (summarize the older portion of the chat
+working window into STM) with **three triggers**; the trigger decides the
+boundary:
 
 | Trigger | Initiator | Boundary | Consent | Availability |
 |---|---|---|---|---|
-| **Bounded auto** | runtime, post-turn | keep ~30% tail (`compute_suggested_boundary`) | none | interactive + cron |
-| **User-forced full** | user, `/compact` | **everything** — working emptied, no tail | n/a | interactive |
-| **Agent-proposed semantic** | agent, `memory.propose_compact` | agent-chosen topic-shift point (`boundary_event_id`, tool-pair-snapped) | **required, blocking** | interactive only |
+| **Bounded auto** | runtime, post-run | keep ~30% tail (`compute_suggested_boundary`) | none | interactive + cron |
+| **User-forced full** | user, `/compact` | **everything** — working emptied | n/a | interactive |
+| **Agent-proposed semantic** | agent, `memory.propose_compact` | agent-chosen topic-shift point (tool-pair-snapped) | **required, blocking** | interactive only |
 
-- **Bounded auto** is the only trigger that runs in cron/autonomous turns and the
-  only one that *guarantees* the working window stays bounded (it fires whenever
-  the window exceeds `episodic.working_memory_tokens`).
-- **User-forced full** (`/compact`) empties the working window into STM and marks
-  an episode boundary by emitting `session_ended` then `session_started`. The
-  next user message starts a fresh episode carrying only the injected memory
-  preamble.
-- **Agent-proposed semantic** is the agent's *only* path to compaction — there is
-  no unconsented agent force-compact. The agent calls
-  `memory.propose_compact(boundary_event_id, reason)` when the conversation has
-  moved on from older context. It is gated by:
-  - **floor** — `episodic.propose_floor_tokens` (no proposal below this size);
-  - **cooldown** — both `episodic.propose_min_interval_seconds` (wall-clock) and
-    `episodic.propose_min_turns` (turns) since the last compaction.
+- **Bounded auto** fires whenever the **chat-scope** window exceeds
+  `episodic.working_memory_tokens`. Task-scoped turns are excluded from both
+  the token estimate and the compaction input (ADR-0009 §5) — a busy task
+  never triggers conversation compaction.
+- **User-forced full** (`/compact`) empties the working window into STM and
+  marks an episode boundary by emitting `session_ended` + `session_started`.
+- **Agent-proposed semantic** is the agent's *only* path to compaction — no
+  unconsented agent force-compact. Gated by `propose_floor_tokens` plus the
+  dual cooldown (`propose_min_interval_seconds`, `propose_min_turns`). On a
+  passed guard the runtime emits `mem_compact_proposed`, **blocks** awaiting
+  consent over the decision channel (§4.6), then `mem_compact_approved` +
+  tier-1 at the boundary, or `mem_compact_declined`. `yolo` auto-approves
+  (audited). Headless/no-session proposals are a no-op.
 
-  When the guards pass, the runtime emits `mem_compact_proposed`, then **blocks
-  the turn** awaiting consent over the decision channel (§4.6.1): on approval it
-  emits `mem_compact_approved` and runs tier-1 at the proposed boundary; on
-  decline it emits `mem_compact_declined` and leaves memory untouched. Under
-  `yolo` the proposal auto-approves (`mem_compact_approved` with `rule:"yolo"`)
-  without a round-trip — still recorded for audit. In a headless/cron run with no
-  attached session, a non-`yolo` proposal is a no-op (no events).
+**Task-scope compaction** is a fourth use of the same shape but a different
+target: when a running task's own-scope window exceeds the budget, its older
+turns are folded into the task's cumulative **brief** (not STM) and the task's
+brief watermark advances. Specified in `TASK_SPEC.md` §4.2; it shares the
+boundary helper and the reversible-before-irreversible posture.
 
 ### 4.1 Tier-1 (working → STM)
 
-**Trigger:** see §4.0. The bounded-auto trigger fires when the token estimate of
-the recent-messages window (as assembled in §3.2) exceeds
-`episodic.working_memory_tokens`.
+**Input:** chat-scope events with `watermark < id ≤ snapshot_id`.
 
-**Input:** all **chat-scope** events with `id > compaction_watermark` and
-`id ≤ snapshot_id` (events with a `task_id` are excluded — task turns are not
-episodic; ADR-0009 §5). The bounded-auto trigger likewise counts chat-scope tokens
-only, so a busy task never triggers conversation compaction.
-
-**Output:** zero or more new STM sections appended to `short_term.md`, plus
-an advance of `compaction_watermark` to a chosen `boundary_event_id`.
+**Output:** zero or more STM sections appended to `short_term.md`, plus an
+advance of the watermark to the chosen `boundary_event_id`.
 
 **Boundary selection:**
 
-1. The runtime computes `suggested_boundary` — the most recent event such
-   that the events newer than it total at least
-   `max(keep_recent_messages_min, 0.3 × working_memory_tokens)` tokens, and
-   the boundary lies between an assistant turn and the next user turn (or
-   between any two non-paired events).
-2. The compaction LLM is called with: the full to-be-compacted region, the
-   suggested boundary event_id, and a JSON-output instruction returning:
+1. The runtime computes `suggested_boundary` — keep at least
+   `keep_recent_messages_min` messages and ~30% of the budget as the raw tail,
+   snapped so a tool_call/tool_result pair is never split.
+2. The compaction LLM receives the to-be-compacted region and the suggested
+   boundary, and returns JSON:
 
    ```json
    {
      "sections": [
-       {
-         "ts_start": "<ISO>",
-         "ts_end": "<ISO>",
-         "topic": "short phrase",
-         "topics": ["keyword", "..."],
-         "body": "..."
-       }
+       {"ts_start": "<ISO>", "ts_end": "<ISO>", "topic": "short phrase",
+        "topics": ["keyword"], "body": "..."}
      ],
      "boundary_event_id": <int>
    }
    ```
 
-3. The boundary returned MUST satisfy
-   `event_log_min_id ≤ boundary_event_id ≤ suggested_boundary`. (The model
-   may compress less than suggested, never more.) If the model violates
-   this, the runtime falls back to `suggested_boundary` and uses the
-   sections as-is.
-4. If the model output fails JSON parsing or schema validation, the
-   runtime aborts tier-1 with no state change and logs an `ERROR` event.
-   The next tier-1 attempt happens on the next threshold crossing.
+3. The returned boundary MUST satisfy `min_id ≤ boundary ≤ suggested` (the
+   model may compress less than suggested, never more); violations fall back
+   to `suggested_boundary`.
+4. Unparseable/invalid output aborts tier-1 with no state change and an
+   `ERROR` event.
 
-**Event:** `mem_compacted` with payload
-`{tier: 1, snapshot_id, boundary_event_id, sections_added, tokens_before, tokens_after, model}`.
+**Event:** `mem_compacted` `{tier:1, snapshot_id, boundary_event_id,
+sections_added, tokens_before, tokens_after, model}` — `model` is the real
+compaction model id.
 
 ### 4.2 Compaction watermark
 
-A monotonically non-decreasing event ID stored in `~/.eonlet/eonlets/<id>/memory/watermark`
-(a tiny text file containing a single integer).
-
-- Events with `id ≤ watermark` are represented by STM/LTM, not by raw
-  history.
-- The watermark advances **only** on successful tier-1 compaction.
-- On worker startup, the runtime reads the watermark; if the file is
-  missing or unparseable, watermark = 0 (replay everything as raw — safe
-  fallback).
+A monotonically non-decreasing event id in `memory/watermark`. Events with
+`id ≤ watermark` in the **chat scope** are represented by STM/LTM, not raw
+history. Advances **only** on successful tier-1. Missing/unparseable file ⇒
+watermark 0 (replay everything raw — safe fallback). Task scopes use the
+per-task brief watermark instead (TASK_SPEC §4.2); the two never interact.
 
 ### 4.3 Snapshot semantics
 
-Tier-1 pseudocode:
-
-```python
-async def run_tier1():
-    async with stm_lock:
-        snapshot_id = store.latest_id()                # capture
-        events = store.read_range(watermark, snapshot_id)
-        if estimate_tokens(events) < working_memory_tokens:
-            return                                     # raced; nothing to do
-        result = await compaction_model.summarize(events, suggested_boundary)
-        if not valid(result):
-            emit(ERROR); return
-        append_sections(short_term_md, result.sections)
-        watermark = result.boundary_event_id
-        emit(mem_compacted, ...)
-    # check if tier-2 is now warranted
-    if estimate_tokens(short_term_md) >= short_term_tokens:
-        schedule_tier2()
-```
-
-New events arriving during the LLM call are appended normally to the event
-store; they will be eligible for the *next* tier-1 pass. The agent loop is
-never blocked by compaction.
+Tier-1 captures `store.latest_id()` as its upper bound under the per-eonlet
+lock; events appended during the LLM call land in the *next* pass. The agent
+loop is never blocked by compaction. (M-I4.)
 
 ### 4.4 Tier-2 (STM → LTM)
 
-**Trigger:** when `tokens(short_term.md) > conversation.short_term_tokens`.
+**Trigger:** `tokens(short_term.md) > episodic.short_term_tokens`, checked
+after a tier-1 ran.
 
-**Input:** the full STM, sectioned per §2.1.
-
-**Output:** new LTM bullets (under existing category headers; create the
-header if absent) and a reduced STM keeping only the sections the model
-flagged as `stm_keep`.
-
-**LLM response schema:**
+**Input:** the full STM. **Output:** new `episodic` LTM bullets (tagged
+`[src:implicit, ts:<today>]`) and a reduced STM keeping only sections the
+model flagged:
 
 ```json
 {
-  "ltm_additions": [
-    {"section": "user|feedback|project|reference|fact|episodic", "content": "..."}
-  ],
-  "stm_keep_section_headers": ["## [...] topic", "..."]
+  "ltm_additions": [{"section": "episodic", "content": "..."}],
+  "stm_keep_section_headers": ["## [...] topic"]
 }
 ```
 
-Validation:
+Validation: `section` MUST be `episodic`; keep-headers must exactly match
+existing STM headers (unknown ⇒ ignored, missing ⇒ section dropped).
 
-- Each `ltm_additions[].section` MUST be one of the six categories.
-- Each header in `stm_keep_section_headers` MUST be an exact match for an
-  existing STM section header. Unknown headers are ignored; missing
-  matches result in the section being dropped.
-- All bullets added by tier-2 are tagged `[src:implicit, ts:<today>]`.
+**Event:** `mem_ltm_promoted` `{snapshot_id, additions, kept_section_count}`.
 
-**Event:** `mem_ltm_promoted` with payload
-`{snapshot_id, additions, kept_section_count}`.
+### 4.5 Tier-3 (LTM forgetting)
 
-### 4.5 Tier-3 (LTM → LTM, "forgetting")
+**Trigger:** `tokens(long_term.md) > episodic.long_term_tokens`.
 
-**Trigger:** when `tokens(long_term.md) > conversation.long_term_tokens`.
-
-**Input:** the full LTM document.
-
-**Output:** a rewritten LTM that fits within budget. Items tagged
-`src:explicit` (or any of the explicit categories `user/feedback/project/
-reference`) are merge candidates only; items tagged `src:implicit` (from
-tier-2) may be dropped entirely.
-
-**LLM response schema:**
+**Input:** the full LTM. **Output:** a rewritten LTM within budget. Selection
+is uniform recency/salience — no source-based exemption (durable facts belong
+in the knowledge axis, which tier-3 never touches).
 
 ```json
 {
-  "kept_bullets": [
-    {"section": "...", "content": "...", "src": "...", "ts": "...", "merged_from": ["..."]}
-  ],
-  "dropped_bullets": [
-    {"section": "...", "preview": "first 80 chars", "reason": "duplicate|stale|low-salience"}
-  ]
+  "kept_bullets": [{"section": "...", "content": "...", "src": "...", "ts": "...", "merged_from": ["..."]}],
+  "dropped_bullets": [{"section": "...", "preview": "first 80 chars", "reason": "duplicate|stale|low-salience"}]
 }
 ```
 
-`merged_from` allows two implicit observations to combine into one
-consolidated explicit-style bullet.
+**Event:** `mem_ltm_forgotten` `{snapshot_id, kept_count, dropped_count,
+dropped_digest}` — the digest keeps *what was forgotten* in the log even when
+LTM no longer has it (M-I7).
 
-The runtime rewrites `long_term.md` in full from `kept_bullets`, preserving
-category ordering.
+### 4.6 Decision channel (consent round-trip, ADR-0006)
 
-**Event:** `mem_ltm_forgotten` with payload
-`{snapshot_id, kept_count, dropped_count, dropped_digest: [...]}`.
+Agent-proposed compaction and the interactive permission confirm share one
+generic blocking round-trip (`worker/decisions.py`): the worker pushes a
+`decision/request` notification to attached sessions and blocks; the CLI
+answers with `decision.respond`; first responder wins. No attached session (or
+the last one detaching mid-wait) auto-declines — a headless worker never
+hangs.
 
-`dropped_digest` carries the `preview + reason` for each drop so the event
-log retains *what was forgotten* even when LTM no longer does.
+### 4.7 Auto-compact pause
 
-### 4.6 Auto-compact pause
-
-The worker exposes a session-scoped boolean `auto_compact_enabled`,
-initialized from `agent.yaml`'s `memory.episodic.auto_compact`. When
-false, threshold-driven (bounded-auto) compaction is suppressed; explicit calls
-to `memory.compact` / `/compact` still run.
-
-This flag is **not** persisted. Restart re-reads config defaults.
-
-### 4.6.1 Decision channel (consent round-trip, ADR-0006)
-
-The agent-proposed trigger (§4.0) and the interactive permission confirm share
-**one** generic blocking round-trip (`worker/decisions.py`):
-
-1. The worker registers a pending decision and pushes a `decision/request`
-   notification (`{id, kind, prompt, options, payload}`, `kind ∈ {"permission",
-   "compaction"}`) to the attached session(s); the agent task blocks.
-2. An attached CLI renders the prompt and replies with a `decision.respond`
-   request (`{id, choice}`). The first responder wins; later/duplicate answers
-   to a resolved id are ignored.
-3. The blocked task resumes with the choice.
-
-If **no session is attached** when the decision is raised, or the **last session
-detaches while waiting**, the decision auto-declines — a headless worker never
-hangs. The blocking design also means the working window cannot keep growing
-while a proposal awaits consent.
-
-### 4.7 Per-turn timestamps (ADR-0006)
-
-When `memory.inject_turn_timestamps` is true, each user message rendered into the
-working window is prefixed at render time with its local datetime, e.g.
-`[2026-05-30 14:23 +08:00] <content>`. This is **render-time only** — nothing is
-written back into the `user_message` event payload (events stay immutable;
-`Event.ts` already carries the time). It gives the model temporal cognition of
-*when* episodes happened, matching the dated STM/LTM and the session boundaries
-that user-forced compaction emits.
+Session-scoped `auto_compact_enabled` (init from
+`memory.episodic.auto_compact`; `/compact off|on` flips it; not persisted).
+When false, threshold-driven compaction is suppressed; explicit `/compact`
+still runs.
 
 ---
 
 ## 5. Tool Surface
 
-All tools live in `src/eonlet/tools/builtin/`. Each follows `TOOL_SPEC.md`
-conventions. Tools are listed by canonical name; `ToolAnnotations` shows
-the permission posture.
+All in `src/eonlet/tools/builtin/`. The `task` tool is specified in
+`TASK_SPEC.md`.
 
 ### 5.1 `recall` (read_only)
 
 ```python
 class RecallArgs:
     mode: Literal["by_keyword", "by_date", "by_date_range", "around_event"]
-    query: str | None = None              # by_keyword
-    date: str | None = None               # by_date — YYYY-MM-DD
+    query: str | None = None
+    date: str | None = None                  # YYYY-MM-DD
     date_range: tuple[str, str] | None = None
     around_event_id: int | None = None
     context_radius: int = 5
     limit: int = 20
-    include: list[Literal["events", "notes", "todos", "memory"]] = ["events"]
+    include: list[Literal["events", "knowledge", "tasks"]] = ["events"]
 ```
 
-Returns markdown formatted as:
+Returns markdown; each hit carries its event id (`#1284`) for follow-up
+`around_event` queries. Recall spans **all scopes** — it is the escape hatch
+into compacted chat history and pruned task turns alike.
 
-```
-## by_keyword "AAPL trim" — 7 hits
-
-### [2026-05-22 14:23 #1284] user
-We should trim AAPL by 3% this week.
-
-### [2026-05-22 14:24 #1285] assistant
-Got it — preparing the trade...
-```
-
-Each hit carries the event id (`#1284`) for follow-up `around_event`
-queries. `include="memory"` adds a section per matching memory document.
-
-### 5.2 `remember` (destructive)
-
-```python
-class RememberArgs:
-    content: str
-    category: Literal["user", "feedback", "project", "reference", "fact"] = "fact"
-```
-
-Writes a bullet to LTM under the given category with trailer
-`[src:explicit, ts:<today>]`. `episodic` is not a valid explicit category
-(it's compaction-only).
-
-### 5.3 `note` (destructive on mutating actions)
-
-Discriminated union by `action`:
+### 5.2 `knowledge` (destructive on mutating actions)
 
 | action | extra args | annotation |
 |---|---|---|
-| `add` | `title?: str, content: str, tags?: list[str]` | destructive |
-| `list` | `tags?: list[str]` | read_only |
-| `get` | `id: str` | read_only |
-| `update` | `id: str, content: str` | destructive |
-| `delete` | `id: str` | destructive |
+| `open` | `path` | read_only |
+| `list` | – | read_only |
+| `write` | `path, content, index_line?` | destructive |
+| `edit` | `path, old_string, new_string` | destructive |
+| `delete` | `path` | destructive |
+| `move` | `path, new_path, index_line?` | destructive |
 
-Notes use slugged ids derived from title or auto-generated
-(`note-<YYYY-MM-DD>-<4hex>`).
+`write`/`edit`/`move` keep `index.md` in sync and emit `kb_*` events carrying
+the resulting full body (§7). `write`/`move` results carry a visible warning
+when the index exceeds `knowledge.index_max_tokens`.
 
-### 5.4 `todo` (destructive on mutating actions)
-
-| action | extra args | annotation |
-|---|---|---|
-| `add` | `content: str, due?: ISO, tags?: list[str]` | destructive |
-| `list` | `status?: "pending|done|cancelled|all" = "pending"` | read_only |
-| `done` | `id: str` | destructive |
-| `update` | `id: str, content?: str, due?: ISO, tags?: list[str]` | destructive |
-| `delete` | `id: str` | destructive |
-
-### 5.5 `memory` (mixed)
+### 5.3 `memory` (mixed)
 
 | action | extra args | annotation |
 |---|---|---|
-| `show` | `store?: "stm|ltm|notes|todos|all" = "all"` | read_only |
+| `show` | `store?: "stm"\|"ltm"\|"knowledge"\|"all"` | read_only |
 | `compact` | – | destructive |
+| `propose_compact` | `boundary_event_id, reason` | destructive (consented) |
 | `compact_ltm` | – | destructive |
-| `pause` | – | destructive |
-| `resume` | – | destructive |
+| `pause` / `resume` | – | destructive |
 
-`compact` runs tier-1; `compact_ltm` runs tier-3. Tier-2 is not exposed as
-a direct action — it triggers automatically as a follow-up to tier-1.
-
-### 5.6 `forget` (destructive)
-
-```python
-class ForgetArgs:
-    target: str          # id, partial content match, or category:bullet_index
-    confirm: bool = False
-```
-
-Without `confirm=True`, returns a dry-run preview of what would be deleted.
-With `confirm=True`, performs the deletion and emits `mem_ltm_forgotten`
-with `dropped_digest` carrying the removed content.
-
-### 5.7 Removed tools and fields
-
-The current `notes_read` / `notes_append` tools (v0.0.x) are **removed**
-by P2 of this spec. The new `note.add` action subsumes `notes_append`;
-`note.get` and `note.list` subsume `notes_read`.
-
-The `memory.notes_files` and `memory.recent_messages_in_context` fields
-in `agent.yaml` (v0.0.x schema) are **removed** outright. The new layout
-has exactly one `notes.md` per eonlet, and recent-window sizing is
-token-driven (`working_memory_tokens` + `keep_recent_messages_min` floor).
-The config loader rejects the legacy fields with a `ConfigError`.
+`compact` runs tier-1; `compact_ltm` runs tier-3; tier-2 triggers only as a
+tier-1 follow-up. `propose_compact` is the §4.0 agent-proposed trigger.
 
 ---
 
 ## 6. Slash Commands
 
-Surface available inside `eonlet attach`. Each routes through IPC to the
-worker; CLI is a thin client.
+Inside `eonlet attach`; each routes through worker IPC.
 
 | Command | Effect |
 |---|---|
-| `/compact` | Force tier-1 |
-| `/compact off` | Disable auto-compaction (session-scoped) |
-| `/compact on` | Re-enable auto-compaction |
-| `/compact ltm` | Force tier-3 |
-| `/memory show [stm\|ltm\|notes\|todos]` | Render store contents to the terminal |
-| `/memory edit <store>` | Open `$EDITOR` on the file; on close, reload |
-| `/recall <query>` | Keyword recall, rendered with rich formatting |
-| `/recall date <YYYY-MM-DD>` | By-date recall |
-| `/note add <text>` | Append a note |
-| `/note list [tag]` | List notes, optionally filtered by tag |
-| `/todo add <text>` | Create a todo |
-| `/todo done <id>` | Mark a todo done |
-| `/todo list [status]` | List todos |
-| `/remember <text>` | Write to LTM, default category `fact` |
-| `/forget <id\|query>` | Forget bullets (CLI prompts for confirm) |
-
-Slash commands MUST be parsed by the CLI; the IPC method exposed to the
-worker is `memory.command(verb, args)` with a structured payload.
+| `/compact` | User-forced full compaction (clean slate + episode boundary) |
+| `/compact off` / `/compact on` | Toggle auto-compaction (session-scoped) |
+| `/memory show [stm\|ltm\|knowledge\|all]` | Render store contents |
+| `/knowledge list` / `open <path>` / `write <path> <text>` / `rm <path>` | Knowledge axis ops |
+| `/task …` | Task ops (see TASK_SPEC / CLI_REFERENCE) |
 
 ---
 
 ## 7. Events
 
-All memory-related state changes append events to the event store. Kinds:
-
 | Kind | Trigger | Payload shape |
 |---|---|---|
-| `mem_compacted` | tier-1 success | `{tier:1, snapshot_id, boundary_event_id, sections_added:int, tokens_before:int, tokens_after:int, model:str}` |
-| `mem_ltm_promoted` | tier-2 success | `{snapshot_id, additions:[{section,content,src,ts}], kept_section_count:int, model:str}` |
-| `mem_ltm_forgotten` | tier-3 success OR `forget` tool | `{snapshot_id?, kept_count:int, dropped_count:int, dropped_digest:[{section,preview,reason}], cause:"tier3"\|"forget", model?:str}` |
-| `mem_note_added` | `note.add` | `{id, title?, tags}` |
-| `mem_note_updated` | `note.update` | `{id}` |
-| `mem_note_deleted` | `note.delete` | `{id}` |
-| `mem_todo_added` | `todo.add` | `{id, content, due?, tags}` |
-| `mem_todo_updated` | `todo.update`/`todo.done` | `{id, status, done_at?}` |
-| `mem_todo_deleted` | `todo.delete` | `{id}` |
-| `mem_remember` | `remember` tool | `{section, content_preview, src:"explicit", ts}` |
-| `mem_recall_invoked` | `recall` tool entry | `{mode, query?, date?, hits:int}` |
-| `mem_paused` / `mem_resumed` | `/compact off` / `/compact on` | `{}` |
-| `mem_compact_proposed` | `memory.propose_compact` (guards passed) | `{boundary_event_id:int, reason:str, working_tokens:int}` |
-| `mem_compact_approved` | proposal approved | `{boundary_event_id:int, rule:"user"\|"yolo"}` |
-| `mem_compact_declined` | proposal declined | `{boundary_event_id:int, rule:"user"}` |
-| `session_started` / `session_ended` | user-forced full `/compact` boundary | `{reason:"compact"}` |
+| `mem_compacted` | tier-1 success | `{tier:1, snapshot_id, boundary_event_id, sections_added, tokens_before, tokens_after, model}` |
+| `mem_ltm_promoted` | tier-2 success | `{snapshot_id, additions, kept_section_count, model}` |
+| `mem_ltm_forgotten` | tier-3 success | `{snapshot_id, kept_count, dropped_count, dropped_digest, cause:"tier3", model?}` |
+| `mem_recall_invoked` | `recall` entry | `{mode, query?, date?, hits}` |
+| `mem_paused` / `mem_resumed` | `/compact off` / `on` | `{}` |
+| `mem_compact_proposed` | proposal guards passed | `{boundary_event_id, reason, working_tokens}` |
+| `mem_compact_approved` / `_declined` | consent outcome | `{boundary_event_id, rule}` |
+| `kb_written` | knowledge write/edit | `{path, size, action:"write"\|"edit", content}` — **carries the resulting full body** (knowledge must be reconstructable from the log; I-S1) |
+| `kb_deleted` | knowledge delete | `{path}` |
+| `kb_moved` | knowledge move | `{src, dst}` |
+| `session_started` / `session_ended` | `/compact` episode boundary | `{reason:"compact"}` |
 
-All of these are first-class `EventKind` values. `eonlet replay`, `eonlet
-tail`, and `eonlet export` MUST include them.
-
-Bodies of memory documents are NOT carried in event payloads (too large) —
-events carry counts, ids, and digests only. The current document state can
-be read from disk.
+STM/LTM bodies are NOT carried in events (counts, ids, digests only — they are
+re-derivable); knowledge bodies ARE (they are not re-derivable from anything
+else). Task events are specified in `TASK_SPEC.md`.
 
 ---
 
 ## 8. `agent.yaml` Schema
 
-The `memory` block in `agent.yaml`. **Old shape** (current code):
-
-```yaml
-memory:
-  recent_messages_in_context: 50
-  notes_files: [notes.md, todo.md]
-```
-
-**New shape** (this spec):
-
 ```yaml
 memory:
   enabled: true
-  compaction_model: "claude-haiku-4-5-20251001"
+  compaction_model: "claude-haiku-4-5@anthropic"
+  inject_turn_timestamps: true       # render-time [date time] prefix on user turns
 
-  conversation:
+  episodic:
     working_memory_tokens: 10000
     keep_recent_messages_min: 4
     short_term_tokens: 4000
     long_term_tokens: 8000
     auto_compact: true
+    propose_semantic: true           # allow agent-proposed compaction (ADR-0006)
+    propose_floor_tokens: 5000
+    propose_min_interval_seconds: 1800
+    propose_min_turns: 3
 
-  notes:
-    max_tokens: 4000
-    inject: true
-
-  todos:
-    inject_active: true
-    archive_done_after_days: 30      # 0 disables archival
+  knowledge:
+    inject_index: true
+    index_max_tokens: 2000           # over-budget ⇒ visible tool warning
+    warn_file_tokens: 4000
 ```
 
-Loader behavior:
-
-- All sub-fields have defaults; the entire `memory:` block can be omitted.
-- The legacy fields `recent_messages_in_context` and `notes_files` are
-  **rejected** at load time with a `ConfigError` pointing to the
-  migration tool. There is no silent acceptance period.
-- `enabled: false` disables the entire subsystem: no preamble injection, no
-  compaction, no tier triggers. The runtime falls back to the v0.0.x
-  "replay everything" behavior. Memory tools remain registered but return
-  `is_error=True` with a clear message.
-- `compaction_model` accepts any string the existing provider router
-  accepts (including `fake-*` for tests).
+- All sub-fields have defaults; the whole `memory:` block can be omitted.
+- The legacy v0.0.x fields (`recent_messages_in_context`, `notes_files`) are
+  rejected at load time with a `ConfigError`. No migration tool exists
+  (pre-alpha rewrites `agent.yaml`).
+- `tasks:` is a separate **top-level** block (`AGENT_CONFIG_SPEC.md` /
+  `TASK_SPEC.md`), not part of `memory:`.
 
 ---
 
 ## 9. Disabled Mode
 
-`memory.enabled = false` semantics in detail:
+`memory.enabled = false`:
 
-1. No memory preamble is added to the system prompt.
-2. The runtime falls back to `recent_messages_in_context` for window
-   selection (with the new spec's default = 30).
-3. Compaction tasks are not scheduled.
-4. STM/LTM/notes/todos files are not created. Pre-existing files are
-   untouched.
-5. Memory tools (`recall`, `remember`, `note`, `todo`, `memory`, `forget`)
-   return `ToolResult(is_error=True, content="memory subsystem disabled in agent.yaml")`.
-6. Slash commands print a one-line notice and do nothing.
-
-This mode exists for tests, one-shot agents, and the migration period
-before P2 has shipped.
+1. No memory preamble; no `<knowledge_index>`.
+2. No compaction (any tier, any trigger); watermark ignored (treated as 0).
+3. The window is still bounded by the `episodic` token budgets (the budget
+   walk needs no memory files).
+4. Memory files are not created; pre-existing files are untouched.
+5. `memory` tool actions and `propose_compact` return
+   `is_error=True` with a clear message; task checkpoint briefs fall back to
+   the structural summary.
 
 ---
 
 ## 10. Lifecycle Hooks
 
-The memory subsystem hooks into the worker lifecycle at four points:
-
-1. **Worker startup** — read watermark; verify `index.sqlite` schema and
-   rebuild if missing/corrupt; load memory document file mtimes for the
-   memory preamble cache.
-2. **Event append** — incrementally update `msg_fts` and `msg_meta` for any
-   event with text-bearing payload.
-3. **Worker idle** — opportunistic time to run pending compaction tasks.
-   The runtime checks token estimates at the end of every agent run; if a
-   tier's threshold is crossed, it schedules the task before going idle.
-4. **TODO archival sweep** — once per worker startup and once per day, scan
-   `todos.jsonl` for entries with `status=done` and `done_at` older than
-   `archive_done_after_days`; move them to `todos.archive.jsonl`. Skipped
-   if `archive_done_after_days == 0`.
+1. **Worker startup** — verify/rebuild `index.sqlite`, catch up any events
+   appended after the highest indexed id.
+2. **Event append** — `AgentRuntime._record` indexes every text-bearing event
+   into the recall index synchronously.
+3. **Post-run** — the compaction cascade runs inline after every run:
+   tier-1 (threshold) → tier-2 (if tier-1 ran) → tier-3 (threshold).
 
 ---
 
-## 11. Migration from Legacy `auto memory`
+## 11. Invariants & Test Guidance
 
-`eonlet memory migrate <legacy_dir>` is a one-shot CLI subcommand that:
+- **M-I1** (Reconstructability) See I-S1. Knowledge: replaying `kb_written`/
+  `kb_deleted`/`kb_moved` reproduces the latest tree exactly.
+- **M-I2** (Watermark monotonicity) Both the chat watermark and every task's
+  brief watermark never decrease, including across restarts.
+- **M-I3** (Boundary safety) The window never includes a `tool_result` whose
+  `tool_call` is outside the window; compaction boundaries never split a pair.
+- **M-I4** (Snapshot isolation) Events appended during a compaction run land
+  in the next run's input, never the current run's output.
+- **M-I5** (Scope isolation) Task-scoped turns never enter STM/LTM, never
+  count toward the chat tier-1 threshold, and never appear in a chat window
+  (and vice versa). ADR-0009.
+- **M-I6** (Knowledge preservation) No automatic process ever deletes or
+  rewrites a knowledge file. Only the `knowledge` tool / IPC may.
+- **M-I7** (Forget auditability) After tier-3, dropped content's digest is
+  recoverable from the event log.
+- **M-I8** (Disabled-mode neutrality) With `memory.enabled = false`, no memory
+  file is created and no memory event is emitted.
 
-1. Reads `<legacy_dir>/MEMORY.md` and the per-fact files it indexes.
-2. Maps each fact's frontmatter `metadata.type` to the corresponding LTM
-   category (`user`/`feedback`/`project`/`reference`).
-3. Constructs an LTM document, writing each fact as one bullet with
-   trailer `[src:explicit, ts:<original mtime>]`.
-4. Writes the result to the target eonlet's `memory/long_term.md`.
-5. Refuses to overwrite an existing LTM file unless `--force` is passed.
-
-The migration tool is documented in `CLI_REFERENCE.md`. Migration is
-opt-in; agents created after P2 ships start with empty memory documents.
-
----
-
-## 12. Invariants & Test Guidance
-
-Implementations MUST verify these invariants:
-
-- **M-I1** (Replayability) Given an event log, the post-compaction state
-  of `memory/` can be reconstructed by replaying the log. Concretely:
-  delete `memory/`, restart the worker — the recall index rebuilds, STM
-  and LTM are reconstructed from `mem_compacted` / `mem_ltm_promoted` /
-  `mem_ltm_forgotten` events.
-- **M-I2** (Watermark monotonicity) Watermark never decreases across the
-  worker's lifetime, including across restarts.
-- **M-I3** (Boundary safety) The recent-messages window NEVER includes a
-  `tool_result` event whose corresponding `tool_call` is outside the
-  window.
-- **M-I4** (Snapshot isolation) New events appended during a compaction
-  run land in the next run's input, never the current run's output.
-- **M-I5** (Budget) For any sequence of conversations, `tokens(injected) ≤
-  runtime.max_context_tokens`. Provable by construction in §3.4.
-- **M-I6** (Notes preservation) Auto-compaction NEVER deletes notes
-  entries.
-- **M-I7** (Forget audibility) After `forget` or tier-3, the dropped
-  content's digest is recoverable from the event log.
-- **M-I8** (Disabled-mode neutrality) With `memory.enabled = false`, no
-  memory file is created and no memory event is emitted.
-
-Test layout:
-
-```
-tests/unit/memory/
-├── test_config.py            # schema, defaults, deprecation warnings
-├── test_storage.py           # atomic write, lock, file format round-trip
-├── test_watermark.py         # monotonicity, missing-file fallback
-├── test_index.py             # FTS5 rebuild, incremental update
-├── test_boundary.py          # M-I3 — never split tool_call pairs
-├── test_injection.py         # preamble assembly, budget enforcement
-├── test_compaction_t1.py     # uses FakeProvider for the compaction LLM
-├── test_compaction_t2.py
-├── test_compaction_t3.py
-├── test_tools_recall.py
-├── test_tools_remember.py
-├── test_tools_note.py
-├── test_tools_todo.py
-├── test_tools_memory.py
-└── test_disabled.py          # M-I8
-
-tests/integration/
-└── test_memory_e2e.py        # full loop: chat → tier-1 → tier-2 → recall
-```
-
-The compaction LLM in tests is the `FakeProvider` (added in v0.0.5),
-parameterized to return canned JSON for tier-1/2/3 requests.
+Test layout: see `tests/unit/memory/` (per-store, per-tier, injection,
+recall, knowledge, agent-injection end-to-end) — the structure in the repo is
+authoritative.
 
 ---
 
-## 13. Versioning
+## 12. Versioning
 
-This spec is `0.1.0`. Backwards-incompatible changes bump the major
-version; field additions bump the minor.
-
-Files written by this spec carry no embedded version — they are read
-liberally. The `index.sqlite` schema has its own `PRAGMA user_version`
-managed by the storage layer; missing or older versions trigger a
-rebuild, not a migration.
+This spec is `0.2.0` (dual-axis rewrite; supersedes `0.1.0` wholesale).
+Backwards-incompatible changes bump the major version; field additions bump
+the minor. `index.sqlite` carries its own `PRAGMA user_version`; missing or
+older versions trigger a rebuild, not a migration.
 
 ---
 
-## 14. References
+## 13. References
 
-- ADR-0003 — decision record for this subsystem
-- `SPEC.md` §7.5 — to be updated when this spec lands (memory subsystem
-  becomes non-trivial)
-- `TOOL_SPEC.md` — tool protocol the memory tools implement
-- `AGENT_CONFIG_SPEC.md` — to be updated with the new `memory:` block
+- ADR-0003 — original memory decision (compaction tiers, recall)
+- ADR-0005 — dual-axis re-architecture (knowledge axis, tasks out of memory)
+- ADR-0006 — compaction trigger matrix + consent channel + timestamps
+- ADR-0009 — task-scoped context; episodic = chat scope
+- `TASK_SPEC.md` — task forest, briefs, task-scope compaction
 - `src/eonlet/memory/` — implementation
-- `src/eonlet/tools/builtin/{recall,remember,note,todo,memory,forget}.py`
+- `src/eonlet/tools/builtin/{recall,knowledge,memory}.py`

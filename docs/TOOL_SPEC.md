@@ -423,18 +423,21 @@ Paths are confined to the knowledge tree: `..`, absolute paths, and the reserved
 
 Hierarchical, event-sourced workflow state — not memory (ADR-0005/0007). The
 forest is a fold of the task event log (no `todos.jsonl`); pending **leaves**
-inject as a `<tasks>` block each run. Full model: [TASK_SPEC](TASK_SPEC.md).
+plus suspended tasks inject as a `<tasks>` block each run. Full model:
+[TASK_SPEC](TASK_SPEC.md).
 
 ```yaml
 input:
-  action: "add" | "list" | "done" | "cancel" | "update" | "delete"
+  action: "add" | "list" | "done" | "cancel" | "resume" | "update" | "delete"
   content: string | null                  # for add/update
   id: string | null                       # for done/cancel/update/delete (defaults to
-                                          #   the current task inside a scheduled run)
+                                          #   the current task inside a scheduled run);
+                                          #   required for resume
   goal: string | null                     # durable objective (used on resume)
   parent_id: string | null               # for add → create a subtask (tree)
   priority: int | null                    # higher runs first (default 0)
-  result: string | null                   # for done → outcome summary
+  result: string | null                   # for done → outcome summary (REQUIRED when a
+                                          #   task-scoped run finishes its own task)
   schedule: string | null                 # for add → cron; hatches a fresh instance per fire
   timezone: string | null                 # required with schedule (IANA)
   due: string | null                      # optional ISO-8601
@@ -445,8 +448,10 @@ annotations: destructive
 
 Inside a scheduled task-run the agent calls `task(done)` / `task(add …)` without
 restating the id (they default to the *current task*); `add` without a parent is
-a subtask of it (the decomposition signal). Creation respects the
-`tasks.scheduling` depth/fan-out caps.
+a subtask of it (the decomposition signal). `done` for the run's own task
+requires a non-empty `result` — it is the only payload that flows up the tree.
+`resume` re-queues a suspended task (→ pending) so the scheduler picks it up.
+Creation respects the `tasks.scheduling` depth/fan-out caps.
 
 ### 6.13 `send_email`
 

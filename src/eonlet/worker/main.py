@@ -252,7 +252,12 @@ async def _signal_watcher(shutdown: anyio.Event, on_signal: Callable[[], None]) 
             return
 
 
-SCHED_POLL_S = 1.0  # idle re-check cadence when the task scheduler is enabled
+# Idle re-check cadence under task scheduling. A safety net only: every path
+# that creates runnable work either happens inside the loop itself or pushes a
+# queue item / `task_wake` sentinel — so this can be long. (At 1 s an idle
+# worker burns a wakeup per second per agent, which multiplies badly across a
+# fleet.)
+SCHED_POLL_S = 30.0
 _CLOSED = object()  # sentinel: the trigger stream was closed
 
 

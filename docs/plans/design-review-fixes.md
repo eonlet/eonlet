@@ -10,11 +10,13 @@ does not change decisions).
 
 Status legend: `[ ]` open · `[x]` done · `[~]` documented-as-deliberate.
 
+**All fifteen items landed 2026-06-10** (commits: Round A–E on main).
+
 ---
 
 ## A. Severe — design promises broken in implementation
 
-### P1 `[ ]` Task results never flow back into the chat scope
+### P1 `[x]` Task results never flow back into the chat scope
 
 **Problem.** ADR-0009 promises "T completes → result surfaces upward into
 chat … and that enters episodic memory naturally". In code, `TASK_TRANSITIONED`
@@ -29,7 +31,7 @@ run (`_run_task`), record a chat-scope `<task_result>` envelope as a
 window naturally on the next turn and is folded into STM by tier-1. Chat-turn
 `task(done)` calls need no envelope (already visible in chat scope).
 
-### P2 `[ ]` Crash leaves `active` tasks wedged forever
+### P2 `[x]` Crash leaves `active` tasks wedged forever
 
 **Problem.** `_run_task` records `→active` then runs. A crash/SIGKILL mid-run
 replays the task as `active`; `next_runnable` only picks pending leaves /
@@ -40,7 +42,7 @@ in `<tasks>`. No startup reconciliation exists.
 (`reason="crash_recovery"`). Serial execution guarantees at most one task can
 legitimately be active, and the worker is just starting — none is.
 
-### P3 `[ ]` Suspended tasks are a black hole
+### P3 `[x]` Suspended tasks are a black hole
 
 **Problem.** YIELDED (incl. budget-exhausted, and "model forgot `task(done)`")
 → `suspended`; the scheduler never picks suspended; the `<tasks>` block hides
@@ -55,7 +57,7 @@ cancels. Tasks vanish without anyone being told.
 
 ## B. Memory system — invariants & consistency
 
-### P4 `[ ]` Knowledge axis is not event-sourced (I-S1 is false)
+### P4 `[x]` Knowledge axis is not event-sourced (I-S1 is false)
 
 **Problem.** `knowledge/` is the "never auto-deleted" curated asset, yet it is
 a single on-disk copy: `kb_written` carries only path+size, so the event log —
@@ -66,7 +68,7 @@ nominally the single source of truth (Invariant #1) — cannot reconstruct it.
 are small markdown by design). The log then preserves every version; a rebuild
 tool can come later. Document the amended invariant.
 
-### P5 `[ ]` Chat STM/LTM is injected into task-scoped runs
+### P5 `[x]` Chat STM/LTM is injected into task-scoped runs
 
 **Problem.** `handle_user_message` builds the `<memory>` preamble
 unconditionally, so every task beat carries the *chat* episodic timeline —
@@ -78,7 +80,7 @@ makes the *knowledge* axis global.
 `<long_term>`/`<short_term>` (episodic = chat scope, per the ADR). `recall`
 remains the escape hatch.
 
-### P6 `[ ]` Knowledge-index overflow has no feedback loop
+### P6 `[x]` Knowledge-index overflow has no feedback loop
 
 **Problem.** The index is injected every call; exceeding `index_max_tokens`
 only logs a warning the agent never sees. The agent is the only entity that can
@@ -103,7 +105,7 @@ MEMORY_SPEC §3.2.
 
 ## C. Scheduling & runtime efficiency
 
-### P8 `[ ]` Every user message costs an LLM checkpoint of the running task
+### P8 `[x]` Every user message costs an LLM checkpoint of the running task
 
 **Problem.** Any interactive message — even "thanks" — pauses the running task
 and triggers a full LLM brief compression before re-queue, then re-dispatch.
@@ -114,7 +116,7 @@ Chatty users thrash the task with paid LLM calls.
 intact for the resume). The LLM brief stays for yield/suspend/cross-tree
 preemption, where the task may sit for a long time.
 
-### P9 `[ ]` 1 Hz idle polling
+### P9 `[x]` 1 Hz idle polling
 
 **Problem.** With scheduling enabled the worker wakes every second forever.
 All paths that create runnable work already push a queue item or `task_wake`
@@ -124,7 +126,7 @@ is a belt-and-braces only.
 **Fix.** Raise `SCHED_POLL_S` to 30 s (safety net), keep the wake sentinel as
 the primary signal.
 
-### P10 `[ ]` Cancelling/deleting a running task doesn't stop the run
+### P10 `[x]` Cancelling/deleting a running task doesn't stop the run
 
 **Problem.** `pause_check` returns False when the current task is deleted and
 doesn't look at terminal states — the run burns tokens to its natural end.
@@ -132,7 +134,7 @@ doesn't look at terminal states — the run burns tokens to its natural end.
 **Fix.** First check in `pause_check`: current task gone or terminal → end the
 run immediately; `_run_task` skips checkpoint/transition for that case.
 
-### P11 `[ ]` Per-task budget re-reads the whole log every turn
+### P11 `[x]` Per-task budget re-reads the whole log every turn
 
 **Problem.** The budget check does `store.read(since=start_id)` and sums at
 *every* turn boundary — O(suffix) per turn, on top of the known full-read
@@ -145,7 +147,7 @@ the delta since the last check).
 
 ## D. Context organization — smaller
 
-### P12 `[ ]` `progress_summary`/`framing` double-injected and go stale
+### P12 `[x]` `progress_summary`/`framing` double-injected and go stale
 
 **Problem.** On resume, the brief appears both in the framing `USER_MESSAGE`
 ("Progress so far") and in the system prompt (`<task_progress>`); repeated
@@ -157,7 +159,7 @@ above") and progress out of the kickoff message into the system prompt
 (rebuilt every turn, hence never stale); keep the kickoff message minimal
 (instructions + goal + synthesis child results).
 
-### P13 `[ ]` `task(done)` accepts an empty result
+### P13 `[x]` `task(done)` accepts an empty result
 
 **Problem.** The `result` is the *only* payload of the upward flow; an empty
 one leaves the parent synthesis (and P1's chat envelope) with "(done)".
@@ -166,7 +168,7 @@ one leaves the parent synthesis (and P1's chat envelope) with "(done)".
 `result` (error prompts the model to supply one). Chat-scope `done` (user
 ticking items off) stays optional.
 
-### P14 `[ ]` `mem_compacted.model` records a class name
+### P14 `[x]` `mem_compacted.model` records a class name
 
 **Problem.** Audit field carries `type(compactor).__name__` ("LLMCompactor"),
 not the model id.
@@ -177,7 +179,7 @@ not the model id.
 
 ## E. Documentation
 
-### P15 `[ ]` MEMORY_SPEC is partially false
+### P15 `[x]` MEMORY_SPEC is partially false
 
 **Problem.** The spec carries a long superseding notice; §5–§11 describe
 removed tools (`note`/`remember`/`forget`/`todo`), the old config shape, and a
