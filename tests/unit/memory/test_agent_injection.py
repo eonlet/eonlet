@@ -640,6 +640,6 @@ def test_consecutive_user_messages_coalesced(tmp_path: Path) -> None:
         assert not (roles[i] == "user" and roles[i + 1] == "user"), roles
     # And the merged content carries all three pieces.
     merged = "\n".join(m.content for m in rec.last_messages if m.role == "user")
-    assert "task_result id=\"a\"" in merged
-    assert "task_result id=\"b\"" in merged
+    assert 'task_result id="a"' in merged
+    assert 'task_result id="b"' in merged
     assert "now the user speaks" in merged

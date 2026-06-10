@@ -147,9 +147,7 @@ def test_kb_written_events_carry_full_body(tmp_path: Path) -> None:
             ctx,
         )
         await tool(
-            KnowledgeArgs(
-                action="edit", path="user.md", old_string="terse", new_string="concise"
-            ),
+            KnowledgeArgs(action="edit", path="user.md", old_string="terse", new_string="concise"),
             ctx,
         )
 
