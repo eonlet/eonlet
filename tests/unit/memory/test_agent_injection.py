@@ -509,3 +509,58 @@ def test_task_scope_compaction_folds_and_prunes(tmp_path: Path) -> None:
     # …and the brief is carried in the system prompt instead.
     assert "<task_progress>" in runtime._build_system_prompt()
     runtime.current_task_id = None
+
+
+def test_task_scoped_run_skips_episodic_preamble(tmp_path: Path) -> None:
+    # ADR-0009 §5 / design-review P5: the knowledge axis is global, but STM/LTM
+    # are the CHAT timeline — a task-scoped run must not carry them.
+    from eonlet.runtime.events import task_created
+
+    runtime, rec = _build_runtime(tmp_path)
+    (runtime.memory_dir / "long_term.md").write_text("## episodic\n- LTM-MARKER")
+    (runtime.memory_dir / "short_term.md").write_text("## [t] x\nSTM-MARKER")
+    kdir = runtime.memory_dir / "knowledge"
+    kdir.mkdir()
+    (kdir / "index.md").write_text("- [user.md] KB-MARKER")
+
+    async def go() -> None:
+        await runtime._record(task_created(id="task-a", content="do it"))
+        runtime.current_task_id = "task-a"
+        try:
+            async for _ in runtime.handle_user_message("<task> go </task>"):
+                pass
+        finally:
+            runtime.current_task_id = None
+
+    anyio.run(go)
+    assert "KB-MARKER" in rec.last_system  # knowledge stays global
+    assert "LTM-MARKER" not in rec.last_system
+    assert "STM-MARKER" not in rec.last_system
+
+    # A plain chat turn still gets the full preamble.
+    async def chat() -> None:
+        async for _ in runtime.handle_user_message("hello"):
+            pass
+
+    anyio.run(chat)
+    assert "LTM-MARKER" in rec.last_system and "STM-MARKER" in rec.last_system
+
+
+def test_task_context_framing_in_system_prompt(tmp_path: Path) -> None:
+    # Design-review P12: the down-tree trace lives in the system prompt
+    # (<task_context>), rebuilt per turn — not as a stale kickoff-message copy.
+    from eonlet.runtime.events import task_created, task_updated
+
+    runtime, _rec = _build_runtime(tmp_path)
+
+    async def go() -> None:
+        await runtime._record(task_created(id="task-a", content="schema"))
+        await runtime._record(task_updated(id="task-a", framing="Parent chose Postgres."))
+
+    anyio.run(go)
+    runtime.current_task_id = "task-a"
+    sp = runtime._build_system_prompt()
+    runtime.current_task_id = None
+    assert "<task_context>" in sp and "Parent chose Postgres." in sp
+    # Outside the task scope, no task blocks at all.
+    assert "<task_context>" not in runtime._build_system_prompt()

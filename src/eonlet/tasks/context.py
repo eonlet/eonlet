@@ -1,11 +1,12 @@
 """Per-task prompt assembly for scheduler-driven runs (ADR-0007, M2).
 
 When the scheduler dispatches a task, the agent needs to know *what* it is
-working on and *where it left off*. We don't open a separate long-lived
-conversation per task (ADR §4); instead we assemble a focused framing message
-from the live forest — goal + parent chain + resume brief + (for a synthesis
-turn) the children's results. Knowledge and episodic recall are already injected
-by the memory preamble, so this only carries the task-specific context.
+working on. We don't open a separate long-lived conversation per task (ADR §4);
+instead we assemble a focused kickoff message from the live forest — goal +
+parent chain + (for a synthesis turn) the children's results. The decision
+trace and resume brief travel in the system prompt (``<task_context>`` /
+``<task_progress>``, rebuilt per turn), and the knowledge index is injected by
+the memory preamble — so this only carries the per-dispatch specifics.
 
 Pure function over the forest — no I/O, no LLM.
 """
@@ -36,11 +37,15 @@ def _parent_chain(forest: TaskForest, task_id: str) -> list[str]:
 
 
 def build_task_prompt(forest: TaskForest, task_id: str) -> str:
-    """Return the framing message seeding a task-scoped run.
+    """Return the kickoff message seeding a task-scoped run.
 
-    Includes a how-to-finish instruction, the goal, the parent chain, any resume
-    brief (``progress_summary``), and — when all children are terminal — their
-    results for the synthesis turn.
+    Carries the how-to-finish instruction, the goal, the parent chain, and —
+    when all children are terminal — their results for the synthesis turn.
+    The down-tree decision trace (``framing``) and the resume brief
+    (``progress_summary``) are *not* repeated here: the runtime injects them
+    into the system prompt (``<task_context>`` / ``<task_progress>``), which is
+    rebuilt every turn — so they never go stale, and repeated pauses don't
+    accumulate contradictory copies in the scope window.
     """
     t = forest.get(task_id)
     if t is None:
@@ -61,17 +66,6 @@ def build_task_prompt(forest: TaskForest, task_id: str) -> str:
     chain = _parent_chain(forest, t.id)
     if chain:
         lines.append("Parent context: " + " > ".join(chain))
-
-    # Down-tree decision trace (ADR-0009 M3): the parent's (or chat's) decisions
-    # this task must stay coherent with — so a subtask doesn't relitigate how the
-    # work was decomposed.
-    if t.framing:
-        lines.append("")
-        lines.append(f"Context from above: {t.framing}")
-
-    if t.progress_summary:
-        lines.append("")
-        lines.append(f"Progress so far: {t.progress_summary}")
 
     children = forest.children(t.id)
     if children and all(is_terminal(c.status) for c in children):

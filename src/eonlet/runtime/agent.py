@@ -168,9 +168,14 @@ class AgentRuntime:
         # Build the memory preamble once per run. Stores might mutate during
         # the run (e.g. agent adds a note mid-conversation), but recomputing
         # mid-turn would inflate token usage; we re-build next run.
+        # A task-scoped run gets the knowledge index only (ADR-0009 §5):
+        # STM/LTM are the chat timeline; the task's context comes from its
+        # down-tree trace + own scope, not the whole conversation history.
         try:
             self._cached_preamble = await build_memory_preamble(
-                self.memory_dir, self.definition.config.memory
+                self.memory_dir,
+                self.definition.config.memory,
+                include_episodic=self.current_task_id is None,
             )
         except Exception:
             log.exception("memory preamble build failed; injecting nothing")
@@ -545,14 +550,20 @@ class AgentRuntime:
             parts.append(self._cached_preamble)
         if self._cached_tasks:
             parts.append(self._cached_tasks)
-        # During a task-scoped run, inject the current task's live resume brief
-        # (ADR-0009 M4). Rebuilt each turn, so as task-scope compaction folds older
-        # turns out of the window the brief stays present here — continuity without
-        # re-injecting messages.
+        # During a task-scoped run, inject the task's down-tree decision trace
+        # (<task_context>, ADR-0009 M3) and live resume brief (<task_progress>,
+        # M4) here rather than in the kickoff message: the system prompt is
+        # rebuilt every turn, so both stay present — and current — as the
+        # window prunes, with no stale copies accumulating as messages.
         if self.current_task_id is not None:
             t = self.task_forest.get(self.current_task_id)
-            if t is not None and t.progress_summary.strip():
-                parts.append(f"<task_progress>\n{t.progress_summary.strip()}\n</task_progress>")
+            if t is not None:
+                if t.framing.strip():
+                    parts.append(f"<task_context>\n{t.framing.strip()}\n</task_context>")
+                if t.progress_summary.strip():
+                    parts.append(
+                        f"<task_progress>\n{t.progress_summary.strip()}\n</task_progress>"
+                    )
         return "\n\n".join(parts)
 
     # ── event recording ──────────────────────────────────────────────────────

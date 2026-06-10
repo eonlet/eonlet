@@ -55,13 +55,20 @@ class WindowSlice:
 # ── Preamble assembly ──────────────────────────────────────────────────────
 
 
-async def build_memory_preamble(memory_dir: Path, cfg: MemoryConfig) -> str:
+async def build_memory_preamble(
+    memory_dir: Path, cfg: MemoryConfig, *, include_episodic: bool = True
+) -> str:
     """Return the ``<memory>...</memory>`` block, or ``""`` when empty.
 
     Sub-blocks are emitted in the order knowledge_index → long_term →
     short_term. The knowledge index (ADR-0005) is the always-injected map of
     the curated knowledge tree; its file bodies are never injected. Each block
     is omitted when its source is empty (or its ``inject*`` flag is false).
+
+    ``include_episodic=False`` keeps only the knowledge index — used for
+    task-scoped runs (ADR-0009 §5): the knowledge axis is global, but STM/LTM
+    are the *chat* timeline; a task gets its context via the down-tree trace,
+    not the whole conversation history.
 
     Tasks are **not** part of memory anymore (ADR-0005) — the runtime injects a
     sibling ``<tasks>`` block via :func:`build_tasks_block`.
@@ -84,19 +91,19 @@ async def build_memory_preamble(memory_dir: Path, cfg: MemoryConfig) -> str:
                 )
             blocks.append(f"<knowledge_index>\n{index_text}\n</knowledge_index>")
 
-    # ── long-term (episodic timeline) ──────────────────────────────────
-    ltm_path = long_term_path(memory_dir)
-    if ltm_path.exists():
-        ltm_text = ltm_path.read_text(encoding="utf-8").strip()
-        if ltm_text:
-            blocks.append(f"<long_term>\n{ltm_text}\n</long_term>")
+    # ── episodic timeline (chat scope only — skipped for task runs) ────
+    if include_episodic:
+        ltm_path = long_term_path(memory_dir)
+        if ltm_path.exists():
+            ltm_text = ltm_path.read_text(encoding="utf-8").strip()
+            if ltm_text:
+                blocks.append(f"<long_term>\n{ltm_text}\n</long_term>")
 
-    # ── short-term ─────────────────────────────────────────────────────
-    stm_p = short_term_path(memory_dir)
-    if stm_p.exists():
-        stm_text = stm_p.read_text(encoding="utf-8").strip()
-        if stm_text:
-            blocks.append(f"<short_term>\n{stm_text}\n</short_term>")
+        stm_p = short_term_path(memory_dir)
+        if stm_p.exists():
+            stm_text = stm_p.read_text(encoding="utf-8").strip()
+            if stm_text:
+                blocks.append(f"<short_term>\n{stm_text}\n</short_term>")
 
     if not blocks:
         return EMPTY_PREAMBLE
