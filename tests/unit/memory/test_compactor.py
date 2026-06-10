@@ -195,3 +195,13 @@ def test_llm_compactor_uses_provider() -> None:
     result = anyio.run(compactor.summarize, events, 1)
     assert result.boundary_event_id == 1
     assert len(result.sections) == 1
+
+
+def test_llm_compactor_exposes_model_name() -> None:
+    # mem_compacted.model must record the real model id, not a class name.
+    from types import SimpleNamespace
+
+    from eonlet.memory.compactor import LLMCompactor
+
+    comp = LLMCompactor(SimpleNamespace(model="fake-haiku"))  # type: ignore[arg-type]
+    assert comp.model_name == "fake-haiku"

@@ -123,8 +123,11 @@ class KnowledgeTool:
             )
         rel = await store.write(path=args.path, content=args.content, index_line=args.index_line)
         if ctx.record_event is not None:
-            await ctx.record_event(kb_written(path=rel, size=len(args.content), action="write"))
-        return ToolResult(content=f"wrote {rel}", structured_output={"path": rel})
+            await ctx.record_event(
+                kb_written(path=rel, size=len(args.content), action="write", content=args.content)
+            )
+        out = f"wrote {rel}" + _index_budget_warning(store, ctx)
+        return ToolResult(content=out, structured_output={"path": rel})
 
     @staticmethod
     async def _edit(store: KnowledgeStore, args: KnowledgeArgs, ctx: ToolContext) -> ToolResult:
@@ -137,7 +140,12 @@ class KnowledgeTool:
             path=args.path, old_string=args.old_string, new_string=args.new_string
         )
         if ctx.record_event is not None:
-            await ctx.record_event(kb_written(path=rel, size=len(args.new_string), action="edit"))
+            # The event carries the complete post-edit body so the log can
+            # reconstruct the file (knowledge is never auto-deleted).
+            body = await store.open(rel) or ""
+            await ctx.record_event(
+                kb_written(path=rel, size=len(body), action="edit", content=body)
+            )
         return ToolResult(content=f"edited {rel}", structured_output={"path": rel})
 
     # ── delete / move ──────────────────────────────────────────────────
@@ -164,6 +172,28 @@ class KnowledgeTool:
         if ctx.record_event is not None:
             await ctx.record_event(kb_moved(src=src_rel, dst=dst_rel))
         return ToolResult(
-            content=f"moved {src_rel} → {dst_rel}",
+            content=f"moved {src_rel} → {dst_rel}" + _index_budget_warning(store, ctx),
             structured_output={"src": src_rel, "dst": dst_rel},
         )
+
+
+def _index_budget_warning(store: KnowledgeStore, ctx: ToolContext) -> str:
+    """A visible nudge when the always-injected index outgrows its budget.
+
+    The agent is the only entity that can prune its own index, and a silent
+    log warning never reaches it — so the signal has to ride the ToolResult.
+    Empty string when within budget or when no runtime config is reachable.
+    """
+    runtime = (ctx.extra or {}).get("runtime")
+    if runtime is None:
+        return ""
+    from ...memory.tokens import estimate
+
+    limit = runtime.definition.config.memory.knowledge.index_max_tokens
+    tokens = estimate(store.index_text())
+    if tokens <= limit:
+        return ""
+    return (
+        f"\nWARNING: the knowledge index is ~{tokens} tokens (budget {limit}). "
+        "It is injected into every call — prune or merge index lines."
+    )

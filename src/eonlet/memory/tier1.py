@@ -227,7 +227,9 @@ async def run_tier1(
         tokens_after = working_window_token_estimate(events, watermark=new_watermark)
 
         # Emit event AFTER state change so replay reconstructs the right order.
-        model_name = type(compactor).__name__
+        # Prefer the real model id (LLMCompactor.model_name); fall back to the
+        # class name for test compactors that wrap no provider.
+        model_name = getattr(compactor, "model_name", None) or type(compactor).__name__
         if record_event is not None:
             ev2 = mem_compacted(
                 snapshot_id=snapshot_id,

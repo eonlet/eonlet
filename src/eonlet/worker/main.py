@@ -1231,7 +1231,9 @@ async def _handle_memory_ipc(
                 )
             except (KnowledgeError, KnowledgePathError) as e:
                 return {"ok": False, "error": str(e)}
-            await runtime._record(kb_written(path=rel, size=len(str(content)), action="write"))
+            await runtime._record(
+                kb_written(path=rel, size=len(str(content)), action="write", content=str(content))
+            )
             return {"ok": True, "path": rel}
         if sub == "delete":
             path = str(params.get("path", ""))

@@ -386,16 +386,19 @@ def mem_compact_declined(*, boundary_event_id: int, rule: str = "user") -> Event
 # ── Knowledge-axis helpers (ADR-0005) ────────────────────────────────────────
 
 
-def kb_written(*, path: str, size: int, action: str = "write") -> Event:
+def kb_written(*, path: str, size: int, action: str = "write", content: str = "") -> Event:
     """A knowledge file was created or edited.
 
-    Summary-only: the event records the path and resulting size, not the body
-    (the body lives on disk; the event is just a pointer to it).
-    ``action`` is ``"write"`` (full-body replace) or ``"edit"`` (string-replace).
+    Carries the resulting **full body** in ``content``: knowledge is the one
+    durable store that is never auto-deleted, so the event log — the single
+    source of truth (Invariant #1) — must be able to reconstruct it. Knowledge
+    files are small curated markdown by design, so the cost is negligible.
+    ``action`` is ``"write"`` (full-body replace) or ``"edit"`` (string-replace;
+    ``content`` still holds the complete post-edit body).
     """
     return Event(
         kind=EventKind.KB_WRITTEN,
-        payload={"path": path, "size": size, "action": action},
+        payload={"path": path, "size": size, "action": action, "content": content},
     )
 
 

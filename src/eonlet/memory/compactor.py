@@ -198,6 +198,11 @@ class LLMCompactor:
     def __init__(self, provider: LLMProvider) -> None:
         self._provider = provider
 
+    @property
+    def model_name(self) -> str:
+        """The underlying model id, recorded in ``mem_compacted`` for audit."""
+        return self._provider.model
+
     async def summarize(self, events: list[Event], suggested_boundary: int) -> CompactionResult:
         prompt = build_compaction_prompt(events, suggested_boundary)
         msg = LLMMessage(role="user", content=prompt)

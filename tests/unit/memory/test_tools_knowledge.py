@@ -133,3 +133,88 @@ def test_list_empty_base(tmp_path: Path) -> None:
     tool = KnowledgeTool()
     out = anyio.run(lambda: tool(KnowledgeArgs(action="list"), ctx))
     assert "empty" in out.content.lower()
+
+
+def test_kb_written_events_carry_full_body(tmp_path: Path) -> None:
+    # Knowledge is never auto-deleted, so the event log must be able to
+    # reconstruct it (Invariant #1) — events carry the resulting full body.
+    ctx, captured = _ctx(tmp_path)
+    tool = KnowledgeTool()
+
+    async def go() -> None:
+        await tool(
+            KnowledgeArgs(action="write", path="user.md", content="likes terse replies"),
+            ctx,
+        )
+        await tool(
+            KnowledgeArgs(
+                action="edit", path="user.md", old_string="terse", new_string="concise"
+            ),
+            ctx,
+        )
+
+    anyio.run(go)
+    writes = [e for e in captured if e.kind == EventKind.KB_WRITTEN]
+    assert writes[0].payload["content"] == "likes terse replies"
+    assert writes[1].payload["action"] == "edit"
+    # The store normalizes files to end with a newline.
+    assert writes[1].payload["content"].rstrip("\n") == "likes concise replies"
+    assert writes[1].payload["size"] == len(writes[1].payload["content"])
+
+
+def test_write_warns_when_index_over_budget(tmp_path: Path) -> None:
+    # The agent is the only entity that can prune its index — the overflow
+    # signal must ride the ToolResult, not a log line it never sees.
+    from types import SimpleNamespace
+
+    ctx, _ = _ctx(tmp_path)
+    ctx.extra = {
+        "runtime": SimpleNamespace(
+            definition=SimpleNamespace(
+                config=SimpleNamespace(
+                    memory=SimpleNamespace(knowledge=SimpleNamespace(index_max_tokens=1))
+                )
+            )
+        )
+    }
+    tool = KnowledgeTool()
+
+    async def go() -> None:
+        out = await tool(
+            KnowledgeArgs(
+                action="write",
+                path="rules/a.md",
+                content="x",
+                index_line="a fairly long index line that costs more than one token",
+            ),
+            ctx,
+        )
+        assert not out.is_error
+        assert "WARNING" in out.content and "knowledge index" in out.content
+
+    anyio.run(go)
+
+
+def test_write_no_warning_within_budget(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    ctx, _ = _ctx(tmp_path)
+    ctx.extra = {
+        "runtime": SimpleNamespace(
+            definition=SimpleNamespace(
+                config=SimpleNamespace(
+                    memory=SimpleNamespace(knowledge=SimpleNamespace(index_max_tokens=100_000))
+                )
+            )
+        )
+    }
+    tool = KnowledgeTool()
+
+    async def go() -> None:
+        out = await tool(
+            KnowledgeArgs(action="write", path="rules/a.md", content="x", index_line="rule"),
+            ctx,
+        )
+        assert "WARNING" not in out.content
+
+    anyio.run(go)
