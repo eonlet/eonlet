@@ -147,6 +147,7 @@ async def run_worker(
         global_cfg=global_cfg,
     )
     runtime.recall_index = recall_index
+    await _recover_stale_tasks(runtime)
 
     http_fetcher: HTTPFetcher | None = None
 
@@ -216,6 +217,25 @@ async def run_worker(
 
 
 # ── tasks ────────────────────────────────────────────────────────────────────
+
+
+async def _recover_stale_tasks(runtime: AgentRuntime) -> None:
+    """Re-queue tasks left ``active`` by a crashed worker.
+
+    A worker that died mid task run replays that task as ``active`` — a state
+    the scheduler never re-picks, wedging it forever. At startup nothing can
+    legitimately be active (execution is strictly serial and no run is in
+    flight), so any active task is a crash residue.
+    """
+    from ..runtime.events import task_transitioned
+
+    for stale in runtime.task_forest.by_status("active"):
+        log.warning("crash recovery: re-queueing task %s (was active at shutdown)", stale.id)
+        await runtime._record(
+            task_transitioned(
+                id=stale.id, from_state="active", to_state="pending", reason="crash_recovery"
+            )
+        )
 
 
 async def _heartbeat_loop(eonlet_id: str, shutdown: anyio.Event) -> None:
@@ -388,10 +408,20 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
         runtime.on_turn_boundary = None
 
     if preempt_to:
+        if preempt_to.get("gone"):
+            # Cancelled/deleted out from under the run via the control plane —
+            # there is nothing left to checkpoint or transition.
+            return
         # Paused (user interrupt or a higher-priority tree): checkpoint a resume
         # brief and put the task back to pending so the scheduler re-picks it once
         # the preemptor — now outranking it — finishes, resuming from the brief.
-        summary, boundary = await _checkpoint_summary(runtime, task.id)
+        # A user-input pause is expected to resume promptly and (boundary=None)
+        # keeps the raw scoped window intact, so the cheap structural brief
+        # suffices — no LLM call per chat message while a task runs.
+        user_interrupt = preempt_to.get("reason") == "preempted:user-input"
+        summary, boundary = await _checkpoint_summary(
+            runtime, task.id, structural_only=user_interrupt
+        )
         await runtime._record(
             task_checkpointed(id=task.id, progress_summary=summary, boundary_event_id=boundary)
         )
@@ -445,14 +475,27 @@ def _make_pause_check(
 ) -> Callable[[], Awaitable[bool]]:
     """Build the turn-boundary hook: per-task budget cap + preemption."""
     from ..config import parse_duration
-    from ..tasks import preemptor
+    from ..tasks import is_terminal, preemptor
 
     cooldown = parse_duration(sched.preempt_cooldown)
     budget = int(sched.per_task_budget_tokens or 0)
-    start_id = runtime.store.latest_id()  # token baseline for this run
+    # Incremental token accounting: each check reads only the events appended
+    # since the previous check, not the whole run suffix every turn.
+    spent = 0
+    last_seen = runtime.store.latest_id()  # token baseline for this run
 
     async def check() -> bool:
+        nonlocal spent, last_seen
         if preempt_to:  # already decided to pause this run
+            return True
+        # 0. The task was cancelled/deleted out from under the run (via the
+        #    control plane): stop immediately instead of burning tokens to the
+        #    natural end. ``gone`` tells _run_task to skip checkpoint/transition.
+        cur = runtime.task_forest.get(task.id)
+        if cur is None or is_terminal(cur.status):
+            preempt_to["gone"] = "1"
+            preempt_to["reason"] = "task_gone"
+            log.info("task %s gone/terminal mid-run; ending run", task.id)
             return True
         # 1. A queued interactive user message preempts unconditionally (ADR-0008
         #    §3): the user is interrupting — yield so the worker can handle the
@@ -465,9 +508,10 @@ def _make_pause_check(
         # 2. Per-task token budget (ADR-0007 M4): end the run if it has spent its
         #    allowance. Leaves preempt_to empty → classified as a yield (suspend).
         if budget:
-            spent = sum(
-                (e.tokens_in or 0) + (e.tokens_out or 0) for e in runtime.store.read(since=start_id)
-            )
+            for e in runtime.store.read(since=last_seen):
+                spent += (e.tokens_in or 0) + (e.tokens_out or 0)
+                if (e.id or 0) > last_seen:
+                    last_seen = e.id or last_seen
             if spent >= budget:
                 log.info("task %s hit per-task token budget %d (spent %d)", task.id, budget, spent)
                 return True
@@ -475,9 +519,6 @@ def _make_pause_check(
         #    §3/§4). Consent splits by the contender root's origin: a user tree
         #    preempts unconditionally; an agent tree keeps ADR-0007 §6 consent +
         #    cooldown; a trigger tree is never returned by `preemptor`.
-        cur = runtime.task_forest.get(task.id)
-        if cur is None:
-            return False
         contender = preemptor(runtime.task_forest, cur)
         if contender is None:
             return False
@@ -577,7 +618,9 @@ async def _ensure_framing(runtime: AgentRuntime, task: Task) -> None:
         await runtime._record(task_updated(id=task.id, framing=trace.strip()))
 
 
-async def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> tuple[str, int | None]:
+async def _checkpoint_summary(
+    runtime: AgentRuntime, task_id: str, *, structural_only: bool = False
+) -> tuple[str, int | None]:
     """The resume brief written when a task is suspended/yielded/preempted.
 
     Returns ``(brief, boundary_event_id)``. ADR-0009 M2/M4: compress the task's
@@ -585,6 +628,10 @@ async def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> tuple[str,
     with any prior brief, into key details/events/decisions via the compaction LLM
     (decision continuity — Cognition). ``boundary_event_id`` is the latest folded
     id, advancing the watermark so a resume window starts clean.
+
+    ``structural_only=True`` skips the LLM call outright — used for user-input
+    pauses, which resume promptly and keep their raw window (boundary=None), so
+    paying an LLM compression per chat message would be waste.
 
     Falls back to a structural summary with ``boundary=None`` (no watermark
     advance, so nothing is pruned/lost) when memory is disabled, no compaction
@@ -599,7 +646,7 @@ async def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> tuple[str,
     cfg = runtime.definition.config.memory
     scope = [e for e in runtime.store.read() if e.task_id == task_id and (e.id or 0) > wm]
     boundary = scope[-1].id if scope else None
-    if cfg.enabled and scope:
+    if cfg.enabled and scope and not structural_only:
         prov = _resolve_compaction_provider(runtime, cfg.compaction_model)
         if prov is not None:
             try:
