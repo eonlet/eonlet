@@ -151,6 +151,29 @@ def test_tasks_block_omitted_when_inject_pending_false(tmp_path: Path) -> None:
     assert build_tasks_block(forest, TasksConfig(inject_pending=False)) == ""
 
 
+def test_tasks_block_surfaces_suspended(tmp_path: Path) -> None:
+    # Suspended tasks only resume explicitly — hiding them would make yielded
+    # work silently vanish (design-review P3).
+    forest = _forest(
+        task_created(id="t1", content="active work"),
+        task_created(id="t2", content="paused work"),
+        task_transitioned(id="t2", from_state="pending", to_state="suspended", reason="yielded"),
+    )
+    out = build_tasks_block(forest, TasksConfig())
+    assert "active work" in out
+    assert "paused work" in out
+    assert "suspended" in out and "resume" in out
+
+
+def test_tasks_block_suspended_only(tmp_path: Path) -> None:
+    forest = _forest(
+        task_created(id="t1", content="paused work"),
+        task_transitioned(id="t1", from_state="pending", to_state="suspended", reason="yielded"),
+    )
+    out = build_tasks_block(forest, TasksConfig())
+    assert out.startswith("<tasks>") and "paused work" in out
+
+
 # ── recent window selection ────────────────────────────────────────────────
 
 

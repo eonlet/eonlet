@@ -279,3 +279,65 @@ def test_task_no_event_sink_errors(tmp_path: Path) -> None:
     tool = TaskTool()
     out = anyio.run(lambda: tool(TaskArgs(action="add", content="x"), ctx))
     assert out.is_error and "no event sink" in out.content
+
+
+def test_done_in_own_scoped_run_requires_result(tmp_path: Path) -> None:
+    # ADR-0009 upward flow: the result is the only payload that flows up, so a
+    # task-scoped run finishing its own task must supply one.
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> str:
+        out = await tool(TaskArgs(action="add", content="the task"), ctx)
+        tid = out.structured_output["id"]  # type: ignore[index]
+        ctx.current_task_id = tid
+        bare = await tool(TaskArgs(action="done"), ctx)
+        assert bare.is_error and "result" in bare.content
+        ok = await tool(TaskArgs(action="done", result="shipped"), ctx)
+        assert not ok.is_error
+        return tid
+
+    tid = anyio.run(go)
+    assert forest.get(tid).status == "done"  # type: ignore[union-attr]
+
+
+def test_done_from_chat_scope_result_optional(tmp_path: Path) -> None:
+    # Ticking a task off in chat (current_task_id None, or a different task)
+    # stays frictionless.
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> str:
+        out = await tool(TaskArgs(action="add", content="errand"), ctx)
+        tid = out.structured_output["id"]  # type: ignore[index]
+        done = await tool(TaskArgs(action="done", id=tid), ctx)
+        assert not done.is_error
+        return tid
+
+    tid = anyio.run(go)
+    assert forest.get(tid).status == "done"  # type: ignore[union-attr]
+
+
+def test_task_resume_requeues_suspended(tmp_path: Path) -> None:
+    from eonlet.runtime.events import task_transitioned
+
+    ctx, _captured, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> str:
+        out = await tool(TaskArgs(action="add", content="long job"), ctx)
+        tid = out.structured_output["id"]  # type: ignore[index]
+        # Simulate the scheduler suspending a yielded task.
+        await ctx.record_event(  # type: ignore[misc]
+            task_transitioned(id=tid, from_state="pending", to_state="suspended", reason="yielded")
+        )
+        not_suspended = await tool(TaskArgs(action="resume"), ctx)
+        assert not_suspended.is_error  # id required
+        resumed = await tool(TaskArgs(action="resume", id=tid), ctx)
+        assert not resumed.is_error
+        again = await tool(TaskArgs(action="resume", id=tid), ctx)
+        assert again.is_error and "not suspended" in again.content
+        return tid
+
+    tid = anyio.run(go)
+    assert forest.get(tid).status == "pending"  # type: ignore[union-attr]

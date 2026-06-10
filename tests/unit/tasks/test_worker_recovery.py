@@ -222,3 +222,50 @@ def test_structural_only_checkpoint_skips_llm(tmp_path: Path) -> None:
         assert brief2 == "LLM-BRIEF" and boundary2 is not None
 
     anyio.run(go)
+
+
+# ── P1: a finished root's result surfaces into the chat scope ────────────────
+
+
+def test_surface_root_result_records_chat_envelope(tmp_path: Path) -> None:
+    from eonlet.worker.main import _surface_root_result
+
+    async def go() -> None:
+        runtime = _build_runtime(tmp_path)
+        await runtime._record(task_created(id="root-1", content="research X", goal="learn X"))
+        await runtime._record(
+            task_transitioned(
+                id="root-1",
+                from_state="pending",
+                to_state="done",
+                reason="tool:done",
+                result="X is 42",
+            )
+        )
+        await _surface_root_result(runtime, "root-1")
+        last = runtime.state.messages[-1]
+        assert last.role == "user" and last.task_id is None  # chat scope
+        assert "<task_result" in last.content
+        assert "X is 42" in last.content and "learn X" in last.content
+
+    anyio.run(go)
+
+
+def test_surface_root_result_skips_subtasks(tmp_path: Path) -> None:
+    # Subtask results flow up via the parent's synthesis turn, never into chat.
+    from eonlet.worker.main import _surface_root_result
+
+    async def go() -> None:
+        runtime = _build_runtime(tmp_path)
+        await runtime._record(task_created(id="root-1", content="parent"))
+        await runtime._record(task_created(id="child-1", content="part", parent_id="root-1"))
+        await runtime._record(
+            task_transitioned(
+                id="child-1", from_state="pending", to_state="done", result="part done"
+            )
+        )
+        before = len(runtime.state.messages)
+        await _surface_root_result(runtime, "child-1")
+        assert len(runtime.state.messages) == before  # no envelope
+
+    anyio.run(go)

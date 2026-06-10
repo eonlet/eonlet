@@ -452,6 +452,8 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
                     reason="suspend_backlog_full",
                 )
             )
+            # Don't let the backlog cap drop a root silently — tell the chat.
+            await _surface_root_result(runtime, task.id)
         else:
             summary, boundary = await _checkpoint_summary(runtime, task.id)
             await runtime._record(
@@ -462,7 +464,38 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
                     id=task.id, from_state="active", to_state="suspended", reason="yielded"
                 )
             )
-    # DONE / GONE: the agent already moved the task (or it's gone) — nothing to do.
+    elif outcome is PostRun.DONE:
+        # The upward edge of ADR-0009's asymmetric flow: a finished ROOT's
+        # result surfaces into the chat scope, where the model (and tier-1 →
+        # episodic memory) can see it. Without this the conversation never
+        # learns what its own background work produced.
+        await _surface_root_result(runtime, task.id)
+    # GONE: the task was deleted mid-run — nothing to surface.
+
+
+async def _surface_root_result(runtime: AgentRuntime, task_id: str) -> None:
+    """Record a chat-scope ``<task_result>`` envelope for a terminal root task.
+
+    Mirrors the ``<trigger>`` envelope convention: a user-role message that
+    enters the chat window naturally on the next turn and is folded into STM by
+    tier-1. Subtask results stay out — they flow up via the parent's synthesis
+    turn, and surfacing them here would leak child internals past the parent.
+    No agent run is triggered; the envelope just waits in the window.
+    """
+    from ..runtime.events import user_message
+
+    t = runtime.task_forest.get(task_id)
+    if t is None or t.parent_id is not None:
+        return
+    body = t.result.strip() if t.result else "(no result recorded)"
+    await runtime._record(
+        user_message(
+            f'<task_result id="{t.id}" status="{t.status}">\n'
+            f"Goal: {t.goal or t.content}\n"
+            f"Result: {body}\n"
+            "</task_result>"
+        )
+    )
 
 
 def _task_label(task: Task) -> str:

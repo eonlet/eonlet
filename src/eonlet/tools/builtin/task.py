@@ -23,7 +23,7 @@ from ..protocol import ToolAnnotations, ToolContext, ToolResult, tool
 
 
 class TaskArgs(BaseModel):
-    action: Literal["add", "list", "done", "cancel", "update", "delete"]
+    action: Literal["add", "list", "done", "cancel", "resume", "update", "delete"]
     id: str | None = Field(
         default=None, description="Task id (required for done/cancel/update/delete)."
     )
@@ -151,7 +151,9 @@ class TaskTool:
         "'add' (content required; optional parent_id/priority/goal/due/tags), "
         "'list' (status filter: pending|active|suspended|blocked|done|cancelled|all; "
         "rendered as a tree), "
-        "'done' (mark → done by id), 'cancel' (mark → cancelled by id), "
+        "'done' (mark → done by id; pass result=<short outcome summary>), "
+        "'cancel' (mark → cancelled by id), "
+        "'resume' (re-queue a suspended task by id so the scheduler picks it up), "
         "'update' (id + any of content/goal/priority/due/tags), 'delete' (id)."
     )
     input_schema = TaskArgs
@@ -227,6 +229,21 @@ class TaskTool:
             dst = "done" if args.action == "done" else "cancelled"
             if task.status == dst:
                 return ToolResult(content=f"{tid} already {dst}")
+            # A task-scoped run finishing ITS OWN task must leave a result —
+            # it is the only payload that flows up to the parent synthesis /
+            # the chat <task_result> envelope (ADR-0009 upward flow).
+            if (
+                args.action == "done"
+                and tid == ctx.current_task_id
+                and not (args.result or "").strip()
+            ):
+                return ToolResult(
+                    content=(
+                        "task done: provide result=<short outcome summary> — it is the "
+                        "only context that flows back to the parent task / conversation"
+                    ),
+                    is_error=True,
+                )
             if not can_transition(task.status, dst):
                 return ToolResult(
                     content=f"task {args.action}: cannot move {tid} from {task.status} to {dst}",
@@ -242,6 +259,27 @@ class TaskTool:
                 )
             )
             return ToolResult(content=f"{args.action} {task.id}")
+
+        if args.action == "resume":
+            # Re-queue a suspended task (→ pending) so the scheduler picks it
+            # up again. The agent-side counterpart of `eonlet tasks resume`,
+            # so surfaced suspended work can be continued on user request.
+            if not args.id:
+                return ToolResult(content="task resume: 'id' is required", is_error=True)
+            task = forest.get(args.id) if forest is not None else None
+            if task is None:
+                return ToolResult(content=f"no such task: {args.id}", is_error=True)
+            if task.status != "suspended":
+                return ToolResult(
+                    content=f"task resume: {args.id} is {task.status}, not suspended",
+                    is_error=True,
+                )
+            await ctx.record_event(
+                task_transitioned(
+                    id=task.id, from_state="suspended", to_state="pending", reason="tool:resume"
+                )
+            )
+            return ToolResult(content=f"resumed {task.id} (pending)")
 
         if args.action == "update":
             tid = args.id or ctx.current_task_id

@@ -26,7 +26,7 @@ from pathlib import Path
 import structlog
 
 from ..runtime.events import Event, EventKind
-from ..tasks import TaskForest
+from ..tasks import Task, TaskForest
 from ..tasks.config import TasksConfig
 from .config import MemoryConfig
 from .knowledge import KnowledgeStore
@@ -119,15 +119,24 @@ def build_tasks_block(forest: TaskForest, cfg: TasksConfig) -> str:
     if not cfg.inject_pending:
         return EMPTY_PREAMBLE
     pending = forest.pending_leaves()
-    if not pending:
+    # Suspended tasks are surfaced too: they only ever resume by an explicit
+    # `resume`, so hiding them here would make yielded work silently vanish
+    # (nobody — model or user — would ever be reminded it exists).
+    suspended = sorted(forest.by_status("suspended"), key=lambda t: (t.created_at, t.id))
+    if not pending and not suspended:
         return EMPTY_PREAMBLE
-    lines = []
-    for t in pending:
+
+    def _line(t: Task) -> str:
         prio = f" (p{t.priority})" if t.priority else ""
         due = f" (due: {t.due})" if t.due else ""
         tags = "  (tags: " + ", ".join(t.tags) + ")" if t.tags else ""
         body = t.goal or t.content
-        lines.append(f"- [{t.id}]{prio} {body}{due}{tags}")
+        return f"- [{t.id}]{prio} {body}{due}{tags}"
+
+    lines = [_line(t) for t in pending]
+    if suspended:
+        lines.append('suspended — will not run again unless resumed (task action="resume"):')
+        lines.extend(_line(t) for t in suspended)
     return "<tasks>\n" + "\n".join(lines) + "\n</tasks>"
 
 
