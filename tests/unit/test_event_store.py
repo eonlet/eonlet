@@ -2,11 +2,41 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from eonlet.runtime.events import EventKind, assistant_message, tool_call, user_message
 from eonlet.runtime.state import fold
 from eonlet.runtime.store import EventStore
+
+
+def test_task_id_roundtrips(tmp_path: Path) -> None:
+    # ADR-0009: the task scope is a structural Event field, persisted + restored.
+    store = EventStore(tmp_path / "state.db")
+    store.append(user_message("chat turn"))  # task_id None (chat scope)
+    store.append(user_message("task turn").model_copy(update={"task_id": "task-x"}))
+    fetched = store.read()
+    assert fetched[0].task_id is None
+    assert fetched[1].task_id == "task-x"
+
+
+def test_task_id_column_added_to_legacy_db(tmp_path: Path) -> None:
+    # A store created before ADR-0009 lacks the task_id column; opening it must
+    # add the column (additive migration) and keep working.
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL,
+            payload BLOB NOT NULL, parent_id INTEGER, trigger_id TEXT,
+            cost_usd REAL, tokens_in INTEGER, tokens_out INTEGER)"""
+    )
+    conn.commit()
+    conn.close()
+    store = EventStore(db)  # should ALTER TABLE to add task_id
+    stored = store.append(user_message("hi").model_copy(update={"task_id": "task-y"}))
+    assert stored.id == 1
+    assert store.read()[0].task_id == "task-y"
 
 
 def test_append_assigns_id_and_roundtrips(tmp_path: Path) -> None:

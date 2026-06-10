@@ -414,15 +414,38 @@ class _DecisionPrompt:
     options: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _ViewScope:
+    """Which conversation the attach screen is showing (ADR-0009 task scope).
+
+    ``None`` is the *chat scope* — the user↔agent conversation. The event
+    printer shows only chat-scope turns by default; a task's execution turns
+    (stamped with that task's id) are hidden so the screen stays a clean
+    transcript. ``/task view <id>`` sets this to a task id to follow that task's
+    trace live; ``/task exit`` clears it back to the chat.
+
+    ``verbose_tools`` controls whether tool-call mechanics (the ``⎿ tool(args)``
+    lines, ``⋯ running`` hints, and tool results) are rendered in the *chat*
+    view. Default off — the chat stays a clean conversation of assistant/user
+    text even when the agent does work inline in the turn. Tool detail is always
+    shown inside a ``/task view`` (that view exists to show execution); the
+    ``/tools on`` toggle turns it on for the chat too.
+    """
+
+    task_id: str | None = None
+    verbose_tools: bool = False
+
+
 async def _attach_async(eid: str, sock: str, readonly: bool) -> None:
     async with IPCClient(sock) as client, anyio.create_task_group() as tg:
         tg.start_soon(client.run)
         info = await client.request("session.start", {"client_id": "cli"})
         _print_attach_banner(eid, readonly, info)
         pending = _DecisionPrompt()
-        tg.start_soon(_event_printer, client, pending)
+        scope = _ViewScope()
+        tg.start_soon(_event_printer, client, pending, scope)
         if not readonly:
-            tg.start_soon(_input_reader, client, eid, tg.cancel_scope, pending)
+            tg.start_soon(_input_reader, client, eid, tg.cancel_scope, pending, scope)
 
 
 def _print_attach_banner(eid: str, readonly: bool, info: dict[str, Any] | None) -> None:
@@ -441,12 +464,17 @@ def _print_attach_banner(eid: str, readonly: bool, info: dict[str, Any] | None) 
     model = state.get("model") or "?"
     nmsg = state.get("message_count", "?")
     ro = "  [yellow](read-only)[/]" if readonly else ""
+    # Permission-mode pill — yolo is highlighted since it auto-approves tools.
+    mode = state.get("mode")
+    mode_pill = "  [bold red]⚡ yolo[/]" if mode == "yolo" else ("  [dim]🔒 ask[/]" if mode else "")
 
     console.print()
     console.print(
-        f"[bold cyan]●[/] [bold]{eid}[/]  [dim]· {model} · {nmsg} msgs[/]  {status_pill}{ro}"
+        f"[bold cyan]●[/] [bold]{eid}[/]  [dim]· {model} · {nmsg} msgs[/]  {status_pill}{mode_pill}{ro}"
     )
-    console.print("[dim]   type /help for commands · Ctrl+D to detach[/]")
+    console.print(
+        "[dim]   conversation only · /tools to show tool calls · /help · Ctrl+D to detach[/]"
+    )
     _print_recent_history(state.get("recent_messages") or [])
 
 
@@ -498,6 +526,57 @@ def _fmt_args_short(args: Any, limit: int = 160) -> str:
     return escape(s)
 
 
+def _fmt_args(args: Any, limit: int = 120) -> str:
+    from rich.markup import escape
+
+    if isinstance(args, dict):
+        s = ", ".join(f"{k}={_short(v)}" for k, v in args.items())
+    else:
+        s = repr(args)
+    if len(s) > limit:
+        s = s[: limit - 1] + "…"
+    return escape(s)
+
+
+# Conversation-family event kinds — the ones stamped with a task scope (ADR-0009).
+# Everything else (task lifecycle, memory, errors) is scope-neutral.
+_CONV_KINDS = frozenset(
+    {"user_message", "assistant_message", "tool_call", "tool_result", "tool_error"}
+)
+
+
+def _render_event_line(kind: str | None, payload: dict[str, Any]) -> None:
+    """Render one stored conversation event (used by ``/task view`` replay).
+
+    Mirrors the live transcript style in ``_event_printer`` but without the
+    streaming/thinking machinery — these are already-recorded events.
+    """
+    from rich.markup import escape
+
+    if kind == "user_message":
+        content = (payload.get("content") or "").rstrip()
+        if content:
+            console.print(f"[bold cyan]>[/] {escape(content)}")
+    elif kind == "assistant_message":
+        content = (payload.get("content") or "").rstrip()
+        if content:
+            console.print(f"[bold cyan]●[/] {escape(content)}")
+        for tc in payload.get("tool_calls") or []:
+            console.print(
+                f"  [dim cyan]⎿[/] [bold]{escape(str(tc.get('name')))}[/]"
+                f"({_fmt_args(tc.get('args'))})"
+            )
+    elif kind == "tool_result":
+        snippet = (payload.get("output") or "").rstrip()
+        if len(snippet) > 800:
+            snippet = snippet[:800] + "…"
+        snippet = escape(snippet).replace("\n", "\n    ")
+        console.print(f"    [green]✓[/] {snippet}")
+    elif kind == "tool_error":
+        output = escape(str(payload.get("output") or "")).replace("\n", "\n    ")
+        console.print(f"    [red]✗[/] {output}")
+
+
 def _print_help() -> None:
     from rich.table import Table
 
@@ -529,17 +608,32 @@ def _print_help() -> None:
     t.add_row("/knowledge write <path> <text>", "create/replace a knowledge file")
     t.add_row("/knowledge rm <path>", "delete a knowledge file")
     t.add_row("/task add <text>", "add a pending task")
-    t.add_row("/task list [status]", "list tasks (pending|done|cancelled|all)")
+    t.add_row("/task list [status]", "flat list (pending|active|done|cancelled|all)")
+    t.add_row("/task tree [status]", "full forest as a tree, incl. history (default: all)")
+    t.add_row("/task view <id>", "follow a task's execution trace")
+    t.add_row("/task exit", "stop following; back to the chat view")
     t.add_row("/task done <id>", "mark a task done")
     t.add_row("/task rm <id>", "delete a task")
     t.add_row("/compact", "full compaction now (empty working window, new episode)")
     t.add_row("/compact off|on", "toggle auto-compaction for this session")
     t.add_row("/memory show [store]", "print stm|ltm|knowledge|all")
+    t.add_row("/tools [on|off]", "show/hide tool calls in chat (default off; bare toggles)")
+    t.add_row("/yolo [on|off]", "switch permission mode (bare /yolo toggles)")
+    t.add_row("/ask", "switch to ask mode (destructive tools prompt)")
+    t.add_row("/permissions", "show the current permission mode")
     console.print(t)
 
 
-async def _event_printer(client: IPCClient, pending: _DecisionPrompt) -> None:
-    """Pretty-print server-pushed notifications.
+async def _event_printer(client: IPCClient, pending: _DecisionPrompt, scope: _ViewScope) -> None:
+    """Pretty-print server-pushed notifications, filtered to the current view.
+
+    ``scope`` selects which conversation is shown (ADR-0009 task scope): the
+    chat scope by default (``scope.task_id is None``), or a single task's
+    execution trace after ``/task view``. Conversation turns whose ``task_id``
+    does not match the view are dropped — so commanding the agent to do work no
+    longer floods the screen with the task's internal tool calls. Task
+    lifecycle (queued / done) still surfaces as a concise one-liner in the chat
+    view so the user knows work is happening.
 
     Streamed ``token_delta`` notifications are *buffered*, not echoed live.
     Live-streaming under prompt_toolkit's ``patch_stdout`` proved unreliable
@@ -548,14 +642,12 @@ async def _event_printer(client: IPCClient, pending: _DecisionPrompt) -> None:
     model is generating; once the final ``assistant_message`` event arrives,
     its authoritative ``content`` is printed in one ``console.print`` call —
     correct every time.
-
-    Tool-related events are still rendered as they happen, so the user sees
-    progress for long tool calls.
     """
     from rich.markup import escape
 
     thinking_shown = False  # True after we've drawn the "● thinking..." line
     stream_buf: list[str] = []  # accumulator for token_delta — used as fallback
+    root_tasks: set[str] = set()  # top-level task ids seen this session
 
     def _ensure_thinking_line() -> None:
         nonlocal thinking_shown
@@ -568,20 +660,14 @@ async def _event_printer(client: IPCClient, pending: _DecisionPrompt) -> None:
         thinking_shown = False
         stream_buf.clear()
 
-    def _fmt_args(args: Any, limit: int = 120) -> str:
-        if isinstance(args, dict):
-            s = ", ".join(f"{k}={_short(v)}" for k, v in args.items())
-        else:
-            s = repr(args)
-        if len(s) > limit:
-            s = s[: limit - 1] + "…"
-        return escape(s)
-
     async for msg in client.notifications():
         method = msg.get("method")
         params = msg.get("params") or {}
         if method == "token_delta":
-            # Buffer only — no live echo (see docstring).
+            # Buffer only — no live echo (see docstring). Skip deltas from a
+            # scope we're not viewing (the broadcaster stamps the running task).
+            if params.get("task_id") != scope.task_id:
+                continue
             text = params.get("delta_text") or ""
             stream_buf.append(text)
             _ensure_thinking_line()
@@ -602,40 +688,87 @@ async def _event_printer(client: IPCClient, pending: _DecisionPrompt) -> None:
             continue
         kind = params.get("kind")
         payload = params.get("payload") or {}
-        if kind == "user_message":
-            # Show thinking indicator as soon as the worker accepts the
-            # message — before the first token arrives.
-            _ensure_thinking_line()
-        elif kind == "assistant_message":
-            content = payload.get("content") or ""
-            tcs = payload.get("tool_calls") or []
-            # Print the authoritative content from the event payload.
-            if content:
-                console.print(f"\n[bold cyan]●[/] {escape(content)}")
-            elif not tcs and stream_buf:
-                # Defensive: event has no content but we did receive deltas —
-                # render what we got rather than dropping it.
-                console.print(f"\n[bold cyan]●[/] {escape(''.join(stream_buf))}")
-            for tc in tcs:
-                console.print(
-                    f"  [dim cyan]⎿[/] [bold]{escape(str(tc['name']))}[/]"
-                    f"({_fmt_args(tc.get('args'))})"
-                )
-            _reset_stream()
-        elif kind == "tool_call":
-            # Live "starting" hint for long-running tools. We don't repeat the
-            # name here since assistant_message already announced it via ⎿.
-            console.print(f"    [dim]⋯ running {escape(str(payload.get('tool_name')))}…[/]")
-        elif kind == "tool_result":
-            snippet = (payload.get("output") or "").rstrip()
-            if len(snippet) > 600:
-                snippet = snippet[:600] + "…"
-            snippet = escape(snippet).replace("\n", "\n    ")
-            console.print(f"    [green]✓[/] {snippet}")
-        elif kind == "tool_error":
-            output = escape(str(payload.get("output") or "")).replace("\n", "\n    ")
-            console.print(f"    [red]✗[/] {output}")
-        elif kind == "permission_denied":
+
+        # Conversation turns are scope-filtered — only render the conversation
+        # the user is currently viewing. Tool-call mechanics are shown only when
+        # following a task (`/task view`) or when the chat tool view is on
+        # (`/tools on`); the default chat view stays a clean assistant/user
+        # transcript even when the agent works inline in the turn.
+        if kind in _CONV_KINDS:
+            if params.get("task_id") != scope.task_id:
+                continue
+            show_tools = scope.task_id is not None or scope.verbose_tools
+            if kind == "user_message":
+                # Show thinking indicator as soon as the worker accepts the
+                # message — before the first token arrives.
+                _ensure_thinking_line()
+            elif kind == "assistant_message":
+                content = payload.get("content") or ""
+                tcs = payload.get("tool_calls") or []
+                if content:
+                    console.print(f"\n[bold cyan]●[/] {escape(content)}")
+                elif not tcs and stream_buf:
+                    # Defensive: event has no content but we did receive deltas —
+                    # render what we got rather than dropping it.
+                    console.print(f"\n[bold cyan]●[/] {escape(''.join(stream_buf))}")
+                if show_tools:
+                    for tc in tcs:
+                        console.print(
+                            f"  [dim cyan]⎿[/] [bold]{escape(str(tc['name']))}[/]"
+                            f"({_fmt_args(tc.get('args'))})"
+                        )
+                elif tcs and not content:
+                    # Quiet chat view: don't dump the call, but keep a single
+                    # "working…" beat so silence during tools reads as progress.
+                    console.print("[dim]  ⋯ working…[/]")
+                _reset_stream()
+            elif kind == "tool_call":
+                if show_tools:
+                    # Live "starting" hint for long-running tools. We don't
+                    # repeat the name — assistant_message announced it via ⎿.
+                    console.print(f"    [dim]⋯ running {escape(str(payload.get('tool_name')))}…[/]")
+            elif kind == "tool_result":
+                if show_tools:
+                    snippet = (payload.get("output") or "").rstrip()
+                    if len(snippet) > 600:
+                        snippet = snippet[:600] + "…"
+                    snippet = escape(snippet).replace("\n", "\n    ")
+                    console.print(f"    [green]✓[/] {snippet}")
+            elif kind == "tool_error":
+                # Errors always surface — a failed tool is something the user
+                # should see even in the quiet chat view.
+                output = escape(str(payload.get("output") or "")).replace("\n", "\n    ")
+                console.print(f"    [red]✗[/] {output}")
+            continue
+
+        # Task lifecycle — surfaced only in the chat view, as a concise line so
+        # the user sees that work was queued / finished without the noise. Use
+        # /task view <id> to follow a task's execution.
+        if kind == "task_created":
+            if scope.task_id is None and not payload.get("parent_id"):
+                tid = str(payload.get("id", "?"))
+                root_tasks.add(tid)
+                content = str(payload.get("content", ""))
+                console.print(f"\n[dim]◇ task [bold]{escape(tid)}[/] queued — {escape(content)}[/]")
+            continue
+        if kind == "task_transitioned":
+            to_state = payload.get("to_state")
+            tid = str(payload.get("id", "?"))
+            # Only terminal moves, and only for top-level tasks (subtask churn
+            # stays hidden). If we never saw the creation (attached late), show
+            # it anyway rather than swallow the outcome.
+            show = scope.task_id is None and to_state in {"done", "cancelled"}
+            if show and (tid in root_tasks or not root_tasks):
+                mark = "[green]✓ done[/]" if to_state == "done" else "[yellow]✗ cancelled[/]"
+                console.print(f"\n[dim]◇ task [bold]{escape(tid)}[/][/] {mark}")
+                result = (payload.get("result") or "").rstrip()
+                if result:
+                    if len(result) > 600:
+                        result = result[:600] + "…"
+                    console.print(f"    [dim]{escape(result)}[/]".replace("\n", "\n    "))
+            continue
+
+        if kind == "permission_denied":
             console.print(f"    [yellow]⛔ denied[/] {escape(str(payload))}")
         elif kind == "error":
             console.print(f"    [bold red]error[/] {escape(str(payload))}")
@@ -662,11 +795,19 @@ def _short(v: Any, limit: int = 60) -> str:
 
 
 async def _input_reader(
-    client: IPCClient, eid: str, cancel: anyio.CancelScope, pending: _DecisionPrompt
+    client: IPCClient,
+    eid: str,
+    cancel: anyio.CancelScope,
+    pending: _DecisionPrompt,
+    scope: _ViewScope,
 ) -> None:
     """Read user input via prompt_toolkit; send as message.send. Slash commands
     are handled locally. While a decision is pending (ADR-0006), the next typed
-    line is routed to ``decision.respond`` instead of being sent as a message."""
+    line is routed to ``decision.respond`` instead of being sent as a message.
+
+    ``scope`` is the shared view state: the prompt shows which task (if any) is
+    being followed, and typing an ordinary message snaps the view back to the
+    chat so the user sees their own line and the reply."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.formatted_text import ANSI
@@ -679,15 +820,18 @@ async def _input_reader(
         history=FileHistory(str(hist_path)),
         auto_suggest=AutoSuggestFromHistory(),
     )
-    # Claude-Code-style prompt: just a bold cyan chevron. The agent's name is
-    # already shown in the attach banner; repeating it on every prompt line
-    # confuses "who am I talking to" with "who is typing".
-    prompt_text = ANSI("\n\x1b[1;36m>\x1b[0m ")
+
+    def _prompt_text() -> ANSI:
+        # Claude-Code-style prompt: a bold cyan chevron. When following a task,
+        # prefix the scope so the user knows typed text snaps back to the chat.
+        if scope.task_id is not None:
+            return ANSI(f"\n\x1b[2m[task {scope.task_id}]\x1b[0m \x1b[1;36m>\x1b[0m ")
+        return ANSI("\n\x1b[1;36m>\x1b[0m ")
 
     while True:
         try:
             with patch_stdout(raw=True):
-                line = await session.prompt_async(prompt_text)
+                line = await session.prompt_async(_prompt_text())
         except (EOFError, KeyboardInterrupt):
             console.print("[dim]detaching[/]")
             cancel.cancel()
@@ -707,14 +851,21 @@ async def _input_reader(
             console.print(f"[dim]   → {'approved' if approve else 'denied'}[/]")
             continue
         if line.startswith("/"):
-            done = await _handle_slash(line, client, eid, cancel)
+            done = await _handle_slash(line, client, eid, cancel, scope)
             if done:
                 return
             continue
+        # An ordinary message is a chat-scope turn; if we were following a task,
+        # return to the chat view so the user sees their message and the reply.
+        if scope.task_id is not None:
+            console.print(f"[dim]── left task {scope.task_id} · back to chat ──[/]")
+            scope.task_id = None
         await client.request("message.send", {"content": line})
 
 
-async def _handle_slash(line: str, client: IPCClient, eid: str, cancel: anyio.CancelScope) -> bool:
+async def _handle_slash(
+    line: str, client: IPCClient, eid: str, cancel: anyio.CancelScope, scope: _ViewScope
+) -> bool:
     """Return True if the caller should exit the input loop."""
     cmd, _, rest = line[1:].partition(" ")
     cmd = cmd.lower()
@@ -740,7 +891,7 @@ async def _handle_slash(line: str, client: IPCClient, eid: str, cancel: anyio.Ca
         await _handle_knowledge_slash(rest, client)
         return False
     if cmd in {"task", "tasks", "todo", "todos"}:
-        await _handle_task_slash(rest, client)
+        await _handle_task_slash(rest, client, scope)
         return False
     if cmd == "compact":
         await _handle_compact_slash(rest, client)
@@ -748,8 +899,86 @@ async def _handle_slash(line: str, client: IPCClient, eid: str, cancel: anyio.Ca
     if cmd == "memory":
         await _handle_memory_slash(rest, client)
         return False
+    if cmd in {"yolo", "ask", "permissions", "perms", "mode"}:
+        await _handle_mode_slash(cmd, rest, client)
+        return False
+    if cmd in {"tools", "verbose"}:
+        _handle_tools_slash(rest, scope)
+        return False
     console.print(f"[yellow]unknown command:[/] {line}  (try /help)")
     return False
+
+
+def _handle_tools_slash(rest: str, scope: _ViewScope) -> None:
+    """Toggle whether tool-call mechanics show in the chat view.
+
+    Forms: ``/tools`` (toggle) · ``/tools on`` · ``/tools off``. Off (default)
+    keeps the chat a clean assistant/user transcript; on shows the ``⎿ tool``
+    calls and results inline. A ``/task view`` always shows full detail
+    regardless of this setting.
+    """
+    arg = rest.strip().lower()
+    if arg in {"on", "show", "verbose"}:
+        scope.verbose_tools = True
+    elif arg in {"off", "hide", "quiet"}:
+        scope.verbose_tools = False
+    elif not arg:
+        scope.verbose_tools = not scope.verbose_tools
+    else:
+        console.print("[yellow]usage:[/] /tools [on|off]")
+        return
+    if scope.verbose_tools:
+        console.print("[green]tool details ON[/] — chat shows tool calls and results")
+    else:
+        console.print("[dim]tool details OFF[/] — chat shows the conversation only")
+
+
+async def _handle_mode_slash(cmd: str, rest: str, client: IPCClient) -> None:
+    """Switch the permission mode for this running session (yolo ↔ ask).
+
+    Forms:
+      /yolo                — toggle yolo on/off
+      /yolo on  | /yolo off
+      /ask                 — switch to ask mode (alias for /yolo off)
+      /permissions         — show the current mode (no change)
+
+    The change applies to the running worker only — it is not written back to
+    ``agent.yaml`` and resets on restart.
+    """
+    arg = rest.strip().lower()
+
+    # /permissions (no arg) → report the current mode, don't change it.
+    if cmd in {"permissions", "perms"} and not arg:
+        info = await client.request("session.start", {"client_id": "cli"})
+        mode = ((info or {}).get("state") or {}).get("mode") or "?"
+        pill = "[bold red]⚡ yolo[/]" if mode == "yolo" else f"[dim]{mode}[/]"
+        console.print(f"permission mode: {pill}")
+        return
+
+    # Resolve the requested mode from the command + argument.
+    alias = {"on": "yolo", "off": "ask"}
+    want: str
+    if cmd == "ask":
+        want = "ask"
+    elif not arg:
+        want = "toggle"  # bare /yolo (or /mode) flips
+    elif arg in {"yolo", "ask", "toggle"}:
+        want = arg
+    elif arg in alias:
+        want = alias[arg]
+    else:
+        console.print("[yellow]usage:[/] /yolo [on|off]  ·  /ask  ·  /permissions")
+        return
+
+    resp = await client.request("permissions.set_mode", {"mode": want})
+    if not resp.get("ok"):
+        console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
+        return
+    new = resp.get("mode")
+    if new == "yolo":
+        console.print("[bold red]⚡ yolo mode ON[/] — tools auto-approve (no confirmation prompts)")
+    else:
+        console.print("[green]🔒 ask mode[/] — destructive tools prompt for confirmation")
 
 
 async def _handle_trigger_slash(rest: str, client: IPCClient) -> None:
@@ -975,27 +1204,158 @@ async def _handle_knowledge_slash(rest: str, client: IPCClient) -> None:
     console.print(f"[yellow]unknown knowledge subcommand:[/] {sub}  (try /help)")
 
 
-async def _handle_task_slash(rest: str, client: IPCClient) -> None:
+def _resolve_task(frag: str, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Find the one task whose id matches ``frag`` — any unique fragment of a
+    full id, not just the whole id (handy for the long minted ids).
+
+    An exact id always wins; otherwise any task whose id *contains* the fragment,
+    if that is unique. Prints the reason and returns ``None`` when there is no
+    match or the fragment is ambiguous.
+    """
+    from rich.markup import escape
+
+    exact = [t for t in tasks if str(t.get("id")) == frag]
+    matches = exact or [t for t in tasks if frag in str(t.get("id"))]
+    if not matches:
+        console.print(f"[yellow]no such task:[/] {escape(frag)}")
+        return None
+    if len(matches) > 1:
+        console.print(f"[yellow]ambiguous id[/] '{escape(frag)}' matches {len(matches)} tasks:")
+        for t in matches[:10]:
+            body = escape(str(t.get("goal") or t.get("content") or "").strip())
+            console.print(
+                f"  [bold]{escape(str(t.get('id')))}[/] [dim]{escape(str(t.get('status', '?')))}[/]"
+                f" — {body}"
+            )
+        if len(matches) > 10:
+            console.print(f"  [dim]… and {len(matches) - 10} more[/]")
+        return None
+    return matches[0]
+
+
+async def _resolve_task_id(frag: str, client: IPCClient) -> str | None:
+    """Resolve a (possibly partial) task id to a full id via the live forest.
+
+    Returns ``None`` — and prints the reason — when the fragment matches no task
+    or is ambiguous, so mutating commands never act on a guessed-wrong task.
+    """
+    resp = await client.request("task.list", {"status": "all"})
+    tasks = (resp or {}).get("tasks") or []
+    task = _resolve_task(frag, tasks)
+    return str(task.get("id")) if task is not None else None
+
+
+async def _enter_task_view(arg: str, client: IPCClient, scope: _ViewScope) -> None:
+    """Replay a task's execution trace and switch the live view to follow it.
+
+    The id may be any unique fragment of a full task id (e.g. a short prefix),
+    not just the whole id."""
+    from rich.markup import escape
+
+    frag = arg.split()[0] if arg else ""
+    if not frag:
+        console.print("[yellow]usage:[/] /task view <id>")
+        return
+    resp = await client.request("task.list", {"status": "all"})
+    tasks = (resp or {}).get("tasks") or []
+    task = _resolve_task(frag, tasks)
+    if task is None:
+        return  # _resolve_task printed the reason
+    tid = str(task.get("id"))
+
+    console.rule(f"task {tid} · {task.get('status', '?')}")
+    headline = str(task.get("goal") or task.get("content") or "").strip()
+    if headline:
+        console.print(f"[dim]{escape(headline)}[/]\n")
+
+    events = await client.request("events.replay", {"task_id": tid}) or []
+    if not events:
+        console.print("[dim](no execution yet — task has not run)[/]")
+    for e in events:
+        _render_event_line(e.get("kind"), e.get("payload") or {})
+
+    brief = str(task.get("progress_summary") or "").strip()
+    if brief:
+        console.print(f"\n[dim]── progress brief ──[/]\n[dim]{escape(brief)}[/]")
+    result = str(task.get("result") or "").strip()
+    if result:
+        console.print(f"\n[dim]── result ──[/]\n[dim]{escape(result)}[/]")
+
+    scope.task_id = tid
+    console.print(
+        f"\n[dim]── following task {tid} live · type /task exit (or just send a message) "
+        "to return ──[/]"
+    )
+
+
+async def _handle_task_slash(rest: str, client: IPCClient, scope: _ViewScope) -> None:
     """Dispatch ``/task ...`` subcommands (ADR-0005; replaces ``/todo``).
 
     Forms:
       /task                        — list pending
-      /task list [status]          — list with status filter
+      /task list [status]          — flat list with status filter
+      /task tree [status]          — full forest as a tree (default: all, incl. history)
       /task add <text>             — add pending task
+      /task view <id>              — follow a task's execution trace
+      /task exit                   — stop following; back to the chat view
       /task done <id>              — mark done
       /task cancel <id>            — mark cancelled
       /task rm <id>                — delete
+
+    Every ``<id>`` may be any unique fragment of a full task id (see
+    ``_resolve_task``), not just the whole id.
     """
     from rich.table import Table
+
+    valid_status = ("pending", "active", "suspended", "blocked", "done", "cancelled", "all")
 
     sub, _, srest = rest.partition(" ")
     sub = sub.lower()
     srest = srest.strip()
 
+    if sub in {"view", "watch", "enter"}:
+        await _enter_task_view(srest, client, scope)
+        return
+
+    if sub in {"exit", "leave", "back", "unwatch", "chat"}:
+        if scope.task_id is None:
+            console.print("[dim](already in the chat view)[/]")
+        else:
+            console.print(f"[dim]── left task {scope.task_id} · back to chat ──[/]")
+            scope.task_id = None
+        return
+
+    if sub in {"tree", "forest"}:
+        # The full forest incl. history — done/cancelled tasks and their tree
+        # structure. Defaults to "all" so historical runs show by default.
+        status = srest or "all"
+        if status not in valid_status:
+            console.print(f"[yellow]bad status:[/] {status}  (one of {', '.join(valid_status)})")
+            return
+        resp = await client.request("task.tree", {"status": status})
+        if not resp.get("ok"):
+            console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
+            return
+        nodes = resp.get("tasks") or []
+        if not nodes:
+            console.print(f"[dim](no {status} tasks)[/]")
+            return
+        for n in nodes:
+            _render_task_node(
+                status=n.get("status"),
+                tid=n.get("id"),
+                priority=n.get("priority"),
+                due=n.get("due"),
+                goal=n.get("goal"),
+                content=n.get("content"),
+                depth=int(n.get("depth") or 0),
+            )
+        return
+
     if not sub or sub in {"ls", "list"}:
         status = srest or "pending"
-        if status not in ("pending", "done", "cancelled", "all"):
-            console.print(f"[yellow]bad status:[/] {status}")
+        if status not in valid_status:
+            console.print(f"[yellow]bad status:[/] {status}  (one of {', '.join(valid_status)})")
             return
         resp = await client.request("task.list", {"status": status})
         tasks = (resp or {}).get("tasks") or []
@@ -1032,9 +1392,12 @@ async def _handle_task_slash(rest: str, client: IPCClient) -> None:
         if not srest:
             console.print(f"[yellow]usage:[/] /task {sub} <id>")
             return
-        resp = await client.request(f"task.{sub}", {"id": srest})
+        tid = await _resolve_task_id(srest, client)
+        if tid is None:
+            return  # _resolve_task_id printed the reason
+        resp = await client.request(f"task.{sub}", {"id": tid})
         if resp.get("ok"):
-            console.print(f"[green]{sub}[/] {srest}")
+            console.print(f"[green]{sub}[/] {tid}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
@@ -1043,9 +1406,12 @@ async def _handle_task_slash(rest: str, client: IPCClient) -> None:
         if not srest:
             console.print("[yellow]usage:[/] /task rm <id>")
             return
-        resp = await client.request("task.delete", {"id": srest})
+        tid = await _resolve_task_id(srest, client)
+        if tid is None:
+            return  # _resolve_task_id printed the reason
+        resp = await client.request("task.delete", {"id": tid})
         if resp.get("ok"):
-            console.print(f"[green]deleted[/] {srest}")
+            console.print(f"[green]deleted[/] {tid}")
         else:
             console.print(f"[red]error:[/] {resp.get('error', 'failed')}")
         return
@@ -1335,6 +1701,48 @@ def _cmd_tasks_mutate(
         fail(result.get("error", "failed"), code=1)
 
 
+_TASK_ICON = {
+    "pending": "[ ]",
+    "active": "[*]",
+    "suspended": "[~]",
+    "blocked": "[!]",
+    "done": "[x]",
+    "cancelled": "[-]",
+}
+_TASK_COLOR = {
+    "active": "bold green",
+    "blocked": "red",
+    "suspended": "yellow",
+    "done": "dim",
+    "cancelled": "dim strike",
+}
+
+
+def _render_task_node(
+    *,
+    status: Any,
+    tid: Any,
+    priority: Any,
+    due: Any,
+    goal: Any,
+    content: Any,
+    depth: int,
+) -> None:
+    """Print one indented task-tree line (shared by ``eonlet tasks`` and the
+    in-attach ``/task tree``). Dynamic text is escaped so task content can't
+    inject rich markup."""
+    from rich.markup import escape
+
+    indent = "  " * max(depth, 0)
+    prio = f" [cyan](p{priority})[/]" if priority else ""
+    due_s = f" [magenta](due {escape(str(due))})[/]" if due else ""
+    body = escape(str(goal or content or "").strip())
+    style = _TASK_COLOR.get(str(status), "")
+    head = f"{_TASK_ICON.get(str(status), '[?]')} {escape(str(tid))}"
+    head = f"[{style}]{head}[/]" if style else head
+    console.print(f"{indent}{head}{prio}{due_s} — {body}")
+
+
 def _cmd_tasks_tree(eonlet_id: str, status: str = "all") -> None:
     """Render the agent's task forest as a tree (read-only, folded from the log).
 
@@ -1370,32 +1778,18 @@ def _cmd_tasks_tree(eonlet_id: str, status: str = "all") -> None:
         console.print(f"[dim]({eid}: no {status} tasks)[/]")
         return
 
-    icon = {
-        "pending": "[ ]",
-        "active": "[*]",
-        "suspended": "[~]",
-        "blocked": "[!]",
-        "done": "[x]",
-        "cancelled": "[-]",
-    }
-    color = {
-        "active": "bold green",
-        "blocked": "red",
-        "suspended": "yellow",
-        "done": "dim",
-        "cancelled": "dim strike",
-    }
     for t, depth in forest.dfs():
         if t.id not in keep:
             continue
-        indent = "  " * depth
-        prio = f" [cyan](p{t.priority})[/]" if t.priority else ""
-        due = f" [magenta](due {t.due})[/]" if t.due else ""
-        body = (t.goal or t.content).strip()
-        style = color.get(t.status, "")
-        head = f"{icon.get(t.status, '[?]')} {t.id}"
-        head = f"[{style}]{head}[/]" if style else head
-        console.print(f"{indent}{head}{prio}{due} — {body}")
+        _render_task_node(
+            status=t.status,
+            tid=t.id,
+            priority=t.priority,
+            due=t.due,
+            goal=t.goal,
+            content=t.content,
+            depth=depth,
+        )
 
 
 def cmd_tail(eonlet_id: str) -> None:

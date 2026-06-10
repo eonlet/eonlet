@@ -38,7 +38,12 @@ class TaskArgs(BaseModel):
         default=None, description="For action='add': attach as a subtask of this task id."
     )
     priority: int | None = Field(
-        default=None, description="Scheduling priority; higher runs first. Default 0."
+        default=None,
+        description=(
+            "Scheduling priority of a TOP-LEVEL task; higher runs (and preempts) "
+            "first. Default 0. Ignored for subtasks (parent_id set) — subtasks run "
+            "in creation order, so priority schedules only between root tasks."
+        ),
     )
     due: str | None = Field(
         default=None,
@@ -139,8 +144,10 @@ def _render_tree(forest: TaskForest, status_filter: str) -> str:
 class TaskTool:
     name = "task"
     description = (
-        "Hierarchical action-item tracker. Tasks form a tree (add with parent_id) "
-        "and carry a priority. Actions: "
+        "Hierarchical action-item tracker. Tasks form a tree (add with parent_id). "
+        "Scheduling is by priority between TOP-LEVEL tasks; subtasks run depth-first "
+        "in creation order (their priority is ignored). A higher-priority top-level "
+        "task preempts a running lower-priority one. Actions: "
         "'add' (content required; optional parent_id/priority/goal/due/tags), "
         "'list' (status filter: pending|active|suspended|blocked|done|cancelled|all; "
         "rendered as a tree), "
@@ -180,14 +187,22 @@ class TaskTool:
                 if guard is not None:
                     return ToolResult(content=f"task add: {guard}", is_error=True)
             new_id = mint_task_id()
+            # Scheduling is over root trees (ADR-0008 §2): priority is honored
+            # only for a root; a subtask runs in creation order, so its priority
+            # has no scheduling effect and is forced to 0. A root created during
+            # a user turn is stamped origin="user" (it preempts without consent);
+            # any subtask — or a root hatched on a non-user turn — follows §5.
+            is_subtask = parent_id is not None
+            origin = "agent" if is_subtask else ctx.turn_origin
+            priority = 0 if is_subtask else (args.priority or 0)
             await ctx.record_event(
                 task_created(
                     id=new_id,
                     content=args.content,
                     goal=args.goal or "",
-                    priority=args.priority or 0,
+                    priority=priority,
                     parent_id=parent_id,
-                    origin="agent",
+                    origin=origin,
                     due=args.due,
                     tags=args.tags,
                 )

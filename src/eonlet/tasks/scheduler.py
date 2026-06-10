@@ -29,7 +29,10 @@ from .forest import Task, TaskForest, is_terminal
 
 
 def _ordered_children(forest: TaskForest, task_id: str) -> list[Task]:
-    return sorted(forest.children(task_id), key=lambda t: (-t.priority, t.created_at, t.id))
+    # Subtasks run in **creation order** (ADR-0008 §2): there is no scheduling
+    # within a tree — priority schedules only at the root. ``forest.children``
+    # already preserves insertion = creation order.
+    return forest.children(task_id)
 
 
 def _runnable_in_subtree(forest: TaskForest, node: Task, exclude_id: str | None) -> Task | None:
@@ -72,16 +75,33 @@ def next_runnable(forest: TaskForest, *, exclude_id: str | None = None) -> Task 
 
 
 def preemptor(forest: TaskForest, current: Task) -> Task | None:
-    """A runnable task that should preempt ``current``, or ``None``.
+    """A runnable node in another tree that should preempt ``current``, or ``None``.
 
-    A contender preempts only if it is **strictly higher priority** than the
-    running task and lies outside the running task's own subtree. (Equal
-    priority never preempts — that would let two same-priority tasks thrash.)
+    Scheduling is over **root trees** (ADR-0008 §2/§3): a contender preempts only
+    if it lives in a *different* root tree whose **root priority is strictly
+    higher** than the running task's root priority. (Equal priority never
+    preempts — that would thrash; a node inside the running task's own tree is
+    never a preemptor — within a tree there is no scheduling.)
+
+    **Trigger-origin trees never preempt** (ADR-0008 §4): autonomous/scheduled
+    work waits for a natural task boundary; only the user (or, where it arises,
+    the agent's own judgment) interrupts foreground work. The returned node is
+    the runnable node *within* the contending tree; consent is the caller's job.
     """
-    contender = next_runnable(forest, exclude_id=current.id)
-    if contender is None:
+    current_root = forest.root_of(current.id)
+    if current_root is None:
         return None
-    return contender if contender.priority > current.priority else None
+    for root in forest.roots():  # priority-desc, then creation order
+        if root.id == current_root.id:
+            continue  # the running task's own tree is never a preemptor
+        if root.priority <= current_root.priority:
+            break  # roots are priority-ordered; nothing strictly higher remains
+        if root.origin == "trigger":
+            continue  # scheduled/autonomous trees never interrupt foreground work
+        found = _runnable_in_subtree(forest, root, None)
+        if found is not None:
+            return found
+    return None
 
 
 def synthesis_ready(forest: TaskForest, task_id: str) -> bool:

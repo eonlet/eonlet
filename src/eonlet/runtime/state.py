@@ -32,6 +32,10 @@ class Message:
     # Source event id — used by the injection pipeline to filter out
     # messages already represented by short-term memory (id ≤ watermark).
     event_id: int | None = None
+    # Task scope (ADR-0009): the task this message belongs to, or ``None`` for
+    # the chat scope. Copied from the source event; the LLM window is filtered
+    # to the active scope so task runs and chat don't see each other's turns.
+    task_id: str | None = None
     # Source event timestamp (unix microseconds). Used to prefix user turns
     # with their local datetime at render time (ADR-0006).
     ts: int | None = None
@@ -67,6 +71,7 @@ def reduce(state: AgentState, event: Event) -> AgentState:
                 content=event.payload.get("content", ""),
                 event_id=event.id,
                 ts=event.ts,
+                task_id=event.task_id,
             )
         )
     elif kind == EventKind.ASSISTANT_MESSAGE:
@@ -77,6 +82,7 @@ def reduce(state: AgentState, event: Event) -> AgentState:
                 tool_calls=event.payload.get("tool_calls", []) or [],
                 reasoning_content=event.payload.get("reasoning_content") or None,
                 event_id=event.id,
+                task_id=event.task_id,
             )
         )
     elif kind == EventKind.TOOL_RESULT:
@@ -86,6 +92,7 @@ def reduce(state: AgentState, event: Event) -> AgentState:
                 content=event.payload.get("output", ""),
                 tool_call_id=event.payload.get("call_id"),
                 event_id=event.id,
+                task_id=event.task_id,
             )
         )
     elif kind == EventKind.TOOL_ERROR:
@@ -96,6 +103,7 @@ def reduce(state: AgentState, event: Event) -> AgentState:
                 tool_call_id=event.payload.get("call_id"),
                 is_error=True,
                 event_id=event.id,
+                task_id=event.task_id,
             )
         )
     # All other event kinds are bookkeeping; they don't change conversation state.

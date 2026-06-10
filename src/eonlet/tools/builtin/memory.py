@@ -23,7 +23,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from ...memory.compactor import LLMCompactor
-from ...memory.injection import working_window_token_estimate
+from ...memory.injection import chat_scope_only, working_window_token_estimate
 from ...memory.paths import long_term_path, short_term_path
 from ...memory.tier1 import run_tier1
 from ...memory.tier3 import run_tier3
@@ -210,7 +210,9 @@ def _propose_guards(runtime: Any, ctx: ToolContext) -> tuple[int, str | None]:
     """
     ep = runtime.definition.config.memory.episodic
     watermark = read_watermark(ctx.memory_dir)
-    events = runtime.store.read(since=watermark)
+    # Semantic-compaction proposals concern the chat conversation, so the
+    # working-memory estimate counts chat-scope turns only (ADR-0009 §5).
+    events = chat_scope_only(runtime.store.read(since=watermark))
     working = working_window_token_estimate(events, watermark=0)
     if working < ep.propose_floor_tokens:
         return working, (

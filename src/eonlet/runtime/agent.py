@@ -94,11 +94,25 @@ class AgentRuntime:
     # path around a task-scoped run; threaded into ToolContext so the `task`
     # tool's done/add default to it. ``None`` for ordinary turns.
     current_task_id: str | None = None
+    # Origin of the current turn (ADR-0008 §5): "user" / "agent" / "trigger".
+    # Set by the worker around each turn; threaded into ToolContext so the `task`
+    # tool can stamp a new root task's origin. Defaults to "user".
+    turn_origin: str = "user"
+    # Count of interactive user messages queued but not yet handled (ADR-0008
+    # §3). Incremented by the IPC `message.send` handler, decremented by the main
+    # loop when it dequeues one. A running task's pause_check yields when >0 so
+    # the user's interrupt is attended to promptly. In-memory; resets on restart.
+    pending_interactive: int = 0
     # Turn-boundary hook (ADR-0007 M3). Called before each turn; if it returns
     # True the run ends cleanly at that boundary. The worker installs it to
     # implement cooperative preemption (pause this task for a higher-priority
     # one). ``None`` for ordinary runs.
     pause_check: Callable[[], Any] | None = None
+    # Turn-boundary side-effect hook (ADR-0009 M4). Called before each turn (after
+    # pause_check). The worker installs it for a task run to fold the task's
+    # own-scope working memory into its brief when it exceeds budget. ``None`` for
+    # ordinary runs. Unlike pause_check it returns nothing — it never ends the run.
+    on_turn_boundary: Callable[[], Any] | None = None
     # Monotonic timestamp of the last preemption (ADR-0007 M3) — anti-thrash
     # cooldown guard. In-memory; resets on worker restart.
     last_preempt_monotonic: float = 0.0
@@ -197,6 +211,10 @@ class AgentRuntime:
             if self.pause_check is not None and await self.pause_check():
                 log.info("agent: run paused at turn boundary")
                 return
+            # Task-scope compaction (ADR-0009 M4): fold older own-scope turns into
+            # the brief if the window exceeds budget, before assembling messages.
+            if self.on_turn_boundary is not None:
+                await self.on_turn_boundary()
             messages = self._build_llm_messages()
             try:
                 resp = await self._stream_one_turn(messages, tool_specs)
@@ -417,6 +435,7 @@ class AgentRuntime:
             record_event=self._record,
             read_tasks=lambda: self.task_forest,
             current_task_id=self.current_task_id,
+            turn_origin=self.turn_origin,
             max_task_depth=self.definition.config.tasks.scheduling.max_tree_depth,
             max_task_fanout=self.definition.config.tasks.scheduling.max_fanout,
             http_fetcher=self.http_fetcher,
@@ -453,8 +472,28 @@ class AgentRuntime:
         budget = cfg.episodic.working_memory_tokens
         min_keep = cfg.episodic.keep_recent_messages_min
 
-        # Filter messages older than the watermark first — they are STM now.
-        eligible = [m for m in self.state.messages if m.event_id is None or m.event_id > watermark]
+        # Scope the window to the current task (ADR-0009 §2): a task-scoped run
+        # sees only its own turns; a chat/cron turn sees only chat-scope turns.
+        # The compaction watermark applies to the CHAT scope only — task turns
+        # are never summarized into STM, so the watermark must not hide them.
+        scope = self.current_task_id
+        if scope is None:
+            eligible = [
+                m
+                for m in self.state.messages
+                if m.task_id is None and (m.event_id is None or m.event_id > watermark)
+            ]
+        else:
+            # The per-task brief watermark (ADR-0009 M4) prunes own-scope turns
+            # already folded into the task's progress_summary (injected into the
+            # system prompt by _build_system_prompt).
+            t = self.task_forest.get(scope)
+            task_wm = t.brief_watermark if t is not None else 0
+            eligible = [
+                m
+                for m in self.state.messages
+                if m.task_id == scope and (m.event_id is None or m.event_id > task_wm)
+            ]
 
         selected: list[Any] = []
         total = 0
@@ -506,11 +545,42 @@ class AgentRuntime:
             parts.append(self._cached_preamble)
         if self._cached_tasks:
             parts.append(self._cached_tasks)
+        # During a task-scoped run, inject the current task's live resume brief
+        # (ADR-0009 M4). Rebuilt each turn, so as task-scope compaction folds older
+        # turns out of the window the brief stays present here — continuity without
+        # re-injecting messages.
+        if self.current_task_id is not None:
+            t = self.task_forest.get(self.current_task_id)
+            if t is not None and t.progress_summary.strip():
+                parts.append(f"<task_progress>\n{t.progress_summary.strip()}\n</task_progress>")
         return "\n\n".join(parts)
 
     # ── event recording ──────────────────────────────────────────────────────
 
+    # Conversation-family kinds that carry a task scope (ADR-0009). Stamped from
+    # current_task_id so the LLM window can be filtered per scope and episodic
+    # compaction can exclude task turns. Task/memory/bookkeeping events stay
+    # scope-neutral (task_id None).
+    _SCOPED_KINDS = frozenset(
+        {
+            EventKind.USER_MESSAGE,
+            EventKind.ASSISTANT_MESSAGE,
+            EventKind.TOOL_CALL,
+            EventKind.TOOL_RESULT,
+            EventKind.TOOL_ERROR,
+        }
+    )
+
     async def _record(self, event: Event) -> Event:
+        # Stamp the task scope on conversation events (ADR-0009 §2): events
+        # produced during a task-scoped run carry that task's id; chat/cron
+        # turns carry None. Done centrally here so no call site has to thread it.
+        if (
+            self.current_task_id is not None
+            and event.task_id is None
+            and event.kind in self._SCOPED_KINDS
+        ):
+            event = event.model_copy(update={"task_id": self.current_task_id})
         stored = self.store.append(event)
         # Update in-memory state for next iteration.
         from .state import reduce as _reduce

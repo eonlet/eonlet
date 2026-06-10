@@ -60,14 +60,16 @@ def test_descends_into_children_before_parent() -> None:
     assert _id(forest) == "c1"
 
 
-def test_highest_priority_sibling_first() -> None:
+def test_siblings_run_in_creation_order() -> None:
+    # ADR-0008 §2: no scheduling within a tree — subtasks run depth-first in
+    # creation order, *not* by priority (priority schedules only at the root).
     forest = _forest(
         task_created(id="root", content="project"),
         task_created(id="a", content="a", parent_id="root", priority=1),
         task_created(id="b", content="b", parent_id="root", priority=8),
         task_transitioned(id="root", from_state="pending", to_state="blocked"),
     )
-    assert _id(forest) == "b"
+    assert _id(forest) == "a"  # created first, despite b's higher priority
 
 
 def test_blocked_parent_synthesizes_when_children_terminal() -> None:
@@ -236,3 +238,65 @@ def test_preemptor_ignores_own_subtask() -> None:
     cur = forest.get("cur")
     assert cur is not None
     assert preemptor(forest, cur) is None
+
+
+def test_preemptor_compares_root_priority_not_node() -> None:
+    # ADR-0008 §2/§3: scheduling is by ROOT priority. A low-priority root tree
+    # does not preempt, even when the running node deep inside the current tree
+    # carries a high priority.
+    forest = _forest(
+        task_created(id="r1", content="r1", priority=5),
+        task_created(id="r1c", content="r1 child", parent_id="r1", priority=9),
+        task_transitioned(id="r1", from_state="pending", to_state="blocked"),
+        task_transitioned(id="r1c", from_state="pending", to_state="active"),
+        task_created(id="r2", content="r2", priority=3),  # root p3 < r1 root p5
+    )
+    cur = forest.get("r1c")
+    assert cur is not None
+    assert preemptor(forest, cur) is None
+
+
+def test_preemptor_higher_root_tree_preempts_from_within() -> None:
+    # A strictly-higher-priority *other* root tree preempts; the contender is the
+    # runnable node within that tree (here the higher tree's pending child).
+    forest = _forest(
+        task_created(id="r1", content="r1", priority=2),
+        task_created(id="r1c", content="r1 child", parent_id="r1"),
+        task_transitioned(id="r1", from_state="pending", to_state="blocked"),
+        task_transitioned(id="r1c", from_state="pending", to_state="active"),
+        task_created(id="r2", content="r2", priority=5),
+        task_created(id="r2c", content="r2 child", parent_id="r2"),
+        task_transitioned(id="r2", from_state="pending", to_state="blocked"),
+    )
+    cur = forest.get("r1c")
+    assert cur is not None
+    p = preemptor(forest, cur)
+    assert p is not None and p.id == "r2c"
+
+
+def test_preemptor_skips_trigger_origin_root() -> None:
+    # ADR-0008 §4: a trigger-origin (scheduled/autonomous) tree never preempts
+    # foreground work, even at higher priority.
+    forest = _forest(
+        task_created(id="cur", content="current", priority=2),
+        task_transitioned(id="cur", from_state="pending", to_state="active"),
+        task_created(id="trig", content="scheduled", priority=9, origin="trigger"),
+    )
+    cur = forest.get("cur")
+    assert cur is not None
+    assert preemptor(forest, cur) is None
+
+
+def test_preemptor_prefers_eligible_root_over_skipped_trigger() -> None:
+    # The top contender is a trigger tree (skipped); the next-highest eligible
+    # root (user-origin) still preempts.
+    forest = _forest(
+        task_created(id="cur", content="current", priority=2),
+        task_transitioned(id="cur", from_state="pending", to_state="active"),
+        task_created(id="trig", content="scheduled", priority=9, origin="trigger"),
+        task_created(id="usr", content="user task", priority=5, origin="user"),
+    )
+    cur = forest.get("cur")
+    assert cur is not None
+    p = preemptor(forest, cur)
+    assert p is not None and p.id == "usr"

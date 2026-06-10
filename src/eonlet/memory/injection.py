@@ -226,6 +226,17 @@ def working_window_token_estimate(events: list[Event], watermark: int) -> int:
     return sum(_event_tokens(e) for e in events if (e.id or 0) > watermark)
 
 
+def chat_scope_only(events: list[Event]) -> list[Event]:
+    """Keep only chat-scope events (ADR-0009 §5).
+
+    Episodic memory is the *conversation* timeline: task-scoped turns
+    (``task_id`` set) are ephemeral working context for a task, never summarized
+    into STM/LTM nor counted toward the chat working-window threshold. Their
+    durable residue is the task's ``result`` + checkpoint brief + the recall log.
+    """
+    return [e for e in events if e.task_id is None]
+
+
 # ── Read-only convenience ──────────────────────────────────────────────────
 
 
@@ -241,6 +252,7 @@ __all__ = [
     "WindowSlice",
     "build_memory_preamble",
     "build_tasks_block",
+    "chat_scope_only",
     "current_watermark",
     "format_turn_timestamp",
     "prefix_user_timestamp",

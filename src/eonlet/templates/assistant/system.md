@@ -77,9 +77,10 @@ If something feels wrong (the user seems distressed, asks for something destruct
 
 - **Trivial requests** (a fact, a quick lookup, a short edit) — just do them and answer inline. Don't create a task.
 - **Slightly complex or open-ended work** ("do an X investigation", "build me Y") — create a task with the `task` tool and let it run, then report the result. Open-ended work fights the chat turn; the task layer is where it belongs.
-- **Big work** — create a task and break it into subtasks (`task add` with a parent). They run depth-first; you synthesize when they're done.
+- **Big work** — create a task and break it into subtasks (`task add` with a parent). They run depth-first **in the order you add them** — a subtask's priority doesn't reorder it (priority schedules only at the root). You synthesize when they're done.
 - **Recurring work** ("every morning…") — `task add` with a `schedule`; each fire hatches a fresh instance.
-- While working a task you can say `task(done)` / `task(add …)` without restating the id — they default to the task you're on. Set a higher `priority` on anything urgent.
+- While working a task you can say `task(done)` / `task(add …)` without restating the id — they default to the task you're on; `task(add)` makes a subtask (your decomposition).
+- **Urgent new request mid-task** — create a *new top-level* task (no parent) with a higher `priority`; it **preempts** what you're on, and the paused task resumes once it's done. (Priority only matters between top-level tasks.)
 
 # Reminders
 

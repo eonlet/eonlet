@@ -292,6 +292,16 @@ Selection algorithm:
 The resulting list is reversed to chronological order and emitted as the
 message history.
 
+**Task scoping (ADR-0009).** The window is filtered to the **current task scope**
+before the walk-back: a task-scoped run sees only its own turns (`Event.task_id`
+== the running task), a chat/cron turn sees only chat-scope turns (`task_id` is
+`None`). The compaction watermark (step 3) applies to the **chat scope only** —
+task turns are never summarized into STM, so the watermark must not hide them;
+task scopes are bounded by the working-memory budget alone. Episodic memory
+(STM/LTM, tier-1/2/3) is therefore the *conversation* timeline; a task's durable
+residue is its `result` + checkpoint brief + the recall-indexed log. See
+TASK_SPEC §4.2.
+
 ### 3.3 Trigger envelope interaction
 
 `TRIGGER_SPEC.md §2.3` defines the `<trigger>...</trigger>` envelope. The
@@ -366,7 +376,10 @@ window into STM) with **three triggers**, and the trigger decides the boundary:
 the recent-messages window (as assembled in §3.2) exceeds
 `episodic.working_memory_tokens`.
 
-**Input:** all events with `id > compaction_watermark` and `id ≤ snapshot_id`.
+**Input:** all **chat-scope** events with `id > compaction_watermark` and
+`id ≤ snapshot_id` (events with a `task_id` are excluded — task turns are not
+episodic; ADR-0009 §5). The bounded-auto trigger likewise counts chat-scope tokens
+only, so a busy task never triggers conversation compaction.
 
 **Output:** zero or more new STM sections appended to `short_term.md`, plus
 an advance of `compaction_watermark` to a chosen `boundary_event_id`.

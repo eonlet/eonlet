@@ -284,6 +284,17 @@ Flags:
 Enters an interactive REPL:
 - Type messages, press Enter to send
 - Streaming output renders in real time
+- The screen shows the **user↔agent conversation only** — assistant/user text.
+  Tool-call mechanics are hidden by default in the chat view (both a scheduled
+  task's internal turns *and* tools the agent runs inline in the chat turn), so
+  the transcript stays a clean conversation. A concise `◇ task <id> queued / ✓
+  done` line marks task lifecycle so you know work is happening. Tool *errors*
+  still surface.
+  - `/tools on` (or bare `/tools` to toggle) shows the `⎿ tool(args)` calls and
+    results inline in the chat; `/tools off` hides them again.
+  - `/task view <id>` follows a task's execution with full tool detail (always
+    verbose, regardless of `/tools`); `/task exit` (or just send a message)
+    returns to the chat.
 - `Ctrl+B D` to detach (worker keeps running)
 - `Ctrl+C` to interrupt current LLM call (does NOT exit attach)
 - `Ctrl+D` to detach and quit
@@ -299,17 +310,25 @@ Enters an interactive REPL:
 | `/knowledge open <path>` | Print one knowledge file in full |
 | `/knowledge write <path> <text>` | Create/replace a knowledge file |
 | `/knowledge rm <path>` | Delete a knowledge file |
-| `/task` / `/task list [status]` | List tasks (pending by default) |
-| `/task add <text>` / `/task done <id>` / `/task rm <id>` | Manage tasks |
+| `/task` / `/task list [status]` | Flat list of tasks (pending by default; status one of pending\|active\|suspended\|blocked\|done\|cancelled\|all) |
+| `/task tree [status]` | Render the full task forest as a tree, including history (default: `all`); a status filter keeps matching tasks plus their ancestors |
+| `/task view <id>` | Replay a task's execution trace and follow it live |
+| `/task exit` | Stop following a task; return to the chat view |
+| `/task add <text>` / `/task done <id>` / `/task cancel <id>` / `/task rm <id>` | Manage tasks |
 | `/memory show [stm\|ltm\|knowledge\|all]` | Print episodic memory stores |
 | `/compact` | Full compaction now: summarize the whole working window into STM, empty it, start a fresh episode (ADR-0006) |
 | `/compact [off\|on]` | Toggle auto-compaction for this session |
+| `/tools [on\|off]` | Show/hide tool-call mechanics in the chat view (default off; bare `/tools` toggles) |
+| `/yolo [on\|off]` | Switch permission mode for the session (bare `/yolo` toggles; not persisted to `agent.yaml`) |
+| `/ask` | Switch to ask mode (destructive tools prompt for confirmation) |
+| `/permissions` | Show the current permission mode |
 | `/budget` | Show today's and month's spending |
 | `/triggers` | List configured triggers and next fire times |
 | `/fire <trigger_id>` | Manually fire a configured trigger (great for testing) |
-| `/permissions` | Show current permission mode and deny list |
 | `/skill ls` | List loaded skills |
 | `/exit` | Detach |
+
+For every `<id>` task argument (`view` / `done` / `cancel` / `rm`), the id may be any **unique fragment** of a full task id (e.g. a short prefix) rather than the whole id — an exact id always wins; an ambiguous fragment lists the candidates and does nothing.
 
 ### `eonlet send <id> "<message>"`
 

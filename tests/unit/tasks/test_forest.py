@@ -117,6 +117,21 @@ def test_update_applies_only_provided_fields() -> None:
     assert t.tags == ["a"]  # untouched
 
 
+def test_update_sets_framing() -> None:
+    # ADR-0009 M3: the down-tree decision trace is stored on the task via
+    # TASK_UPDATED(framing=…), reduced into Task.framing.
+    forest = fold_tasks(
+        _stamp(
+            [
+                task_created(id="t", content="x", goal="do x"),
+                task_updated(id="t", framing="parent chose Postgres"),
+            ]
+        )
+    )
+    t = forest.get("t")
+    assert t is not None and t.framing == "parent chose Postgres"
+
+
 def test_checkpoint_sets_progress_summary() -> None:
     forest = fold_tasks(
         _stamp(
@@ -132,7 +147,22 @@ def test_checkpoint_sets_progress_summary() -> None:
     assert t is not None and t.progress_summary == "did half" and t.status == "suspended"
 
 
-def test_delete_orphans_children_to_roots() -> None:
+def test_checkpoint_boundary_advances_brief_watermark() -> None:
+    # ADR-0009 M4: boundary_event_id advances the per-task brief watermark
+    # (monotonically — a later checkpoint with a smaller/absent boundary can't
+    # rewind it).
+    forest = fold_tasks(
+        _stamp(
+            [
+                task_created(id="t", content="x"),
+                task_checkpointed(id="t", progress_summary="b1", boundary_event_id=5),
+                task_checkpointed(id="t", progress_summary="b2"),  # no boundary
+                task_checkpointed(id="t", progress_summary="b3", boundary_event_id=3),  # older
+            ]
+        )
+    )
+    t = forest.get("t")
+    assert t is not None and t.brief_watermark == 5 and t.progress_summary == "b3"
     forest = fold_tasks(
         _stamp(
             [
@@ -208,3 +238,22 @@ def test_can_transition_rules() -> None:
     assert can_transition("done", "done")  # no-op allowed
     assert not can_transition("done", "active")
     assert not can_transition("cancelled", "pending")
+
+
+def test_root_of() -> None:
+    # ADR-0008 §2: the root is the scheduling unit; root_of walks to it.
+    forest = fold_tasks(
+        _stamp(
+            [
+                task_created(id="a", content="a"),
+                task_created(id="b", content="b", parent_id="a"),
+                task_created(id="c", content="c", parent_id="b"),
+                task_created(id="other", content="other"),
+            ]
+        )
+    )
+    assert forest.root_of("c").id == "a"  # type: ignore[union-attr]
+    assert forest.root_of("b").id == "a"  # type: ignore[union-attr]
+    assert forest.root_of("a").id == "a"  # type: ignore[union-attr]
+    assert forest.root_of("other").id == "other"  # type: ignore[union-attr]
+    assert forest.root_of("ghost") is None

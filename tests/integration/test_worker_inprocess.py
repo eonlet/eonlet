@@ -271,6 +271,216 @@ tasks:
     assert final.get("result") == "completed"
 
 
+def test_inproc_events_replay_filters_by_task_scope(isolated_home: Path) -> None:
+    """``events.replay`` with a ``task_id`` returns only that task's conversation
+    turns — the scoping the attach UI uses to show a single task's execution
+    (ADR-0009). The task's own turns carry the scope; the chat-scope log carries
+    the scope-neutral task lifecycle events."""
+    paths.ensure_home()
+    d = paths.agents_dir() / "scopebot"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(
+        """apiVersion: eonlet/v1
+kind: Agent
+metadata:
+  name: scopebot
+  description: scope replay test
+  version: 0.0.1
+runtime:
+  model: fake-task-done
+  max_steps_per_run: 5
+tools:
+  builtin: [task]
+permissions:
+  mode: yolo
+tasks:
+  scheduling:
+    enabled: true
+""",
+        encoding="utf-8",
+    )
+    (d / "system.md").write_text("# scopebot\nrun tasks.\n", encoding="utf-8")
+    eid = "scopebot.alice"
+    _prep_eonlet(eid, d)
+
+    captured: dict[str, list] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    add = await client.request("task.add", {"content": "do the thing"})
+                    tid = add["id"]
+
+                    for _ in range(60):
+                        listed = await client.request("task.list", {"status": "done"})
+                        if tid in {t["id"] for t in listed["tasks"]}:
+                            break
+                        await anyio.sleep(0.2)
+
+                    captured["scoped"] = await client.request("events.replay", {"task_id": tid})
+                    captured["all"] = await client.request("events.replay", {"from": 0})
+                    captured["tid"] = tid  # type: ignore[assignment]
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(20):
+            await go()
+
+    anyio.run(with_timeout)
+
+    tid = captured["tid"]
+    scoped = captured["scoped"]
+    # Every scoped event belongs to the task and is a conversation turn.
+    assert scoped, "task should have produced conversation events"
+    assert all(e["task_id"] == tid for e in scoped)
+    assert any(e["kind"] == "user_message" for e in scoped)
+
+    # The unfiltered log carries scope-neutral lifecycle events (task_id None)
+    # plus the task's scoped turns — i.e. the two are genuinely separable.
+    all_events = captured["all"]
+    assert any(e["kind"] == "task_created" and e["task_id"] is None for e in all_events)
+    assert any(e["task_id"] == tid for e in all_events)
+
+
+def test_inproc_task_tree_includes_history_and_depth(isolated_home: Path) -> None:
+    """``task.tree`` returns the forest in DFS order with a per-node depth,
+    including historical (done) tasks. A status filter keeps matching tasks plus
+    their ancestors so the tree stays connected — the data behind /task tree."""
+    paths.ensure_home()
+    defn = _write_fake_definition(isolated_home)
+    eid = "echobot.tree"
+    _prep_eonlet(eid, defn)
+
+    captured: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    await client.request("session.start", {"client_id": "test"})
+
+                    root = await client.request("task.add", {"content": "root task"})
+                    rid = root["id"]
+                    child = await client.request(
+                        "task.add", {"content": "child task", "parent_id": rid}
+                    )
+                    cid = child["id"]
+                    # Mark the child done → it becomes "history".
+                    done = await client.request("task.done", {"id": cid})
+                    assert done["ok"]
+
+                    captured["all"] = await client.request("task.tree", {"status": "all"})
+                    captured["done"] = await client.request("task.tree", {"status": "done"})
+                    captured["rid"] = rid  # type: ignore[assignment]
+                    captured["cid"] = cid  # type: ignore[assignment]
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(15):
+            await go()
+
+    anyio.run(with_timeout)
+
+    rid, cid = captured["rid"], captured["cid"]
+    all_nodes = captured["all"]["tasks"]  # type: ignore[index]
+    by_id = {n["id"]: n for n in all_nodes}
+    assert by_id[rid]["depth"] == 0
+    assert by_id[cid]["depth"] == 1
+    # DFS order: a parent precedes its child.
+    ids = [n["id"] for n in all_nodes]
+    assert ids.index(rid) < ids.index(cid)
+
+    # status=done keeps the done child AND its ancestor root (connected tree).
+    done_ids = {n["id"] for n in captured["done"]["tasks"]}  # type: ignore[index]
+    assert cid in done_ids
+    assert rid in done_ids
+
+
+def test_inproc_permissions_set_mode(isolated_home: Path) -> None:
+    """``permissions.set_mode`` switches the live gate (yolo ↔ ask) and reports
+    the mode back via ``session.start`` — the wiring behind ``/yolo``."""
+    paths.ensure_home()
+    defn = _write_fake_definition(isolated_home)  # permissions.mode: yolo
+    eid = "echobot.mode"
+    _prep_eonlet(eid, defn)
+
+    captured: dict[str, object] = {}
+
+    async def go() -> None:
+        shutdown = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                functools.partial(run_worker, eid, shutdown, install_signal_watcher=False)
+            )
+            for _ in range(100):
+                if paths.runtime_sock(eid).exists():
+                    break
+                await anyio.sleep(0.02)
+
+            async with IPCClient(str(paths.runtime_sock(eid))) as client:
+                async with anyio.create_task_group() as ctg:
+                    ctg.start_soon(client.run)
+                    started = await client.request("session.start", {"client_id": "test"})
+                    captured["start_mode"] = (started["state"] or {}).get("mode")
+
+                    captured["to_ask"] = await client.request(
+                        "permissions.set_mode", {"mode": "ask"}
+                    )
+                    captured["toggle"] = await client.request(
+                        "permissions.set_mode", {"mode": "toggle"}
+                    )
+                    captured["bad"] = await client.request(
+                        "permissions.set_mode", {"mode": "bogus"}
+                    )
+                    again = await client.request("session.start", {"client_id": "test"})
+                    captured["end_mode"] = (again["state"] or {}).get("mode")
+                    ctg.cancel_scope.cancel()
+
+            shutdown.set()
+            tg.cancel_scope.cancel()
+
+    async def with_timeout() -> None:
+        with anyio.fail_after(15):
+            await go()
+
+    anyio.run(with_timeout)
+
+    assert captured["start_mode"] == "yolo"  # from the definition
+    assert captured["to_ask"] == {"ok": True, "mode": "ask", "previous": "yolo"}
+    assert captured["toggle"] == {"ok": True, "mode": "yolo", "previous": "ask"}
+    assert captured["bad"]["ok"] is False  # invalid mode rejected
+    assert captured["end_mode"] == "yolo"  # toggle landed back on yolo
+
+
 def _write_scheduling_agent(
     name: str, model: str, *, tools: str = "[task]", preempt: str = "ask"
 ) -> Path:
@@ -480,7 +690,9 @@ def test_inproc_scheduler_preempts_lower_priority(isolated_home: Path) -> None:
     # ...because the busy task was preempted to make way for it.
     preempts = result.get("preempt_events") or []
     assert preempts, "expected a 'preempted:' transition for the busy task"
-    assert preempts[0]["payload"]["reason"] == f"preempted:{result['hi']['id']}"  # type: ignore[index]
+    # Both tasks were created via the control plane (origin="user"), so the
+    # reason carries the contender origin + id (ADR-0008 §4).
+    assert preempts[0]["payload"]["reason"] == f"preempted:user:{result['hi']['id']}"  # type: ignore[index]
 
 
 def test_inproc_scheduled_task_hatches_and_runs(isolated_home: Path) -> None:

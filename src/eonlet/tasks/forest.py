@@ -75,6 +75,18 @@ class Task:
     parent_id: str | None = None
     origin: TaskOrigin = "agent"
     progress_summary: str = ""
+    # Down-tree decision trace (ADR-0009 M3): a compressed snapshot of the
+    # parent's (or chat's) decisions/constraints this task must stay coherent
+    # with. Computed once on first dispatch and stored here; injected by
+    # build_task_prompt. Distinct from progress_summary (this task's own resume
+    # brief). Empty when there is no meaningful source to compress.
+    framing: str = ""
+    # Task-scope brief watermark (ADR-0009 M4): the highest own-scope event id
+    # already folded into ``progress_summary``. The LLM window for this task shows
+    # only scope turns with id > this; older turns are represented by the brief
+    # (and remain in the log for recall). Mirrors the chat-scope compaction
+    # watermark, but per-task and targeting the brief instead of STM.
+    brief_watermark: int = 0
     result: str = ""
     created_at: str = ""
     done_at: str | None = None
@@ -93,6 +105,8 @@ class Task:
             "parent_id": self.parent_id,
             "origin": self.origin,
             "progress_summary": self.progress_summary,
+            "framing": self.framing,
+            "brief_watermark": self.brief_watermark,
             "result": self.result,
             "created_at": self.created_at,
             "done_at": self.done_at,
@@ -144,6 +158,23 @@ class TaskForest:
             d += 1
             node = parent
         return d
+
+    def root_of(self, task_id: str) -> Task | None:
+        """The root of the tree containing ``task_id`` (the node itself if a root).
+
+        The root is the scheduling unit (ADR-0008 §2): preemption compares root
+        priorities, not the priority of the individual running node. ``None`` if
+        ``task_id`` is unknown. Cycle-guarded like :meth:`depth`.
+        """
+        node = self.get(task_id)
+        seen: set[str] = set()
+        while node is not None and node.parent_id is not None and node.id not in seen:
+            seen.add(node.id)
+            parent = self.get(node.parent_id)
+            if parent is None:
+                break
+            node = parent
+        return node
 
     def _is_root(self, t: Task) -> bool:
         # A node is a root if it has no parent, or its parent has been deleted
@@ -241,6 +272,8 @@ def reduce_task(forest: TaskForest, event: Event) -> TaskForest:
             t.due = _opt_str(p["due"])
         if p.get("tags") is not None:
             t.tags = _str_list(p["tags"])
+        if p.get("framing") is not None:
+            t.framing = str(p["framing"])
     elif kind == EventKind.TASK_TRANSITIONED:
         t = forest.get(str(p.get("id", "")))
         if t is None:
@@ -267,6 +300,10 @@ def reduce_task(forest: TaskForest, event: Event) -> TaskForest:
             log.warning("task forest: TASK_CHECKPOINTED for missing %s; ignoring", p.get("id"))
             return forest
         t.progress_summary = str(p.get("progress_summary", ""))
+        bw = p.get("boundary_event_id")
+        if bw is not None:
+            # Advance (never rewind) the task-scope brief watermark (ADR-0009 M4).
+            t.brief_watermark = max(t.brief_watermark, int(bw))
     elif kind == EventKind.TASK_DELETED:
         forest._remove(str(p.get("id", "")))
     # Any non-task event is a no-op.

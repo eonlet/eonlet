@@ -77,6 +77,11 @@ class ToolContext:
     # default to it, so the agent says "done" without restating the id. ``None``
     # for ordinary interactive/cron turns.
     current_task_id: str | None = None
+    # Origin of the current turn (ADR-0008 §5): "user" (interactive), "agent"
+    # (task-scoped run), or "trigger" (cron). The `task` tool stamps a new ROOT
+    # task's origin from this so user-created roots are distinguishable (and
+    # preempt without consent); subtasks are always "agent".
+    turn_origin: str = "user"
     # Anti-runaway caps for `task` creation (ADR-0007 M4). 0 = unlimited. Set by
     # the runtime from tasks.scheduling; bound subtree depth / children-per-node.
     max_task_depth: int = 0

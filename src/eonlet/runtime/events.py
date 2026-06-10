@@ -81,6 +81,13 @@ class Event(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     parent_id: int | None = None
     trigger_id: str | None = None
+    # Task scope (ADR-0009): the id of the task this conversation event was
+    # produced in, or ``None`` for the chat scope. Stamped centrally by
+    # ``AgentRuntime._record`` from ``current_task_id``; mirrors the
+    # ``trigger_id`` routing slot. Only the conversation family
+    # (user/assistant/tool_call/tool_result/tool_error) carries it — it scopes
+    # the LLM window and keeps task turns out of episodic compaction.
+    task_id: str | None = None
     cost_usd: float | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
@@ -272,8 +279,13 @@ def task_updated(
     priority: int | None = None,
     due: str | None = None,
     tags: list[str] | None = None,
+    framing: str | None = None,
 ) -> Event:
-    """Mutate a task's editable fields. Only non-None fields are applied."""
+    """Mutate a task's editable fields. Only non-None fields are applied.
+
+    ``framing`` is the down-tree decision trace (ADR-0009 M3), set programmatically
+    by the runtime on a task's first dispatch — not an agent-editable field.
+    """
     payload: dict[str, Any] = {"id": id}
     if content is not None:
         payload["content"] = content
@@ -285,6 +297,8 @@ def task_updated(
         payload["due"] = due
     if tags is not None:
         payload["tags"] = tags
+    if framing is not None:
+        payload["framing"] = framing
     return Event(kind=EventKind.TASK_UPDATED, payload=payload)
 
 
@@ -300,12 +314,18 @@ def task_transitioned(
     return Event(kind=EventKind.TASK_TRANSITIONED, payload=payload)
 
 
-def task_checkpointed(*, id: str, progress_summary: str) -> Event:
-    """The resume brief written when a task is suspended."""
-    return Event(
-        kind=EventKind.TASK_CHECKPOINTED,
-        payload={"id": id, "progress_summary": progress_summary},
-    )
+def task_checkpointed(
+    *, id: str, progress_summary: str, boundary_event_id: int | None = None
+) -> Event:
+    """The resume brief written when a task is checkpointed.
+
+    ``boundary_event_id`` (ADR-0009 M4) advances the task-scope brief watermark:
+    own-scope events with id ≤ it are now represented by ``progress_summary`` and
+    drop from the live window (they remain in the log for recall)."""
+    payload: dict[str, Any] = {"id": id, "progress_summary": progress_summary}
+    if boundary_event_id is not None:
+        payload["boundary_event_id"] = boundary_event_id
+    return Event(kind=EventKind.TASK_CHECKPOINTED, payload=payload)
 
 
 def task_deleted(*, id: str) -> Event:

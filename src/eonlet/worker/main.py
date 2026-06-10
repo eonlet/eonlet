@@ -176,7 +176,7 @@ async def run_worker(
     server.on_disconnect = broker.on_session_closed
     runtime.decision_broker = broker
     runtime.event_listener = _make_event_broadcaster(server)
-    runtime.on_delta = _make_delta_broadcaster(server)
+    runtime.on_delta = _make_delta_broadcaster(server, runtime)
 
     def _on_signal() -> None:
         log.info("worker: signal received, shutting down")
@@ -321,6 +321,15 @@ async def _main_loop(
                 await _hatch_task(runtime, item)
                 continue
 
+            # Stamp the turn origin (ADR-0008 §5) so a task created this turn is
+            # attributed correctly, and clear the interactive-interrupt mark this
+            # message satisfied (§3).
+            if item.kind == "interactive":
+                runtime.turn_origin = "user"
+                runtime.pending_interactive = max(0, runtime.pending_interactive - 1)
+            else:
+                runtime.turn_origin = "trigger"
+
             ok = True
             try:
                 async for _ in runtime.handle_user_message(item.content):
@@ -328,6 +337,8 @@ async def _main_loop(
             except Exception:
                 log.exception("main_loop: run failed")
                 ok = False
+            finally:
+                runtime.turn_origin = "user"
             if item.kind == "cron" and item.trigger_id:
                 scheduler.record_outcome(item.trigger_id, success=ok)
 
@@ -353,34 +364,40 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
     await runtime._record(
         task_transitioned(id=task.id, from_state=task.status, to_state="active", reason="scheduled")
     )
+    # On first dispatch, give the task its down-tree decision trace (ADR-0009 M3)
+    # so build_task_prompt can carry the parent's/chat's decisions into the run.
+    await _ensure_framing(runtime, task)
     prompt = build_task_prompt(runtime.task_forest, task.id)
     runtime.current_task_id = task.id
-    # Install the turn-boundary hook when preemption is enabled or a per-task
-    # token budget caps the run (ADR-0007 M3/M4).
-    needs_hook = sched.preempt != "off" or sched.per_task_budget_tokens > 0
-    runtime.pause_check = (
-        _make_pause_check(runtime, task, sched, preempt_to) if needs_hook else None
-    )
+    runtime.turn_origin = "agent"
+    # Always install the turn-boundary hook: user-input preemption (ADR-0008 §3)
+    # is possible regardless of the `preempt`/budget config, and the hook also
+    # enforces the per-task token budget (ADR-0007 M4) and agent-initiated
+    # cross-tree preemption (§6) when those are configured.
+    runtime.pause_check = _make_pause_check(runtime, task, sched, preempt_to)
+    # Fold the task's own-scope working memory into its brief when it exceeds
+    # budget, at each turn boundary (ADR-0009 M4).
+    runtime.on_turn_boundary = lambda: _maybe_compact_task(runtime, task.id)
     try:
         async for _ in runtime.handle_user_message(prompt):
             pass
     finally:
         runtime.current_task_id = None
+        runtime.turn_origin = "user"
         runtime.pause_check = None
+        runtime.on_turn_boundary = None
 
     if preempt_to:
-        # Paused for a higher-priority task: checkpoint a resume brief and put
-        # the task back to pending so the scheduler re-picks it after the
-        # preemptor (which now outranks it) and it resumes from the brief.
-        summary = _checkpoint_summary(runtime, task.id)
-        await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+        # Paused (user interrupt or a higher-priority tree): checkpoint a resume
+        # brief and put the task back to pending so the scheduler re-picks it once
+        # the preemptor — now outranking it — finishes, resuming from the brief.
+        summary, boundary = await _checkpoint_summary(runtime, task.id)
         await runtime._record(
-            task_transitioned(
-                id=task.id,
-                from_state="active",
-                to_state="pending",
-                reason=f"preempted:{preempt_to['id']}",
-            )
+            task_checkpointed(id=task.id, progress_summary=summary, boundary_event_id=boundary)
+        )
+        reason = str(preempt_to.get("reason") or f"preempted:{preempt_to.get('id', '')}")
+        await runtime._record(
+            task_transitioned(id=task.id, from_state="active", to_state="pending", reason=reason)
         )
         return
 
@@ -406,8 +423,10 @@ async def _run_task(runtime: AgentRuntime, task: Task) -> None:
                 )
             )
         else:
-            summary = _checkpoint_summary(runtime, task.id)
-            await runtime._record(task_checkpointed(id=task.id, progress_summary=summary))
+            summary, boundary = await _checkpoint_summary(runtime, task.id)
+            await runtime._record(
+                task_checkpointed(id=task.id, progress_summary=summary, boundary_event_id=boundary)
+            )
             await runtime._record(
                 task_transitioned(
                     id=task.id, from_state="active", to_state="suspended", reason="yielded"
@@ -435,8 +454,16 @@ def _make_pause_check(
     async def check() -> bool:
         if preempt_to:  # already decided to pause this run
             return True
-        # Per-task token budget (ADR-0007 M4): end the run if it has spent its
-        # allowance. Leaves preempt_to empty → classified as a yield (suspend).
+        # 1. A queued interactive user message preempts unconditionally (ADR-0008
+        #    §3): the user is interrupting — yield so the worker can handle the
+        #    message (which may create a higher-priority task). No consent, no
+        #    cooldown; re-queued as pending (preempt_to set).
+        if runtime.pending_interactive > 0:
+            preempt_to["reason"] = "preempted:user-input"
+            log.info("task %s paused for queued user input", task.id)
+            return True
+        # 2. Per-task token budget (ADR-0007 M4): end the run if it has spent its
+        #    allowance. Leaves preempt_to empty → classified as a yield (suspend).
         if budget:
             spent = sum(
                 (e.tokens_in or 0) + (e.tokens_out or 0) for e in runtime.store.read(since=start_id)
@@ -444,21 +471,31 @@ def _make_pause_check(
             if spent >= budget:
                 log.info("task %s hit per-task token budget %d (spent %d)", task.id, budget, spent)
                 return True
-        if sched.preempt == "off":
-            return False
-        if time.monotonic() - runtime.last_preempt_monotonic < cooldown:
-            return False  # anti-thrash
+        # 3. Cross-tree preemption by a strictly-higher-priority root (ADR-0008
+        #    §3/§4). Consent splits by the contender root's origin: a user tree
+        #    preempts unconditionally; an agent tree keeps ADR-0007 §6 consent +
+        #    cooldown; a trigger tree is never returned by `preemptor`.
         cur = runtime.task_forest.get(task.id)
         if cur is None:
             return False
         contender = preemptor(runtime.task_forest, cur)
         if contender is None:
             return False
-        if not await _approve_preempt(runtime, cur, contender, sched):
-            return False
+        croot = runtime.task_forest.root_of(contender.id)
+        origin = croot.origin if croot is not None else "agent"
+        if origin != "user":
+            # Agent-initiated cross-tree preemption: governed by `preempt`,
+            # the cooldown, and the consent channel.
+            if sched.preempt == "off":
+                return False
+            if time.monotonic() - runtime.last_preempt_monotonic < cooldown:
+                return False  # anti-thrash
+            if not await _approve_preempt(runtime, cur, contender, sched):
+                return False
         preempt_to["id"] = contender.id
+        preempt_to["reason"] = f"preempted:{origin}:{contender.id}"
         runtime.last_preempt_monotonic = time.monotonic()
-        log.info("task %s paused for higher-priority %s", task.id, contender.id)
+        log.info("task %s paused for higher-priority %s (%s)", task.id, contender.id, origin)
         return True
 
     return check
@@ -486,25 +523,166 @@ async def _approve_preempt(
     return bool(choice == "switch")
 
 
-def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> str:
-    """A minimal, deterministic resume brief from the run's last assistant turn.
+_MIN_TRACE_SOURCE_EVENTS = 2  # below this the goal already suffices — skip the LLM call
 
-    M2 keeps this structural; enriching it with an LLM summary (compactor reuse)
-    is a later refinement. The contract is only that it is non-empty so a resumed
-    task has something to pick up from.
+
+async def _ensure_framing(runtime: AgentRuntime, task: Task) -> None:
+    """Compute & store a task's down-tree decision trace on its first dispatch.
+
+    ADR-0009 §3: a subtask inherits a compressed snapshot of its parent's
+    decisions; a user-origin root inherits the chat turns that motivated it — so
+    the run stays coherent with how the work was decomposed (Cognition Principle
+    1). Computed once (stored on the task via ``framing``) and skipped on later
+    runs. Trigger-origin roots, a trivial source, a disabled/absent compaction
+    provider, or any failure all leave the task goal-only (never fatal).
     """
+    if task.framing:
+        return  # already computed on an earlier dispatch
+    cfg = runtime.definition.config.memory
+    if not cfg.enabled:
+        return
+
+    parent = runtime.task_forest.get(task.parent_id) if task.parent_id else None
+    if parent is not None:
+        source_scope: str | None = parent.id  # the parent task's scope
+        parent_goal = parent.goal or parent.content
+    elif task.origin == "user":
+        source_scope = None  # the chat scope motivated this root
+        parent_goal = "the user conversation"
+    else:
+        return  # trigger-origin root etc. — nothing decomposed it
+
+    source_events = [e for e in runtime.store.read() if e.task_id == source_scope]
+    if len(source_events) < _MIN_TRACE_SOURCE_EVENTS:
+        return  # the goal already captures a trivial source
+
+    prov = _resolve_compaction_provider(runtime, cfg.compaction_model)
+    if prov is None:
+        return
+    try:
+        from ..tasks.brief import build_decision_trace
+
+        trace = await build_decision_trace(
+            prov,
+            parent_goal=parent_goal,
+            child_goal=task.goal or task.content,
+            events=source_events,
+        )
+    except Exception:
+        log.exception("down-tree trace: compression failed; task runs goal-only")
+        return
+    if trace.strip():
+        from ..runtime.events import task_updated
+
+        await runtime._record(task_updated(id=task.id, framing=trace.strip()))
+
+
+async def _checkpoint_summary(runtime: AgentRuntime, task_id: str) -> tuple[str, int | None]:
+    """The resume brief written when a task is suspended/yielded/preempted.
+
+    Returns ``(brief, boundary_event_id)``. ADR-0009 M2/M4: compress the task's
+    **un-folded** own-scope events (id > the task's brief watermark), cumulative
+    with any prior brief, into key details/events/decisions via the compaction LLM
+    (decision continuity — Cognition). ``boundary_event_id`` is the latest folded
+    id, advancing the watermark so a resume window starts clean.
+
+    Falls back to a structural summary with ``boundary=None`` (no watermark
+    advance, so nothing is pruned/lost) when memory is disabled, no compaction
+    provider resolves, the task has no new turns, or the LLM call fails — a
+    checkpoint must never be blocked.
+    """
+    t = runtime.task_forest.get(task_id)
+    goal = (t.goal or t.content) if t is not None else task_id
+    prior = t.progress_summary if t is not None else ""
+    wm = t.brief_watermark if t is not None else 0
+
+    cfg = runtime.definition.config.memory
+    scope = [e for e in runtime.store.read() if e.task_id == task_id and (e.id or 0) > wm]
+    boundary = scope[-1].id if scope else None
+    if cfg.enabled and scope:
+        prov = _resolve_compaction_provider(runtime, cfg.compaction_model)
+        if prov is not None:
+            try:
+                from ..tasks.brief import build_task_brief
+
+                brief = await build_task_brief(prov, goal=goal, events=scope, prior_brief=prior)
+                if brief.strip():
+                    return brief.strip(), boundary
+            except Exception:
+                log.exception("checkpoint brief: LLM compression failed; using structural fallback")
+    # Structural fallback: do NOT advance the watermark (boundary=None) so the
+    # un-folded turns stay in the window — a lossy structural brief must never
+    # cause raw turns to be pruned.
+    return _structural_checkpoint_summary(runtime, task_id, goal, prior), None
+
+
+def _structural_checkpoint_summary(
+    runtime: AgentRuntime, task_id: str, goal: str, prior: str = ""
+) -> str:
+    """Deterministic fallback brief: the task's last non-empty assistant turn,
+    appended to any prior brief so earlier compactions aren't dropped."""
     last = next(
         (
             m.content
             for m in reversed(runtime.state.messages)
-            if m.role == "assistant" and m.content.strip()
+            if m.role == "assistant" and m.content.strip() and m.task_id == task_id
         ),
         "",
     )
-    t = runtime.task_forest.get(task_id)
-    goal = (t.goal or t.content) if t is not None else task_id
     note = (last[:500] + " …") if len(last) > 500 else (last or "(no output)")
-    return f"In progress: {goal}\nLast: {note}"
+    base = f"In progress: {goal}\nLast: {note}"
+    return f"{prior}\n{base}" if prior.strip() else base
+
+
+async def _maybe_compact_task(runtime: AgentRuntime, task_id: str) -> None:
+    """Task-scope tier-1 (ADR-0009 M4): when a running task's un-folded own-scope
+    window exceeds budget, fold its older turns (keeping a recent tail) into the
+    cumulative brief and advance the brief watermark, so the window stays bounded
+    while continuity is preserved (the brief is injected into the system prompt).
+
+    Reversible-before-irreversible: recent turns stay raw in the window; only the
+    older portion is summarized. Any failure leaves the window bounded by the
+    ordinary budget walk (non-fatal).
+    """
+    from ..memory.injection import working_window_token_estimate
+    from ..memory.tier1 import compute_suggested_boundary
+    from ..runtime.events import task_checkpointed
+
+    cfg = runtime.definition.config.memory
+    if not cfg.enabled:
+        return
+    t = runtime.task_forest.get(task_id)
+    if t is None:
+        return
+    scope = [
+        e for e in runtime.store.read() if e.task_id == task_id and (e.id or 0) > t.brief_watermark
+    ]
+    if working_window_token_estimate(scope, watermark=0) < cfg.episodic.working_memory_tokens:
+        return
+    boundary = compute_suggested_boundary(scope, cfg)
+    if boundary <= t.brief_watermark:
+        return  # nothing on the non-tail side to fold
+    fold = [e for e in scope if (e.id or 0) <= boundary]
+    if not fold:
+        return
+    prov = _resolve_compaction_provider(runtime, cfg.compaction_model)
+    if prov is None:
+        return
+    try:
+        from ..tasks.brief import build_task_brief
+
+        brief = await build_task_brief(
+            prov, goal=t.goal or t.content, events=fold, prior_brief=t.progress_summary
+        )
+    except Exception:
+        log.exception("task-scope compaction failed; window stays bounded by the budget walk")
+        return
+    if brief.strip():
+        await runtime._record(
+            task_checkpointed(
+                id=task_id, progress_summary=brief.strip(), boundary_event_id=boundary
+            )
+        )
 
 
 async def _hatch_task(runtime: AgentRuntime, item: TriggerItem) -> None:
@@ -548,12 +726,14 @@ async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:
     cfg = runtime.definition.config.memory
     if not cfg.enabled or not runtime.auto_compact_enabled:
         return False
-    from ..memory.injection import working_window_token_estimate
+    from ..memory.injection import chat_scope_only, working_window_token_estimate
     from ..memory.tier1 import run_tier1
     from ..memory.watermark import read_watermark
 
     watermark = read_watermark(runtime.memory_dir)
-    events = runtime.store.read(since=watermark)
+    # The chat working-window threshold counts chat-scope turns only (ADR-0009
+    # §5): a busy task must not trigger episodic compaction of the conversation.
+    events = chat_scope_only(runtime.store.read(since=watermark))
     if not events:
         return False
     tokens = working_window_token_estimate(events, watermark=0)
@@ -675,11 +855,24 @@ def _make_handler(
                     "eonlet_id": eonlet_id,
                     "message_count": len(runtime.state.messages),
                     "model": runtime.provider.model,
+                    "mode": runtime.gate.mode,
                     "is_running": runtime.is_running,
                     "current_activity": runtime.current_activity,
                     "recent_messages": _recent_messages_for_attach(runtime),
                 },
             }
+        if method == "permissions.set_mode":
+            # Switch the permission mode for this running session (not persisted
+            # to agent.yaml). ``toggle`` flips yolo↔ask. Security-relevant — log it.
+            want = str(params.get("mode") or "").lower()
+            cur = runtime.gate.mode
+            if want == "toggle":
+                want = "ask" if cur == "yolo" else "yolo"
+            if want not in ("yolo", "ask"):
+                return {"ok": False, "error": f"invalid mode: {want} (yolo|ask|toggle)"}
+            runtime.gate.mode = "yolo" if want == "yolo" else "ask"
+            log.info("permission mode changed: %s %s -> %s", eonlet_id, cur, want)
+            return {"ok": True, "mode": runtime.gate.mode, "previous": cur}
         if method == "session.end":
             return {"ok": True}
         if method == "decision.respond":
@@ -696,6 +889,10 @@ def _make_handler(
                 send.send_nowait(TriggerItem(kind="interactive", content=content))
             except anyio.WouldBlock:
                 return {"ok": False, "error": "queue full"}
+            # Mark an interactive interrupt pending (ADR-0008 §3): a running
+            # task's pause_check yields on this so the user is attended to
+            # promptly. Decremented by _main_loop when the message is dequeued.
+            runtime.pending_interactive += 1
             return {"ok": True}
         if method == "trigger.fire":
             tid = params.get("trigger_id")
@@ -739,6 +936,12 @@ def _make_handler(
             }
         if method == "events.replay":
             since = int(params.get("from") or 0)
+            task_id = params.get("task_id")
+            if task_id is not None:
+                # A task's execution trace (ADR-0009 scope): scan the log and
+                # keep that task's conversation events, capped to the last 200.
+                scoped = [e for e in runtime.store.read(since=since) if e.task_id == task_id]
+                return [_event_to_dict(e) for e in scoped[-200:]]
             events = runtime.store.read(since=since, limit=200)
             return [_event_to_dict(e) for e in events]
         if method == "triggers.list":
@@ -1000,14 +1203,18 @@ async def _handle_memory_ipc(
             if guard is not None:
                 return {"ok": False, "error": guard}
             tid = mint_task_id()
+            # Control-plane task creation is user-initiated (ADR-0008 §1): a root
+            # is origin="user" (preempts without consent); a subtask follows the
+            # root-only-priority rule (§2) — priority 0, origin="agent".
+            is_subtask = bool(parent_id)
             await runtime._record(
                 task_created(
                     id=tid,
                     content=content,
                     goal=str(params.get("goal") or ""),
-                    priority=int(params.get("priority") or 0),
+                    priority=0 if is_subtask else int(params.get("priority") or 0),
                     parent_id=str(parent_id) if parent_id else None,
-                    origin="user",
+                    origin="agent" if is_subtask else "user",
                     due=params.get("due"),
                     tags=list(params.get("tags") or []),
                 )
@@ -1020,6 +1227,29 @@ async def _handle_memory_ipc(
                 return {"ok": False, "error": f"invalid status: {status_param}"}
             tasks = forest.by_status(status_param)  # type: ignore[arg-type]
             return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
+        if sub == "tree":
+            # The forest in DFS order with a ``depth`` per node, for the tree
+            # view (incl. history). A status filter keeps matching tasks plus
+            # their ancestors so the tree stays connected.
+            status_param = str(params.get("status", "all"))
+            valid = ("pending", "active", "suspended", "blocked", "done", "cancelled", "all")
+            if status_param not in valid:
+                return {"ok": False, "error": f"invalid status: {status_param}"}
+            keep = {t.id for t in forest.by_status(status_param)}  # type: ignore[arg-type]
+            if status_param != "all":
+                for tid in list(keep):
+                    cur = forest.get(tid)
+                    while cur is not None and cur.parent_id is not None:
+                        keep.add(cur.parent_id)
+                        cur = forest.get(cur.parent_id)
+            nodes: list[dict[str, Any]] = []
+            for t, depth in forest.dfs():
+                if t.id not in keep:
+                    continue
+                node = t.to_dict()
+                node["depth"] = depth
+                nodes.append(node)
+            return {"ok": True, "tasks": nodes}
         if sub in ("done", "cancel", "suspend", "resume"):
             tid = str(params.get("id", ""))
             if not tid:
@@ -1078,13 +1308,21 @@ def _make_event_broadcaster(server: IPCServer) -> Callable[[Event], Awaitable[No
     return listener
 
 
-def _make_delta_broadcaster(server: IPCServer) -> Callable[[str], Awaitable[None]]:
+def _make_delta_broadcaster(
+    server: IPCServer, runtime: AgentRuntime
+) -> Callable[[str], Awaitable[None]]:
     """Token delta hook — pushed as a JSON-RPC ``token_delta`` notification
     (SPEC §8.1) without going through the event store.
+
+    The current task scope (``None`` for chat) is stamped on each delta so the
+    attach client can suppress thinking output from a conversation it is not
+    viewing (ADR-0009 task scope).
     """
 
     async def listener(text: str) -> None:
-        await server.broadcast("token_delta", {"delta_text": text})
+        await server.broadcast(
+            "token_delta", {"delta_text": text, "task_id": runtime.current_task_id}
+        )
 
     return listener
 
@@ -1097,7 +1335,9 @@ def _recent_messages_for_attach(runtime: AgentRuntime) -> list[dict[str, Any]]:
     user always has at least 4 messages of context. Hard cap at 30 to keep the
     payload bounded across a very long tool-heavy run.
     """
-    msgs = runtime.state.messages
+    # Chat scope only (ADR-0009): the re-attach banner shows the user↔agent
+    # conversation, not task-execution turns (those are followed via /task view).
+    msgs = [m for m in runtime.state.messages if m.task_id is None]
     if not msgs:
         return []
     # Find index of the most recent user_message — start of the latest run.

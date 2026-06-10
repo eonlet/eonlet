@@ -57,6 +57,26 @@ def test_synthesis_prompt_lists_child_results() -> None:
     assert "found 3 sources" in out and "trend is up" in out
 
 
+def test_framing_trace_injected() -> None:
+    # ADR-0009 M3: the down-tree decision trace (Task.framing) is injected as a
+    # "Context from above" section.
+    forest = _forest(
+        task_created(id="root", content="ship", goal="ship the feature"),
+        task_created(id="leaf", content="schema", goal="design schema", parent_id="root"),
+    )
+    forest.get("leaf").framing = "Parent chose Postgres; keep snake_case columns."  # type: ignore[union-attr]
+    out = build_task_prompt(forest, "leaf")
+    assert "Context from above: Parent chose Postgres" in out
+    # framing precedes the (empty here) progress section and comes after parent chain
+    assert out.index("Parent context:") < out.index("Context from above:")
+
+
+def test_no_framing_section_when_empty() -> None:
+    forest = _forest(task_created(id="t", content="x", goal="do x"))
+    out = build_task_prompt(forest, "t")
+    assert "Context from above:" not in out
+
+
 def test_missing_task_is_graceful() -> None:
     out = build_task_prompt(TaskForest(), "ghost")
     assert "ghost" in out and "no longer exists" in out

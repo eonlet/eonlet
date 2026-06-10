@@ -14,6 +14,122 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Changed — scheduling refinement ([ADR-0008](docs/adr/0008-user-input-preemption.md))
+
+Refines the ADR-0007 scheduler (revises TASK_SPEC §4–§5; no new `EventKind`).
+
+- **Root tree is the scheduling unit; no scheduling within a tree.** Priority
+  schedules only at the **root** — a subtask's priority has no scheduling effect
+  and `task(add)` forces it to 0; subtasks run in **creation order** (DFS).
+- **Unified preemption rule.** At a turn boundary a switch happens iff a
+  *different* root tree's **root-priority** strictly exceeds the running tree's.
+  `preemptor` now compares root priorities and excludes the whole current tree
+  (`TaskForest.root_of`). This subsumes both task-vs-task and user-interrupt
+  preemption.
+- **Consent splits by initiator.** A `user`-origin contender preempts with no
+  consent and no cooldown; an `agent`-origin contender keeps ADR-0007's
+  `preempt`/cooldown/consent; a `trigger`-origin (scheduled) tree never preempts
+  foreground work.
+- **User-input interrupt.** A queued interactive user message preempts the running
+  task (it yields and re-queues as pending), so the user can interrupt mid-task;
+  the message is then handled as a top-priority turn that may create a new root.
+- **`origin="user"` on user-originated roots** via a new `ToolContext.turn_origin`
+  threaded by the worker; subtasks stay `origin="agent"`.
+- **Concurrent control plane** (already latent in `task.*` IPC + `eonlet tasks`
+  CLI) is documented as the non-LLM path that mutates/queries tasks without
+  interrupting the single serial LLM "compute core".
+
+### Changed — task-scoped context, M1 ([ADR-0009](docs/adr/0009-task-scoped-context.md))
+
+Hierarchical task context management: an **asymmetric context-flow model**
+(compressed decision trace down / `result` up / siblings isolated) over the single
+event log. M1 ships the scoping substrate; LLM checkpoint brief (M2), down-tree
+decision trace (M3), and task-scoped tier-1 (M4) follow.
+
+- **`Event.task_id`** — a new structural field (mirrors the `trigger_id` slot;
+  additive store migration for existing DBs). `runtime._record` stamps it centrally
+  from the current task id onto conversation events; chat/cron turns are the chat
+  scope (`None`). `Message`/`reduce` mirror it.
+- **Scoped LLM window** — `_build_llm_messages` filters to the active scope: a task
+  run sees only its own turns (+ assembled framing + `<memory>`/`<tasks>`); a chat
+  turn sees only chat-scope turns. Fixes the cross-talk where a running task saw the
+  interleaved global timeline (ADR-0008 review #1/#2). The compaction watermark now
+  applies to the chat scope only.
+- **Episodic memory = chat scope** — tier-1 source and trigger count chat-scope
+  events only (`chat_scope_only`); task turns are never promoted to STM/LTM. A
+  task's residue is its `result` + checkpoint brief + the recall-indexed log
+  (recall still indexes everything). Knowledge axis stays global.
+- **M2 — LLM checkpoint brief** — on suspend/yield/preempt the `progress_summary`
+  is now compressed from the task's own-scope events into key details/events/
+  **decisions** via the compaction LLM (`tasks/brief.py`), replacing the structural
+  last-assistant-message grab. Falls back to the structural summary (now
+  scope-aware) when memory is disabled, no compaction provider resolves, or the
+  call fails — a checkpoint is never blocked.
+- **M3 — Down-tree decision trace** — on a task's first dispatch the runtime
+  compresses its parent's scope (or, for a user-origin root, the chat scope) into a
+  `Task.framing` decision trace (`build_decision_trace`), stored via
+  `TASK_UPDATED(framing=…)` and injected by `build_task_prompt` as a "Context from
+  above" section — so a subtask stays coherent with how the work was decomposed
+  (Cognition Principle 1). Trigger-origin roots / trivial sources stay goal-only;
+  any failure is non-fatal. Up-tree (synthesis sees only child `result`s) and
+  sibling isolation are unchanged.
+- **M4 — Task-scope compaction (reversible→irreversible)** — a per-task brief
+  watermark (`Task.brief_watermark`, advanced by `TASK_CHECKPOINTED.boundary_event_id`).
+  At a task's turn boundary, `_maybe_compact_task` folds older own-scope turns
+  (keeping a recent tail) into a **cumulative** brief and prunes them from the
+  window; the brief is injected into the system prompt (`<task_progress>`), rebuilt
+  each turn, so continuity holds without re-injecting messages. The checkpoint brief
+  is now cumulative (`build_task_brief(prior_brief=…)`) and shared by the
+  suspend/yield/preempt path; the structural fallback never advances the watermark
+  (a lossy fallback can't prune raw turns). Completes ADR-0009 (M1–M4).
+
+### Changed — scope-aware attach UI
+
+Builds on the ADR-0009 `Event.task_id` scope to declutter the live `eonlet
+attach` screen — no new events or config.
+
+- **Chat-scope transcript by default** — the attach event printer now filters
+  conversation turns to the view scope. The default view is the chat scope
+  (`task_id is None`), so commanding the agent to do work no longer floods the
+  screen with the task's internal tool calls / sub-turns. Token-delta
+  "thinking…" output is scoped the same way (`_make_delta_broadcaster` stamps
+  the running task id). The re-attach banner history is chat-scope only too.
+- **Conversation-only chat view** — the chat view also hides tool-call mechanics
+  for *inline* work (tools the agent runs in the chat turn itself, e.g. trivial
+  requests it doesn't defer to a scheduled task), not just scheduled-task turns.
+  Assistant/user text and a compact `⋯ working…` beat show; the `⎿ tool(args)`
+  calls and tool results are suppressed (tool *errors* still surface). `/tools`
+  (`on`/`off`/bare-toggle) shows them inline when wanted; a `/task view` is
+  always fully verbose. Default off.
+- **Task lifecycle one-liners** — a top-level task surfaces a concise
+  `◇ task <id> queued — …` on creation and `◇ task <id> ✓ done` (with its
+  result) on completion, so the user knows work is happening without the noise.
+  Subtask churn stays hidden.
+- **`/task view <id>` / `/task exit`** — enter a task to replay its execution
+  trace (+ progress brief / result) and follow it live; leave with `/task exit`
+  or by simply sending a message (which snaps back to the chat). The prompt
+  shows `[task <id>] >` while following. `events.replay` gained an optional
+  `task_id` filter to fetch a single task's scoped trace.
+- **Partial task ids** — every `/task` subcommand that takes an id
+  (`view` / `done` / `cancel` / `rm`) accepts any **unique fragment** of a full
+  task id (e.g. a short prefix), not just the whole id. An exact id always wins;
+  an ambiguous fragment lists the candidates and does nothing (mutating commands
+  never act on a guessed-wrong task).
+- **`/task tree [status]`** — render the whole task forest as a tree from inside
+  attach, **including history** (defaults to `all`, so done/cancelled runs show);
+  a status filter keeps matching tasks plus their ancestors so the tree stays
+  connected. Backed by a new read-only `task.tree` IPC method (DFS order + per-
+  node `depth`); the tree renderer is now shared with the offline `eonlet tasks`
+  command (and escapes task content against rich-markup injection). `/task list`
+  now accepts the full status set (`active`/`suspended`/`blocked` too).
+- **`/yolo` · `/ask` · `/permissions`** — switch the permission mode of the
+  running session from inside attach: `/yolo` toggles (or `/yolo on|off`), `/ask`
+  forces ask mode, `/permissions` reports the current mode. Backed by a new
+  `permissions.set_mode` IPC method (`yolo`/`ask`/`toggle`) that flips the live
+  `PermissionGate.mode` and logs the change; `session.start` now reports `mode`,
+  and the attach banner shows a `⚡ yolo` / `🔒 ask` pill. The change applies to
+  the running worker only — it is not written back to `agent.yaml`.
+
 ## [0.0.10] — 2026-05-31 — Task scheduling (ADR-0007)
 
 Implements [ADR-0007](docs/adr/0007-task-scheduling.md) (milestones M1–M4 per [`docs/plans/task-scheduling.md`](docs/plans/task-scheduling.md)) — the ROADMAP "task-orchestration" feature tier. An eonlet becomes a single human-like worker that runs a hierarchical task forest one task at a time, by priority, with cooperative preemption. Normative spec: [`docs/TASK_SPEC.md`](docs/TASK_SPEC.md).

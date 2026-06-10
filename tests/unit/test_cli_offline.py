@@ -42,6 +42,78 @@ def test_resolve_missing(isolated_home: Path) -> None:
         resolve_eonlet_id("ghost")
 
 
+# ── /task view id resolution (partial id) ─────────────────────────────────────
+
+
+def _tasks() -> list[dict[str, object]]:
+    return [
+        {"id": "task_abc123", "status": "done", "content": "alpha"},
+        {"id": "task_abc999", "status": "pending", "content": "beta"},
+        {"id": "task_xyz000", "status": "active", "content": "gamma"},
+    ]
+
+
+def test_resolve_task_exact_id() -> None:
+    t = commands._resolve_task("task_abc123", _tasks())
+    assert t is not None and t["id"] == "task_abc123"
+
+
+def test_resolve_task_unique_fragment() -> None:
+    # A fragment that appears in exactly one id resolves to its full task.
+    t = commands._resolve_task("xyz", _tasks())
+    assert t is not None and t["id"] == "task_xyz000"
+
+
+def test_resolve_task_unique_suffix() -> None:
+    # "某部分" — any substring, not just a prefix.
+    t = commands._resolve_task("123", _tasks())
+    assert t is not None and t["id"] == "task_abc123"
+
+
+def test_resolve_task_ambiguous_returns_none(capsys: pytest.CaptureFixture[str]) -> None:
+    # "abc" matches two ids → ambiguous, no selection.
+    assert commands._resolve_task("abc", _tasks()) is None
+    out = capsys.readouterr().out
+    assert "ambiguous" in out
+
+
+def test_resolve_task_no_match_returns_none(capsys: pytest.CaptureFixture[str]) -> None:
+    assert commands._resolve_task("nope", _tasks()) is None
+    assert "no such task" in capsys.readouterr().out
+
+
+def test_resolve_task_exact_wins_over_fragment() -> None:
+    # An exact full id wins even when it is also a substring of another id.
+    tasks = [
+        {"id": "task_a", "status": "done", "content": "x"},
+        {"id": "task_ab", "status": "done", "content": "y"},
+    ]
+    t = commands._resolve_task("task_a", tasks)
+    assert t is not None and t["id"] == "task_a"
+
+
+# ── /tools chat-view toggle ───────────────────────────────────────────────────
+
+
+def test_tools_slash_toggle_and_explicit() -> None:
+    scope = commands._ViewScope()
+    assert scope.verbose_tools is False  # quiet chat view by default
+
+    commands._handle_tools_slash("", scope)  # bare toggle → on
+    assert scope.verbose_tools is True
+    commands._handle_tools_slash("", scope)  # toggle → off
+    assert scope.verbose_tools is False
+
+    commands._handle_tools_slash("on", scope)
+    assert scope.verbose_tools is True
+    commands._handle_tools_slash("off", scope)
+    assert scope.verbose_tools is False
+
+    # An unknown arg is a no-op (prints usage, leaves state alone).
+    commands._handle_tools_slash("maybe", scope)
+    assert scope.verbose_tools is False
+
+
 # ── doctor ───────────────────────────────────────────────────────────────────
 
 

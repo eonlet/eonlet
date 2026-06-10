@@ -62,6 +62,13 @@ def build_task_prompt(forest: TaskForest, task_id: str) -> str:
     if chain:
         lines.append("Parent context: " + " > ".join(chain))
 
+    # Down-tree decision trace (ADR-0009 M3): the parent's (or chat's) decisions
+    # this task must stay coherent with — so a subtask doesn't relitigate how the
+    # work was decomposed.
+    if t.framing:
+        lines.append("")
+        lines.append(f"Context from above: {t.framing}")
+
     if t.progress_summary:
         lines.append("")
         lines.append(f"Progress so far: {t.progress_summary}")

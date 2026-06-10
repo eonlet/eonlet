@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS events (
     payload     BLOB NOT NULL,
     parent_id   INTEGER,
     trigger_id  TEXT,
+    task_id     TEXT,
     cost_usd    REAL,
     tokens_in   INTEGER,
     tokens_out  INTEGER,
@@ -74,6 +75,16 @@ class EventStore:
             s = stmt.strip()
             if s:
                 self._conn.execute(s)
+        # Additive migration for stores created before ADR-0009: add the
+        # ``task_id`` column if an older schema is missing it (CREATE TABLE
+        # IF NOT EXISTS won't alter an existing table). Existing rows get NULL
+        # = chat scope, which matches their original (un-scoped) behavior.
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
+        if "task_id" not in cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN task_id TEXT")
+        # Created here (not in _SCHEMA) so it runs only after the column is
+        # guaranteed to exist — covers both fresh and migrated legacy stores.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS events_task_idx ON events(task_id, id)")
 
     # ── core ops ─────────────────────────────────────────────────────────────
 
@@ -83,14 +94,15 @@ class EventStore:
         cur = self._conn.cursor()
         cur.execute(
             """INSERT INTO events (ts, kind, payload, parent_id, trigger_id,
-                                   cost_usd, tokens_in, tokens_out)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   task_id, cost_usd, tokens_in, tokens_out)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 event.ts,
                 str(event.kind),
                 payload_blob,
                 event.parent_id,
                 event.trigger_id,
+                event.task_id,
                 event.cost_usd,
                 event.tokens_in,
                 event.tokens_out,
@@ -104,7 +116,7 @@ class EventStore:
     def read(self, *, since: int = 0, limit: int | None = None) -> list[Event]:
         """Read events with ``id > since``, oldest first."""
         sql = (
-            "SELECT id, ts, kind, payload, parent_id, trigger_id, "
+            "SELECT id, ts, kind, payload, parent_id, trigger_id, task_id, "
             "cost_usd, tokens_in, tokens_out "
             "FROM events WHERE id > ? ORDER BY id ASC"
         )
@@ -188,7 +200,18 @@ class EventStore:
 
 
 def _row_to_event(row: tuple[Any, ...]) -> Event:
-    (id_, ts, kind, payload_blob, parent_id, trigger_id, cost_usd, tokens_in, tokens_out) = row
+    (
+        id_,
+        ts,
+        kind,
+        payload_blob,
+        parent_id,
+        trigger_id,
+        task_id,
+        cost_usd,
+        tokens_in,
+        tokens_out,
+    ) = row
     payload = msgpack.unpackb(bytes(payload_blob), raw=False) if payload_blob else {}
     return Event(
         id=id_,
@@ -197,6 +220,7 @@ def _row_to_event(row: tuple[Any, ...]) -> Event:
         payload=payload,
         parent_id=parent_id,
         trigger_id=trigger_id,
+        task_id=task_id,
         cost_usd=cost_usd,
         tokens_in=tokens_in,
         tokens_out=tokens_out,

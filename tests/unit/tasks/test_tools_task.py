@@ -83,9 +83,30 @@ def test_task_subtask_tree(tmp_path: Path) -> None:
 
     rid, cid = anyio.run(go)
     assert forest.get(cid).parent_id == rid  # type: ignore[union-attr]
-    assert forest.get(cid).priority == 3  # type: ignore[union-attr]
+    # ADR-0008 §2: a subtask's priority has no scheduling effect, so the tool
+    # forces it to 0 (priority schedules only at the root); origin → "agent".
+    assert forest.get(cid).priority == 0  # type: ignore[union-attr]
+    assert forest.get(cid).origin == "agent"  # type: ignore[union-attr]
     # Parent is not a pending leaf; the child is.
     assert [t.id for t in forest.pending_leaves()] == [cid]
+
+
+def test_root_origin_from_turn_origin(tmp_path: Path) -> None:
+    # ADR-0008 §5: a root created during a user turn is origin="user"; during a
+    # cron turn it is origin="trigger". (Subtasks are always "agent" — covered by
+    # test_task_subtask_tree.)
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> Any:
+        r1 = await tool(TaskArgs(action="add", content="user root"), ctx)  # default user turn
+        ctx.turn_origin = "trigger"
+        r2 = await tool(TaskArgs(action="add", content="cron root"), ctx)
+        return r1.structured_output["id"], r2.structured_output["id"]  # type: ignore[index]
+
+    uid, tid = anyio.run(go)
+    assert forest.get(uid).origin == "user"  # type: ignore[union-attr]
+    assert forest.get(tid).origin == "trigger"  # type: ignore[union-attr]
 
 
 def test_add_enforces_depth_cap(tmp_path: Path) -> None:
