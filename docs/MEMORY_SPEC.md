@@ -205,7 +205,9 @@ The system message is the concatenation, in order, of:
    (tasks are workflow state, not memory). Lists pending **leaves**
    (actionable items, highest priority first) plus a `suspended` section —
    suspended tasks only resume by an explicit `resume`, so hiding them would
-   make yielded work silently vanish.
+   make yielded work silently vanish. **Chat scope only**: a task-scoped run
+   injects no forest-wide backlog (sibling isolation); its own decomposition
+   state arrives via the kickoff message and the `task` tool.
 
 5. During a task-scoped run: `<task_context>` (the down-tree decision trace)
    and `<task_progress>` (the cumulative resume brief). Both live **here**, not

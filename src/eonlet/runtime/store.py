@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS trigger_state (
 """
 
 
+# Sentinel for ``read(task_id=…)``: distinguishes "no scope filter" (default)
+# from "the chat scope" (``task_id=None`` → SQL ``IS NULL``).
+_ALL_SCOPES: Any = object()
+
+
 class EventStore:
     """Append-only event log over SQLite. Single-writer per process."""
 
@@ -113,14 +118,33 @@ class EventStore:
         new_id = row[0]
         return event.model_copy(update={"id": new_id})
 
-    def read(self, *, since: int = 0, limit: int | None = None) -> list[Event]:
-        """Read events with ``id > since``, oldest first."""
+    def read(
+        self,
+        *,
+        since: int = 0,
+        limit: int | None = None,
+        task_id: str | None | object = _ALL_SCOPES,
+    ) -> list[Event]:
+        """Read events with ``id > since``, oldest first.
+
+        ``task_id`` filters to one scope via ``events_task_idx`` — O(scope)
+        instead of O(log)-then-filter: a task id string returns that task's
+        events, ``None`` returns chat-scope events (``task_id IS NULL``), and
+        omitting it returns every scope.
+        """
+        where = ["id > ?"]
+        params: list[Any] = [since]
+        if task_id is not _ALL_SCOPES:
+            if task_id is None:
+                where.append("task_id IS NULL")
+            else:
+                where.append("task_id = ?")
+                params.append(task_id)
         sql = (
             "SELECT id, ts, kind, payload, parent_id, trigger_id, task_id, "
             "cost_usd, tokens_in, tokens_out "
-            "FROM events WHERE id > ? ORDER BY id ASC"
+            "FROM events WHERE " + " AND ".join(where) + " ORDER BY id ASC"
         )
-        params: list[Any] = [since]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

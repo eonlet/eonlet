@@ -296,8 +296,20 @@ class TaskTool:
                     content="task update: provide at least one of content/goal/priority/due/tags",
                     is_error=True,
                 )
-            if forest is not None and forest.get(tid) is None:
+            target = forest.get(tid) if forest is not None else None
+            if forest is not None and target is None:
                 return ToolResult(content=f"no such task: {tid}", is_error=True)
+            # Priority schedules only between ROOT tasks (ADR-0008 §2) — a
+            # subtask's priority has no effect, so storing one would mislead.
+            if args.priority is not None and target is not None and target.parent_id is not None:
+                return ToolResult(
+                    content=(
+                        f"task update: {tid} is a subtask — priority has no scheduling "
+                        "effect (subtasks run in creation order; priority schedules "
+                        "only between top-level tasks)"
+                    ),
+                    is_error=True,
+                )
             await ctx.record_event(
                 task_updated(
                     id=tid,

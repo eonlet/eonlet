@@ -564,3 +564,55 @@ def test_task_context_framing_in_system_prompt(tmp_path: Path) -> None:
     assert "<task_context>" in sp and "Parent chose Postgres." in sp
     # Outside the task scope, no task blocks at all.
     assert "<task_context>" not in runtime._build_system_prompt()
+
+
+def test_ensure_framing_chat_root_bounded_by_creation(tmp_path: Path) -> None:
+    # Plan §5.2: the chat→root trace covers only the conversation that existed
+    # when the task was created — not chatter that came after.
+    from eonlet.runtime.events import task_created
+    from eonlet.worker.main import _ensure_framing
+
+    runtime, rec = _build_runtime(tmp_path)
+    runtime.definition.config.memory.compaction_model = "fake-echo"  # reuse the recorder
+
+    async def go() -> None:
+        await runtime._record(user_message("PRE-CREATION request"))
+        await runtime._record(assistant_message("PRE-CREATION plan"))
+        await runtime._record(task_created(id="root", content="do it", origin="user"))
+        await runtime._record(user_message("POST-CREATION chatter"))
+        await runtime._record(assistant_message("POST-CREATION reply"))
+        root = runtime.task_forest.get("root")
+        await _ensure_framing(runtime, root)  # type: ignore[arg-type]
+
+    anyio.run(go)
+    prompt = rec.last_messages[0].content
+    assert "PRE-CREATION request" in prompt
+    assert "POST-CREATION chatter" not in prompt
+
+
+def test_task_scoped_run_skips_tasks_block(tmp_path: Path) -> None:
+    # Plan §5.6 / sibling isolation: a focused task run must not see the
+    # forest-wide backlog; the chat turn still does.
+    from eonlet.runtime.events import task_created
+
+    runtime, rec = _build_runtime(tmp_path)
+
+    async def go() -> None:
+        await runtime._record(task_created(id="t-other", content="OTHER-BACKLOG-ITEM"))
+        await runtime._record(task_created(id="task-a", content="mine"))
+        runtime.current_task_id = "task-a"
+        try:
+            async for _ in runtime.handle_user_message("<task> go </task>"):
+                pass
+        finally:
+            runtime.current_task_id = None
+
+    anyio.run(go)
+    assert "<tasks>" not in rec.last_system
+
+    async def chat() -> None:
+        async for _ in runtime.handle_user_message("hello"):
+            pass
+
+    anyio.run(chat)
+    assert "<tasks>" in rec.last_system and "OTHER-BACKLOG-ITEM" in rec.last_system

@@ -341,3 +341,25 @@ def test_task_resume_requeues_suspended(tmp_path: Path) -> None:
 
     tid = anyio.run(go)
     assert forest.get(tid).status == "pending"  # type: ignore[union-attr]
+
+
+def test_update_priority_on_subtask_rejected(tmp_path: Path) -> None:
+    # Plan §5.7: a subtask's priority has no scheduling effect (root-only,
+    # ADR-0008 §2) — storing one would mislead, so the update is refused.
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> tuple[str, str]:
+        root = await tool(TaskArgs(action="add", content="parent"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        child = await tool(TaskArgs(action="add", content="part", parent_id=rid), ctx)
+        cid = child.structured_output["id"]  # type: ignore[index]
+        res = await tool(TaskArgs(action="update", id=cid, priority=5), ctx)
+        assert res.is_error and "priority" in res.content
+        ok = await tool(TaskArgs(action="update", id=rid, priority=5), ctx)
+        assert not ok.is_error
+        return rid, cid
+
+    rid, cid = anyio.run(go)
+    assert forest.get(cid).priority == 0  # type: ignore[union-attr]
+    assert forest.get(rid).priority == 5  # type: ignore[union-attr]

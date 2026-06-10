@@ -14,6 +14,30 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — plan-§5 leftover sweep ([docs/plans/task-context-management.md](docs/plans/task-context-management.md) §5)
+
+The eight ADR-0008/0009 open items dispositioned: 4 fixed, 4 deliberately
+deferred with rationale recorded inline in §5.
+
+- **#3 Scoped store reads.** `EventStore.read(task_id=…)` filters via
+  `events_task_idx` (`None` = chat scope, `IS NULL`); `_ensure_framing`,
+  `_checkpoint_summary`, `_maybe_compact_task`, tier-1, and `events.replay`
+  now read O(scope) instead of full-log-then-filter.
+- **#2 Exact chat→root trace bound.** `Task.created_event_id` (reduced from
+  `TASK_CREATED`) bounds the down-tree trace to conversation that existed when
+  the task was created — post-creation chatter is excluded.
+- **#6 `<tasks>` is chat-scope only.** A focused task run no longer sees the
+  forest-wide backlog (sibling isolation); its own decomposition state arrives
+  via the kickoff message + `task` tool.
+- **#7 Subtask priority refused.** `task(update)` and the `task.update` IPC
+  (the `eonlet tasks prio` path) reject a priority on a subtask with an
+  explanatory error — it never had a scheduling effect (ADR-0008 §2).
+- **Deferred:** #1 lazy/segmented fold (no pre-alpha log is near the size
+  where it bites), #4 brief/trace eval harness (collect real dogfooding
+  samples first), #5 dormant agent-origin preemption branch (unreachable by
+  design, consent path unit-covered), #8 cumulative-brief re-summarize cost
+  (negligible vs. the task's own generation cost).
+
 ### Fixed — design-review fixes ([docs/plans/design-review-fixes.md](docs/plans/design-review-fixes.md))
 
 A full design review (context organization / memory / scheduling) of the

@@ -631,7 +631,12 @@ async def _ensure_framing(runtime: AgentRuntime, task: Task) -> None:
     else:
         return  # trigger-origin root etc. — nothing decomposed it
 
-    source_events = [e for e in runtime.store.read() if e.task_id == source_scope]
+    source_events = runtime.store.read(task_id=source_scope)
+    if parent is None and task.created_event_id:
+        # Exact bound for the chat→root edge: only the conversation that
+        # existed when the task was created motivated it — chat may have
+        # moved on between creation and this first dispatch.
+        source_events = [e for e in source_events if (e.id or 0) <= task.created_event_id]
     if len(source_events) < _MIN_TRACE_SOURCE_EVENTS:
         return  # the goal already captures a trivial source
 
@@ -682,7 +687,7 @@ async def _checkpoint_summary(
     wm = t.brief_watermark if t is not None else 0
 
     cfg = runtime.definition.config.memory
-    scope = [e for e in runtime.store.read() if e.task_id == task_id and (e.id or 0) > wm]
+    scope = runtime.store.read(since=wm, task_id=task_id)
     boundary = scope[-1].id if scope else None
     if cfg.enabled and scope and not structural_only:
         prov = _resolve_compaction_provider(runtime, cfg.compaction_model)
@@ -739,9 +744,7 @@ async def _maybe_compact_task(runtime: AgentRuntime, task_id: str) -> None:
     t = runtime.task_forest.get(task_id)
     if t is None:
         return
-    scope = [
-        e for e in runtime.store.read() if e.task_id == task_id and (e.id or 0) > t.brief_watermark
-    ]
+    scope = runtime.store.read(since=t.brief_watermark, task_id=task_id)
     if working_window_token_estimate(scope, watermark=0) < cfg.episodic.working_memory_tokens:
         return
     boundary = compute_suggested_boundary(scope, cfg)
@@ -811,14 +814,14 @@ async def _maybe_run_tier1(runtime: AgentRuntime) -> bool:
     cfg = runtime.definition.config.memory
     if not cfg.enabled or not runtime.auto_compact_enabled:
         return False
-    from ..memory.injection import chat_scope_only, working_window_token_estimate
+    from ..memory.injection import working_window_token_estimate
     from ..memory.tier1 import run_tier1
     from ..memory.watermark import read_watermark
 
     watermark = read_watermark(runtime.memory_dir)
     # The chat working-window threshold counts chat-scope turns only (ADR-0009
     # §5): a busy task must not trigger episodic compaction of the conversation.
-    events = chat_scope_only(runtime.store.read(since=watermark))
+    events = runtime.store.read(since=watermark, task_id=None)
     if not events:
         return False
     tokens = working_window_token_estimate(events, watermark=0)
@@ -1023,9 +1026,9 @@ def _make_handler(
             since = int(params.get("from") or 0)
             task_id = params.get("task_id")
             if task_id is not None:
-                # A task's execution trace (ADR-0009 scope): scan the log and
-                # keep that task's conversation events, capped to the last 200.
-                scoped = [e for e in runtime.store.read(since=since) if e.task_id == task_id]
+                # A task's execution trace (ADR-0009 scope), capped to the
+                # last 200. Indexed scoped read — O(scope), not O(log).
+                scoped = runtime.store.read(since=since, task_id=str(task_id))
                 return [_event_to_dict(e) for e in scoped[-200:]]
             events = runtime.store.read(since=since, limit=200)
             return [_event_to_dict(e) for e in events]
@@ -1362,8 +1365,20 @@ async def _handle_memory_ipc(
             tid = str(params.get("id", ""))
             if not tid:
                 return {"ok": False, "error": "id required"}
-            if forest.get(tid) is None:
+            target = forest.get(tid)
+            if target is None:
                 return {"ok": False, "error": f"no such task: {tid}"}
+            # Root-only priority (ADR-0008 §2): refuse to store a priority on a
+            # subtask — it has no scheduling effect and would mislead.
+            if params.get("priority") is not None and target.parent_id is not None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"{tid} is a subtask — priority has no scheduling effect "
+                        "(subtasks run in creation order; priority schedules only "
+                        "between top-level tasks)"
+                    ),
+                }
             await runtime._record(
                 task_updated(
                     id=tid,

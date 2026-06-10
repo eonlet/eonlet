@@ -423,7 +423,8 @@ Paths are confined to the knowledge tree: `..`, absolute paths, and the reserved
 
 Hierarchical, event-sourced workflow state — not memory (ADR-0005/0007). The
 forest is a fold of the task event log (no `todos.jsonl`); pending **leaves**
-plus suspended tasks inject as a `<tasks>` block each run. Full model:
+plus suspended tasks inject as a `<tasks>` block on each chat turn (task-scoped
+runs see no forest-wide backlog). Full model:
 [TASK_SPEC](TASK_SPEC.md).
 
 ```yaml

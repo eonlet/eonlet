@@ -180,8 +180,15 @@ class AgentRuntime:
         except Exception:
             log.exception("memory preamble build failed; injecting nothing")
             self._cached_preamble = ""
+        # The forest-wide <tasks> block is chat-scope only: a focused task run
+        # must not see other trees' backlog (sibling isolation, ADR-0009) — its
+        # own decomposition state arrives via the kickoff message + task tool.
         try:
-            self._cached_tasks = build_tasks_block(self.task_forest, self.definition.config.tasks)
+            self._cached_tasks = (
+                build_tasks_block(self.task_forest, self.definition.config.tasks)
+                if self.current_task_id is None
+                else ""
+            )
         except Exception:
             log.exception("tasks block build failed; injecting nothing")
             self._cached_tasks = ""

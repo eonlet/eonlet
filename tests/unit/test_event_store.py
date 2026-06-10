@@ -72,3 +72,23 @@ def test_trigger_state_upsert(tmp_path: Path) -> None:
     assert s["last_fired_at"] == 42 and s["total_fires"] == 1
     store.update_trigger_state("daily", consecutive_failures=3)
     assert store.get_trigger_state("daily")["consecutive_failures"] == 3
+
+
+def test_read_scoped_by_task_id(tmp_path):
+    # Plan §5.3: scoped reads use events_task_idx — O(scope), not O(log)+filter.
+    from eonlet.runtime.events import user_message
+
+    store = EventStore(tmp_path / "scoped.db")
+    store.append(user_message("chat-1"))
+    store.append(user_message("task-turn").model_copy(update={"task_id": "t1"}))
+    store.append(user_message("chat-2"))
+    store.append(user_message("other-task").model_copy(update={"task_id": "t2"}))
+
+    assert len(store.read()) == 4  # omitted → all scopes
+    chat = store.read(task_id=None)  # None → chat scope (IS NULL)
+    assert [e.payload["content"] for e in chat] == ["chat-1", "chat-2"]
+    t1 = store.read(task_id="t1")
+    assert len(t1) == 1 and t1[0].payload["content"] == "task-turn"
+    # since= composes with the scope filter
+    assert store.read(since=t1[0].id, task_id="t1") == []
+    store.close()

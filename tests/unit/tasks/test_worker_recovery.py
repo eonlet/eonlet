@@ -269,3 +269,23 @@ def test_surface_root_result_skips_subtasks(tmp_path: Path) -> None:
         assert len(runtime.state.messages) == before  # no envelope
 
     anyio.run(go)
+
+
+# ── plan §5.7: subtask priority refused at the IPC/control plane too ─────────
+
+
+def test_ipc_update_priority_on_subtask_rejected(tmp_path: Path) -> None:
+    from eonlet.worker.main import _handle_memory_ipc
+
+    async def go() -> None:
+        runtime = _build_runtime(tmp_path)
+        await runtime._record(task_created(id="r", content="root"))
+        await runtime._record(task_created(id="c", content="child", parent_id="r"))
+        resp = await _handle_memory_ipc("task.update", {"id": "c", "priority": 5}, runtime)
+        assert resp["ok"] is False and "priority" in resp["error"]
+        ok = await _handle_memory_ipc("task.update", {"id": "r", "priority": 5}, runtime)
+        assert ok["ok"] is True
+        root = runtime.task_forest.get("r")
+        assert root is not None and root.priority == 5
+
+    anyio.run(go)

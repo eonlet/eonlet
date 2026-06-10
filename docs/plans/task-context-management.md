@@ -274,33 +274,50 @@ integration tests, account for this.
 
 Carried in the ADRs as "Open / deferred"; collected here for visibility.
 
+> **Status sweep (2026-06-10).** Items **2, 3, 6, 7 are FIXED** (see the
+> design-review/§5 commits on main); items **1, 4, 5, 8 are deliberately
+> deferred** with the rationale noted inline.
+
 1. **`fold` materializes all scopes in memory.** Only the *window* is filtered;
    `AgentState.messages` still holds every conversation message. For very large
    logs this is the same footprint as before. A lazy/segmented fold (or scope-
    indexed read) is the natural optimization — gate it behind its own tests.
-2. **Down-tree trace bound for a chat→root edge** uses the *tail* of the chat
-   scope (`_MAX_BRIEF_EVENTS=120`), not "chat turns strictly before task creation."
-   Fine in practice (the task runs soon after creation, and the chat is frozen
-   during the task run), but if chat continues heavily between creation and first
-   dispatch, the trace tail could include post-creation chatter. Bounding by the
-   task's creation event id would be exact (needs storing that id on the task).
-3. **`_ensure_framing` / `_checkpoint_summary` / `_maybe_compact_task` each do a
-   full `store.read()`** then filter by `task_id` in Python. Fine at current scale
-   (checkpoints/compactions are infrequent), but the `events_task_idx` index now
-   exists — a `read(task_id=…)` store method would make these O(scope) not O(log).
+   *Deferred:* a correct lazy fold needs careful design (replay invariants,
+   structural-checkpoint fallback reads `state.messages`); no pre-alpha log is
+   anywhere near the size where this bites. Revisit when a dogfooding log
+   exceeds ~10⁵ events.
+2. ~~**Down-tree trace bound for a chat→root edge** uses the *tail* of the chat
+   scope~~ **FIXED:** `Task.created_event_id` (reduced from `TASK_CREATED`)
+   now bounds the chat→root trace exactly — post-creation chatter is excluded.
+3. ~~**Full `store.read()` then Python filter**~~ **FIXED:**
+   `EventStore.read(task_id=…)` uses `events_task_idx` (a `None` argument means
+   the chat scope, `IS NULL`); `_ensure_framing` / `_checkpoint_summary` /
+   `_maybe_compact_task` / tier-1 / `events.replay` all read O(scope) now.
 4. **Trace/brief quality is load-bearing and unevaluated.** A bad compression
    degrades a subtask more visibly than the old no-trace behavior. `recall` is the
    escape hatch, but there is no eval harness for brief/trace fidelity yet.
+   *Deferred:* needs an LLM-eval harness (fixtures + judge), which is its own
+   project; collect real brief/trace samples during dogfooding first so the
+   eval set reflects actual failure modes rather than guesses.
 5. **The `agent`-origin preemption branch is dormant** (see §2.3). If a future
    design lets the agent spawn rival root trees by judgment, exercise + test it.
-6. **`<tasks>` block still lists all pending leaves forest-wide during a focused
-   run** (ADR-0008 review #4, left open). Narrowing it to the current spine during
-   a task run is a possible refinement.
-7. **`eonlet tasks <id> prio <subtask> <n>`** still stores a priority on a subtask
-   that has no scheduling effect (ADR-0008 §2). Consider a CLI hint or rejection.
+   *Deferred by design:* under "schedule only over roots; the agent decomposes
+   in-tree" the branch is unreachable in normal operation; it stays as
+   forward-compat and is unit-covered at the consent level (`_approve_preempt`).
+6. ~~**`<tasks>` block lists all pending leaves forest-wide during a focused
+   run**~~ **FIXED:** the `<tasks>` block is chat-scope only now — a task run
+   injects no forest-wide backlog (sibling isolation); its own decomposition
+   state arrives via the kickoff message + `task` tool.
+7. ~~**`eonlet tasks <id> prio <subtask> <n>` stores an ineffective
+   priority**~~ **FIXED:** priority updates on a subtask are rejected with an
+   explanatory error at both the `task` tool and the `task.update` IPC (the
+   CLI path); creation already forced subtask priority to 0.
 8. **Mid-run task compaction re-summarizes from the brief each time** (cumulative).
    For a pathologically long single task this is repeated LLM cost; acceptable
    given how rare runaway single-leaf tasks are (most work decomposes).
+   *Deferred:* the cost is one small-model call per ~`working_memory_tokens` of
+   task output — negligible against the task's own generation cost; an
+   incremental-brief scheme would add statefulness for no measured win.
 
 ### Refactor guidance
 

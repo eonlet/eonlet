@@ -257,3 +257,14 @@ def test_root_of() -> None:
     assert forest.root_of("a").id == "a"  # type: ignore[union-attr]
     assert forest.root_of("other").id == "other"  # type: ignore[union-attr]
     assert forest.root_of("ghost") is None
+
+
+def test_created_event_id_recorded() -> None:
+    # The TASK_CREATED event id is the exact upper bound for the chat→root
+    # down-tree trace (plan §5.2).
+    from eonlet.runtime.events import task_created
+    from eonlet.tasks import fold_tasks
+
+    forest = fold_tasks([task_created(id="t", content="x").model_copy(update={"id": 42})])
+    t = forest.get("t")
+    assert t is not None and t.created_event_id == 42

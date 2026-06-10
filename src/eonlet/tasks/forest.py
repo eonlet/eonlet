@@ -89,6 +89,10 @@ class Task:
     brief_watermark: int = 0
     result: str = ""
     created_at: str = ""
+    # Event id of this task's TASK_CREATED — the exact upper bound for the
+    # chat→root down-tree trace (ADR-0009): only conversation that existed
+    # *when the task was created* motivated it. 0 for pre-existing logs.
+    created_event_id: int = 0
     done_at: str | None = None
     due: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -109,6 +113,7 @@ class Task:
             "brief_watermark": self.brief_watermark,
             "result": self.result,
             "created_at": self.created_at,
+            "created_event_id": self.created_event_id,
             "done_at": self.done_at,
             "due": self.due,
             "tags": list(self.tags),
@@ -252,6 +257,7 @@ def reduce_task(forest: TaskForest, event: Event) -> TaskForest:
                 parent_id=(str(p["parent_id"]) if p.get("parent_id") else None),
                 origin=_origin(p.get("origin")),
                 created_at=_iso(event.ts),
+                created_event_id=int(event.id or 0),
                 due=_opt_str(p.get("due")),
                 tags=_str_list(p.get("tags")),
                 schedule=_opt_str(p.get("schedule")),

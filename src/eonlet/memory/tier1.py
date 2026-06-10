@@ -174,10 +174,11 @@ async def run_tier1(
 
         # Snapshot: chat-scope events in (watermark, snapshot_id]. Task-scoped
         # turns (ADR-0009 §5) are NOT episodic — they never go into STM, so they
-        # are excluded here; their residue is the task's result + checkpoint
-        # brief + the recall log.
-        all_events = store.read(since=watermark)
-        events = [e for e in all_events if (e.id or 0) <= snapshot_id and e.task_id is None]
+        # are excluded here (indexed scoped read); their residue is the task's
+        # result + checkpoint brief + the recall log.
+        events = [
+            e for e in store.read(since=watermark, task_id=None) if (e.id or 0) <= snapshot_id
+        ]
         if not events:
             return CompactionOutcome(ran=False)
 
