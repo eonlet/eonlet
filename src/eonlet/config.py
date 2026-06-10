@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .errors import ConfigError
 from .memory.config import MemoryConfig
 from .tasks.config import TasksConfig
+from .trace.config import TraceConfig
 
 # ── Duration parsing ──────────────────────────────────────────────────────────
 
@@ -226,6 +227,7 @@ class AgentConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     web: WebConfig = Field(default_factory=WebConfig)
+    trace: TraceConfig = Field(default_factory=TraceConfig)
     env: Env = Field(default_factory=Env)
     lifecycle: Lifecycle = Field(default_factory=Lifecycle)
 
@@ -267,6 +269,7 @@ def load_agent_config(path: Path) -> AgentConfig:
         "memory",
         "tasks",
         "web",
+        "trace",
         "env",
         "lifecycle",
         "outputs",

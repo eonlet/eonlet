@@ -14,6 +14,40 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Added — context trace ([ADR-0010](docs/adr/0010-context-trace.md))
+
+Lineage-aware recording of every LLM request, answering "what exactly did the
+model see" without reconstruction (the claude-trace idea, restructured around
+context rewrites):
+
+- **`src/eonlet/trace/`** — `ContextTracer` appends one JSON record per
+  outbound request to `<instance>/trace/context.jsonl`. A request that
+  prefix-extends the previous context stays on the same **line** and stores
+  only the appended suffix (`delta`); any prefix rewrite — episodic
+  compaction, `/compact`, working-window slide, task-scope switch — forks a
+  new line (`root`: full snapshot + `parent: {line, seq}`). The fork points
+  are exactly the context rewrites. The system prompt is versioned within a
+  line (full text stored only on change), since it is rebuilt every turn by
+  design.
+- **Not events** — same ruling as token deltas (SPEC §8.1): records never
+  enter the event store, tracing is best-effort (a failure never breaks the
+  loop), and `trace/` is deletable at any time. Recording happens *before*
+  the provider call, so the context survives a crash mid-stream. A worker
+  restart folds the existing file to continue the current line.
+- **`trace` config block** (`agent.yaml`, default `enabled: false`) and
+  **`eonlet trace <id>`** offline viewer: lineage tree by default,
+  `--line <ln>` folds one line into the full untruncated context, `--json`
+  for raw records.
+- **`--html PATH` viewer export** (`trace/html.py`) — one self-contained,
+  dependency-free HTML file (embedded JSON + vanilla JS/CSS, the claude-trace
+  deliverable shape): sidebar lineage tree, per-call delta separators,
+  role-colored messages, collapsible system prompts / long tool results,
+  clickable fork-origin links. Breakout-safe embedding (`</` → `<\/`;
+  records rendered via `textContent` only).
+- **Tests**: new `tests/unit/trace/` (recorder lineage semantics, runtime
+  wiring incl. watermark-induced fork, HTML embedding + escaping).
+  Total: 683 tests; ruff + mypy clean.
+
 ### Fixed — plan-§5 leftover sweep ([docs/plans/task-context-management.md](docs/plans/task-context-management.md) §5)
 
 The eight ADR-0008/0009 open items dispositioned: 4 fixed, 4 deliberately

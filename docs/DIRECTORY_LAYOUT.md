@@ -95,6 +95,8 @@ This is what the runtime owns. Users may inspect but should not modify (with one
 │   ├── last_run.md             # ditto (used by scheduled agents)
 │   └── attachments/            # large blobs (screenshots, PDFs)
 │       └── 2026-05-12_chart.png
+├── trace/                      # LLM context trace (ADR-0010; only if trace.enabled)
+│   └── context.jsonl           # lineage-aware record of every LLM request
 ├── workspace/                  # agent's working directory
 │   ├── outputs/                # generated artifacts (digests, reports)
 │   │   └── 2026-05-12-digest.md
@@ -117,6 +119,7 @@ This is what the runtime owns. Users may inspect but should not modify (with one
 | `state.db` | Worker only | Worker (write), CLI (read for replay) | Single writer |
 | `.env` | User | Worker | Overrides definition's `.env` |
 | `memory/*.md` | Worker (via tools), user | Worker, user | **User edits allowed** |
+| `trace/context.jsonl` | Worker | CLI (`eonlet trace`), user | Observability only (ADR-0010); safe to delete anytime |
 | `workspace/` | Worker | Worker, user | User can browse outputs |
 | `logs/` | Worker | User (via `eonlet logs`) | Rotated 50MB × 3 |
 | `runtime.sock` | Worker (bind) | CLI (connect) | Deleted on clean exit |

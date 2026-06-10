@@ -231,6 +231,10 @@ src/eonlet/
 │       ├── knowledge.py  — knowledge (open / list / write / edit / delete / move)
 │       ├── task.py       — task (add / list / done / cancel / update / delete)
 │       └── recall.py     — recall (keyword + date; events / knowledge / tasks scopes)
+├── trace/                — Context trace (ADR-0010): lineage-aware LLM request log
+│   ├── config.py         — TraceConfig (`trace.enabled`, default off)
+│   ├── recorder.py       — ContextTracer (delta-on-line / fork-on-rewrite), read_trace/fold_line
+│   └── html.py           — render_html: self-contained HTML viewer (no deps, no server)
 ├── triggers/
 │   ├── scheduler.py      — Cron scheduler (croniter + IANA tz, catch-up, backoff)
 │   └── dynamic_store.py  — Persistent trigger state (last run, failure count)

@@ -476,6 +476,31 @@ eonlet tasks <id> prio    <task_id> <n>    # reprioritize
 The bare/`--status` form reads `state.db` directly (no worker needed); the
 mutating actions go through the running worker over IPC.
 
+### `eonlet trace <id>`
+
+Show the LLM context-trace lineage (ADR-0010). Offline — reads
+`trace/context.jsonl` directly; requires `trace.enabled: true` in the agent's
+`agent.yaml`.
+
+```bash
+eonlet trace <id>                  # lineage tree: lines, forks, call counts
+eonlet trace <id> --line <ln-…>    # fold one line; print its latest full context
+eonlet trace <id> --json           # raw JSONL records, one per line (for jq)
+eonlet trace <id> --html out.html  # write a self-contained HTML viewer
+```
+
+`--html` produces a single dependency-free file (embedded data + vanilla
+JS/CSS — the claude-trace deliverable shape): a sidebar lineage tree, per-call
+delta separators, role-colored messages, collapsible system prompts and long
+tool results, and clickable fork-origin links. Open it in any browser; share
+or archive it as one file.
+
+Each *line* is an unbroken run of requests where the context only grew at the
+tail. A fork in the tree is a context rewrite: episodic compaction, a
+user-forced `/compact`, a working-window slide, or a task-scope switch. The
+`--line` form answers "what exactly did the model see" — system prompt and
+every message, untruncated, in the order the provider received them.
+
 ### `eonlet export <id>`
 
 Export an eonlet's full state to a tar archive (for backup, sharing, or moving between machines).

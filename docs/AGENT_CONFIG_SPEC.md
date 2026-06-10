@@ -557,6 +557,26 @@ The SSRF guard, retry policy (3 attempts on 5xx / transport errors with
 
 ---
 
+## 8.6. `trace` — optional (ADR-0010)
+
+Lineage-aware recording of every LLM request the runtime sends, to
+`<instance>/trace/context.jsonl`. Requests that prefix-extend the previous
+context stay on one *line* and store only the appended delta; any context
+rewrite — episodic compaction, `/compact`, a working-window slide, a
+task-scope switch — forks a new line with a full snapshot and a parent
+pointer. Inspect with `eonlet trace <id>`.
+
+```yaml
+trace:
+  enabled: false      # default — opt-in
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | The file grows without bound (a delta per LLM call, a snapshot per fork). Pure observability: nothing reads it back, and deleting `trace/` is always safe. |
+
+---
+
 ## 9. `env` — optional
 
 Environment variables the agent needs. **Declared, validated at startup, never embedded.**

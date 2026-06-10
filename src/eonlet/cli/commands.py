@@ -2338,6 +2338,124 @@ def _gen_instance_name(agent_type: str) -> str:
     return secrets.token_hex(3)
 
 
+# ── context trace (ADR-0010) ─────────────────────────────────────────────────
+
+
+def cmd_trace(
+    eonlet_id: str,
+    *,
+    line: str | None = None,
+    json_out: bool = False,
+    html_path: str | None = None,
+) -> None:
+    """Show the LLM context-trace lineage. Offline — reads trace/context.jsonl.
+
+    Default renders the line tree (forks = context rewrites such as
+    compaction). ``--line`` folds one line and prints its latest full context,
+    replay-style: everything the model saw, exactly as it saw it. ``--html``
+    writes a self-contained browser viewer instead of printing.
+    """
+    from ..trace import TRACE_FILENAME, read_trace
+
+    eid = resolve_eonlet_id(eonlet_id)
+    path = paths.trace_dir(eid) / TRACE_FILENAME
+    if not path.exists():
+        fail(
+            f"{eid}: no context trace at {path} (enable with `trace.enabled: true` in agent.yaml)",
+            code=3,
+        )
+    records = read_trace(path)
+    if not records:
+        fail(f"{eid}: trace file is empty", code=3)
+
+    if html_path is not None:
+        from ..trace import render_html
+
+        out = Path(html_path)
+        out.write_text(render_html(records, title=f"{eid} · context trace"), encoding="utf-8")
+        console.print(f"wrote {out} — {len(records)} call(s); open it in a browser")
+        return
+    if json_out:
+        for r in records:
+            console.print_json(data=r, indent=None)
+        return
+    if line is not None:
+        _trace_print_line(records, line)
+        return
+    _trace_print_tree(records)
+
+
+def _trace_print_tree(records: list[dict[str, Any]]) -> None:
+    from rich.tree import Tree
+
+    by_line: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for r in records:
+        ln = r.get("line")
+        if not isinstance(ln, str):
+            continue
+        if ln not in by_line:
+            by_line[ln] = []
+            order.append(ln)
+        by_line[ln].append(r)
+
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for ln in order:
+        parent = by_line[ln][0].get("parent") or {}
+        pline = parent.get("line") if isinstance(parent, dict) else None
+        if isinstance(pline, str) and pline in by_line:
+            children.setdefault(pline, []).append(ln)
+        else:
+            roots.append(ln)
+
+    def label(ln: str) -> str:
+        recs = by_line[ln]
+        first, last = recs[0], recs[-1]
+        span = f"seq {first['seq']}-{last['seq']}" if len(recs) > 1 else f"seq {first['seq']}"
+        when = str(first.get("ts", ""))[:19]
+        scope = f" · task {last['task_id']}" if last.get("task_id") else ""
+        return (
+            f"[bold]{ln}[/]  {len(recs)} call(s) · {span} · "
+            f"{last.get('n_messages', '?')} msgs · {when}{scope}"
+        )
+
+    tree = Tree(f"context trace — {len(records)} calls, {len(by_line)} lines")
+    nodes: dict[str, Any] = {}
+
+    def add(ln: str, parent_node: Any) -> None:
+        nodes[ln] = parent_node.add(label(ln))
+        for child in children.get(ln, []):
+            add(child, nodes[ln])
+
+    for ln in roots:
+        add(ln, tree)
+    console.print(tree)
+
+
+def _trace_print_line(records: list[dict[str, Any]], line_id: str) -> None:
+    from ..trace import fold_line
+
+    folded = fold_line(records, line_id)
+    if not folded["records"]:
+        known = ", ".join(dict.fromkeys(str(r.get("line")) for r in records))
+        fail(f"unknown line {line_id!r}; known lines: {known}", code=3)
+    parent = folded["parent"]
+    if parent:
+        console.print(f"[dim]forked from {parent.get('line')} at seq {parent.get('seq')}[/]")
+    console.print(f"[bold cyan]── system ──[/]\n{folded['system']}")
+    for i, m in enumerate(folded["messages"], start=1):
+        role = m.get("role", "?")
+        console.print(f"\n[bold cyan]── {i}. {role} ──[/]")
+        if m.get("content"):
+            console.print(m["content"], markup=False)
+        for tc in m.get("tool_calls") or []:
+            console.print(f"[yellow]tool_call[/] {tc.get('name')}({tc.get('arguments')})")
+        if m.get("tool_call_id"):
+            err = " [red](error)[/]" if m.get("is_error") else ""
+            console.print(f"[dim]↳ result for {m['tool_call_id']}{err}[/]")
+
+
 def _parse_env_lines(lines: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for line in lines:

@@ -238,6 +238,28 @@ def tasks(
 
 
 @app.command()
+def trace(
+    id_: str = typer.Argument(..., metavar="ID"),
+    line: str | None = typer.Option(
+        None, "--line", "-l", help="Fold one line and print its latest full context."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Raw JSONL records, one per line."),
+    html: str | None = typer.Option(
+        None,
+        "--html",
+        metavar="PATH",
+        help="Write a self-contained HTML viewer to PATH (open in a browser).",
+    ),
+) -> None:
+    """Show the LLM context-trace lineage tree (ADR-0010). Reads trace/context.jsonl offline.
+
+    Forks in the tree are context rewrites — compaction, /compact, window
+    slides, task-scope switches. Requires ``trace.enabled: true`` in agent.yaml.
+    """
+    commands.cmd_trace(id_, line=line, json_out=json_out, html_path=html)
+
+
+@app.command()
 def replay(
     id_: str = typer.Argument(..., metavar="ID"),
     from_: int | None = typer.Option(None, "--from", help="Starting event id."),

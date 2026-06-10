@@ -22,6 +22,7 @@ from ..memory.recall import RecallIndex
 from ..permissions import PermissionGate
 from ..tasks import TaskForest, fold_tasks, reduce_task
 from ..tools import ToolContext, ToolResult, get_registry
+from ..trace import ContextTracer
 from ..web import HTTPFetcher
 from .definition import Definition
 from .events import (
@@ -71,6 +72,11 @@ class AgentRuntime:
     # ToolContext so web_fetch / web_search share one connection pool and
     # one SSRF policy. ``None`` in tests that don't exercise the web tools.
     http_fetcher: HTTPFetcher | None = None
+    # Context tracer (ADR-0010) — records every outbound LLM request to
+    # trace/context.jsonl with compaction-aware lineage. Observability only:
+    # ``None`` (tracing disabled) is the default, and a record failure never
+    # breaks the loop.
+    tracer: ContextTracer | None = None
     # Blocking user-decision channel (ADR-0006) — set by the worker to a
     # DecisionBroker. Used to confirm ask-mode destructive tools interactively
     # (and, in M3, compaction proposals). ``None`` in tests / headless contexts,
@@ -141,6 +147,9 @@ class AgentRuntime:
             session_attached=session_attached,
         )
         prov = provider or resolve_model(definition.config.runtime.model, global_cfg)
+        tracer = (
+            ContextTracer(memory_dir.parent / "trace") if definition.config.trace.enabled else None
+        )
         return cls(
             eonlet_id=eonlet_id,
             definition=definition,
@@ -151,6 +160,7 @@ class AgentRuntime:
             gate=gate,
             state=state,
             task_forest=task_forest,
+            tracer=tracer,
             auto_compact_enabled=definition.config.memory.episodic.auto_compact,
         )
 
@@ -325,10 +335,24 @@ class AgentRuntime:
         per SPEC §8.1 ``token_delta`` is a notification, not an event. The
         final ``assistant_message`` event still carries the full content.
         """
+        system = self._build_system_prompt()
+        # Trace the request before the call (ADR-0010) so the context survives
+        # even a crash mid-stream. Best-effort: never breaks the loop.
+        if self.tracer is not None:
+            try:
+                self.tracer.record(
+                    system=system,
+                    messages=messages,
+                    tools=tool_specs,
+                    model=self.provider.model,
+                    task_id=self.current_task_id,
+                )
+            except Exception:
+                log.exception("context trace record failed; continuing")
         final: LLMResponse | None = None
         async for chunk in self.provider.stream(
             messages,
-            system=self._build_system_prompt(),
+            system=system,
             tools=tool_specs,
             max_tokens=self.definition.config.runtime.max_tokens_per_response,
         ):
@@ -568,9 +592,7 @@ class AgentRuntime:
                 if t.framing.strip():
                     parts.append(f"<task_context>\n{t.framing.strip()}\n</task_context>")
                 if t.progress_summary.strip():
-                    parts.append(
-                        f"<task_progress>\n{t.progress_summary.strip()}\n</task_progress>"
-                    )
+                    parts.append(f"<task_progress>\n{t.progress_summary.strip()}\n</task_progress>")
         return "\n\n".join(parts)
 
     # ── event recording ──────────────────────────────────────────────────────

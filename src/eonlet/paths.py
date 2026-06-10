@@ -77,6 +77,11 @@ def tasks_dir(eonlet_id: str) -> Path:
     return eonlet_dir(eonlet_id) / "tasks"
 
 
+def trace_dir(eonlet_id: str) -> Path:
+    """LLM context-trace records — observability, deletable at any time (ADR-0010)."""
+    return eonlet_dir(eonlet_id) / "trace"
+
+
 def workspace_dir(eonlet_id: str) -> Path:
     return eonlet_dir(eonlet_id) / "workspace"
 
