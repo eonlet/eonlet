@@ -643,3 +643,25 @@ def test_consecutive_user_messages_coalesced(tmp_path: Path) -> None:
     assert 'task_result id="a"' in merged
     assert 'task_result id="b"' in merged
     assert "now the user speaks" in merged
+
+
+def test_empty_assistant_message_excluded_from_window(tmp_path: Path) -> None:
+    # Dogfood round 4: a live model returned an EMPTY final turn (told "no
+    # commentary"); the recorded empty assistant_message then 400-failed every
+    # subsequent request ("content or tool_calls must be set") until
+    # compaction. The window builder must drop information-free assistant
+    # messages.
+    from eonlet.runtime.events import assistant_message
+
+    runtime, rec = _build_runtime(tmp_path)
+
+    async def go() -> None:
+        await runtime._record(
+            assistant_message("", tool_calls=[])  # the poison pill
+        )
+        async for _ in runtime.handle_user_message("hello"):
+            pass
+
+    anyio.run(go)
+    for m in rec.last_messages:
+        assert not (m.role == "assistant" and not (m.content or "").strip() and not m.tool_calls)

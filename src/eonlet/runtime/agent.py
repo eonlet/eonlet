@@ -545,6 +545,17 @@ class AgentRuntime:
                 if m.task_id == scope and (m.event_id is None or m.event_id > task_wm)
             ]
 
+        # An assistant message with neither text nor tool calls (a live model
+        # can return an empty final turn, e.g. when told "no commentary") is
+        # information-free and rejected by provider APIs ("content or
+        # tool_calls must be set") — one such event in the log would poison
+        # every subsequent request window until compaction folds it away.
+        eligible = [
+            m
+            for m in eligible
+            if not (m.role == "assistant" and not (m.content or "").strip() and not m.tool_calls)
+        ]
+
         selected: list[Any] = []
         total = 0
         for msg in reversed(eligible):

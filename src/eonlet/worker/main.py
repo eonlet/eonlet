@@ -33,7 +33,7 @@ from .. import paths
 from ..errors import ConfigError, EonletError
 from ..runtime.agent import AgentRuntime
 from ..runtime.definition import import_custom_tool_module, load_definition
-from ..runtime.events import Event
+from ..runtime.events import Event, EventKind
 from ..runtime.store import EventStore
 from ..tasks import Task, next_runnable
 from ..tools import builtin as _builtin  # noqa: F401 — side-effect: register builtin tools
@@ -369,8 +369,13 @@ async def _main_loop(
 
             ok = True
             try:
-                async for _ in runtime.handle_user_message(item.content):
-                    pass
+                async for ev in runtime.handle_user_message(item.content):
+                    # The runtime swallows LLM failures into an ERROR event and
+                    # ends the turn "cleanly" — without this, a cron run that
+                    # died on the provider still counted as success and the
+                    # trigger's failure backoff never engaged.
+                    if ev.kind == EventKind.ERROR:
+                        ok = False
             except Exception:
                 log.exception("main_loop: run failed")
                 ok = False

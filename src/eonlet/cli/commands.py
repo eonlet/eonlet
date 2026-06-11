@@ -1515,11 +1515,18 @@ async def _send_async(sock: str, message: str) -> None:
         tg.start_soon(client.run)
         await client.request("session.start", {"client_id": "cli-send", "interactive": False})
         await client.request("message.send", {"content": message})
-        # End-of-run = an assistant_message event with no tool_calls.
+        # End-of-run = an assistant_message event with no tool_calls — or an
+        # error event (a turn that dies on the provider yields no assistant
+        # message at all; without this `send` hangs forever).
         async for msg in client.notifications():
             if msg.get("method") != "event":
                 continue
             p = msg.get("params") or {}
+            if p.get("kind") == "error":
+                err = (p.get("payload") or {}).get("error", "")
+                console.print(f"[bold red]run failed:[/] {err}")
+                tg.cancel_scope.cancel()
+                return
             if p.get("kind") != "assistant_message":
                 continue
             content = p.get("payload", {}).get("content") or ""

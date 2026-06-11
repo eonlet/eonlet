@@ -14,6 +14,31 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — DeepSeek dogfood round 4 (live-testing findings)
+
+- **One empty assistant reply bricked the agent (P0).** Told "no commentary",
+  deepseek-v4-pro returned an empty final turn (16 reasoning-only tokens); the
+  recorded empty `assistant_message` then made every subsequent request fail
+  DeepSeek's validation ("Invalid assistant message: content or tool_calls
+  must be set") until compaction happened to fold it away — the agent was
+  fully unresponsive. `_build_llm_messages` now drops information-free
+  assistant messages from the window.
+- **Failed trigger runs counted as successes.** The runtime swallows LLM
+  failures into an `error` event and ends the turn cleanly, so `main_loop`
+  reported `success=True` to the cron scheduler even when the run died on the
+  provider — the ≥3-failure backoff could never engage. The event stream is
+  now inspected for `error` events.
+- **`eonlet send` hung forever on a failed turn.** It only terminated on a
+  final assistant message; a turn that dies on the provider never produces
+  one. It now also terminates (with the error text) on an `error` event.
+
+Verified live in round 4 (probe under `permissions.mode: ask` + a scriptable
+interactive IPC driver): approve and deny consent round-trips for destructive
+tools; static cron trigger (exact fire, restart catch-up within grace period,
+headless auto-deny with no retry loop); the full `preempt: ask` consent flow —
+`task_preempt` prompt → switch → checkpoint → preemptor runs → preempted task
+resumes and finishes.
+
 ### Fixed — DeepSeek dogfood round 3 (live-testing findings)
 
 - **Compaction cascade un-gated.** Tier-2 only ran when tier-1 had run in the
