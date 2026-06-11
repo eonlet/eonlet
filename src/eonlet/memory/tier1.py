@@ -99,19 +99,41 @@ def compute_suggested_boundary(events: list[Event], cfg: MemoryConfig) -> int:
     preserved.reverse()
     first_preserved_idx = events.index(preserved[0])
     boundary_idx = first_preserved_idx - 1
-    boundary = events[boundary_idx].id or 0
 
-    # Tool-pair safety: never put the boundary at a tool_call whose result is
-    # in the preserved tail. Pull the boundary back to the assistant_message
-    # that owns the tool_call(s) if needed.
-    while boundary_idx > 0 and events[boundary_idx].kind in (
-        EventKind.TOOL_CALL,
-        EventKind.TOOL_RESULT,
-        EventKind.TOOL_ERROR,
-    ):
+    # Tool-pair safety: never fold a call whose result stays raw. This must
+    # check pair integrity, not event kinds — a boundary landing exactly on
+    # the assistant_message that owns later tool_results folds the call and
+    # orphans the results (seen live: the rebuilt window dropped the orphans,
+    # went empty, and the model hallucinated a whole unrelated conversation).
+    while boundary_idx > 0 and _cut_splits_tool_pair(events, boundary_idx):
         boundary_idx -= 1
-        boundary = events[boundary_idx].id or 0
-    return boundary
+    if _cut_splits_tool_pair(events, boundary_idx):
+        # No safe cut anywhere — compact nothing this pass.
+        return (events[0].id or 0) - 1 if events[0].id else 0
+    return events[boundary_idx].id or 0
+
+
+def _cut_splits_tool_pair(events: list[Event], boundary_idx: int) -> bool:
+    """True if folding ``events[: boundary_idx + 1]`` would orphan a tool
+    result: some tool_result/tool_error after the cut answers a call issued at
+    or before the cut. Robust to bookkeeping events (permissions, checkpoints)
+    interleaved inside the pair."""
+    pending: set[str] = set()
+    for e in events[boundary_idx + 1 :]:
+        if e.kind in (EventKind.TOOL_RESULT, EventKind.TOOL_ERROR):
+            cid = e.payload.get("call_id")
+            if cid:
+                pending.add(str(cid))
+    if not pending:
+        return False
+    for e in events[: boundary_idx + 1]:
+        if e.kind == EventKind.ASSISTANT_MESSAGE:
+            calls = e.payload.get("tool_calls") or []
+            if any(str(tc.get("id")) in pending for tc in calls):
+                return True
+        elif e.kind == EventKind.TOOL_CALL and str(e.payload.get("call_id")) in pending:
+            return True
+    return False
 
 
 def snap_boundary_safe(events: list[Event], boundary: int) -> int:
@@ -124,12 +146,10 @@ def snap_boundary_safe(events: list[Event], boundary: int) -> int:
     idx = next((i for i, e in enumerate(events) if e.id == boundary), None)
     if idx is None:
         return boundary
-    while idx > 0 and events[idx].kind in (
-        EventKind.TOOL_CALL,
-        EventKind.TOOL_RESULT,
-        EventKind.TOOL_ERROR,
-    ):
+    while idx > 0 and _cut_splits_tool_pair(events, idx):
         idx -= 1
+    if _cut_splits_tool_pair(events, idx):
+        return (events[0].id or 0) - 1 if events[0].id else 0
     return events[idx].id or boundary
 
 

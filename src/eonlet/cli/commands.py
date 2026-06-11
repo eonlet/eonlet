@@ -1744,7 +1744,9 @@ def _render_task_node(
     due_s = f" [magenta](due {escape(str(due))})[/]" if due else ""
     body = escape(str(goal or content or "").strip())
     style = _TASK_COLOR.get(str(status), "")
-    head = f"{_TASK_ICON.get(str(status), '[?]')} {escape(str(tid))}"
+    # escape() the icon too: rich parses "[x]"/"[-]" as markup tags and
+    # silently swallows them — done/cancelled rows lost their status marker.
+    head = f"{escape(_TASK_ICON.get(str(status), '[?]'))} {escape(str(tid))}"
     head = f"[{style}]{head}[/]" if style else head
     console.print(f"{indent}{head}{prio}{due_s} — {body}")
 

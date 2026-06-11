@@ -14,6 +14,36 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — DeepSeek dogfood round 2 (live-testing findings)
+
+- **Empty-context hallucination (P0).** A task-scope compaction boundary could
+  land exactly on the assistant message that owns later tool_results: the
+  fold orphaned the results, the rebuilt window dropped the orphans and went
+  *empty*, and the model — given system-prompt-only context — invented an
+  entirely unrelated conversation (observed live: it answered an imaginary
+  Chinese request about oil-painting backgrounds mid-benchmark-task). Two
+  layers fixed:
+  - `compute_suggested_boundary` / `snap_boundary_safe` now check **pair
+    integrity** (would any tool_result after the cut lose its issuing call?)
+    instead of event kinds, robust to interleaved permission/bookkeeping
+    events. The old kind-walk could both stop on the call-owning assistant
+    message (splitting the pair) and over-retreat past completed pairs.
+  - `AgentRuntime._build_llm_messages` never returns an empty task window: if
+    pruning empties it, a continuation message re-grounds the turn (goal +
+    progress brief are already in the system prompt).
+- **Compactor JSON parsing hardened against real models.** deepseek-v4-flash
+  emitted literal newlines inside JSON string values (strict `json.loads`
+  rejects them) — tier-1 silently failed every pass. Now: lenient
+  `strict=False` retry, unfenced-prose extraction, prompt rule demanding raw
+  JSON with escaped newlines, and parse errors carry a snippet of the raw
+  response (it was previously discarded — undiagnosable).
+- **`eonlet tasks` lost done/cancelled markers.** The `[x]`/`[-]` status icons
+  were parsed as rich markup tags and swallowed; they're now escaped.
+- **assistant template: honest task semantics.** The system prompt now warns
+  the model that pending tasks auto-start when the worker is idle — observed
+  live: the agent promised a freshly created task would "sit pending" while
+  the scheduler had already started it.
+
 ### Fixed — DeepSeek dogfood round 1 (live-testing findings)
 
 - **`eonlet send` deadlock under `ask` mode.** `send`/`tasks`/`tail` now declare

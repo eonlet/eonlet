@@ -561,6 +561,25 @@ class AgentRuntime:
         while selected and selected[0].role == "tool":
             selected.pop(0)
 
+        if not selected and scope is not None:
+            # Watermark + orphan pruning can empty a task window mid-run. Never
+            # send a messages-less request: given system-prompt-only context a
+            # live model invented an unrelated conversation. Re-ground the turn;
+            # goal and progress brief are already in the system prompt.
+            log.warning("window: task %s scope emptied after pruning; re-grounding", scope)
+            return [
+                LLMMessage(
+                    role="user",
+                    content=(
+                        f'<task id="{scope}">\n'
+                        "Continue working on this task. The goal, context and "
+                        "your progress brief are in the system prompt. When it "
+                        'is complete, call task(action="done").\n'
+                        "</task>"
+                    ),
+                )
+            ]
+
         from ..memory.injection import prefix_user_timestamp
 
         stamp = cfg.enabled and cfg.inject_turn_timestamps

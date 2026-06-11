@@ -78,6 +78,50 @@ def test_suggested_boundary_avoids_tool_pair() -> None:
     )
 
 
+def test_suggested_boundary_never_orphans_tool_results() -> None:
+    """Live-observed shape: the budget walk lands the cut exactly on the
+    assistant_message that owns later tool_results (with permission events
+    interleaved). Folding it would orphan the results; the rebuilt window then
+    drops them and goes empty. The boundary must retreat before the owner."""
+    cfg = MemoryConfig.model_validate(
+        {"episodic": {"working_memory_tokens": 64, "keep_recent_messages_min": 2}}
+    )
+    events = [
+        user_message("u-old " + "x" * 400).model_copy(update={"id": 10}),
+        assistant_message(
+            "", tool_calls=[{"id": "cA", "name": "file_read", "args": {}}]
+        ).model_copy(update={"id": 11}),
+        tool_call("cA", "file_read", {}).model_copy(update={"id": 12}),
+        Event(
+            kind=EventKind.PERMISSION_GRANTED,
+            payload={"tool_name": "file_read", "call_id": "cA"},
+        ).model_copy(update={"id": 13}),
+        tool_result("cA", "file_read", "out " + "y" * 200).model_copy(update={"id": 14}),
+        tool_result("cA", "file_read", "out2 " + "y" * 200).model_copy(update={"id": 15}),
+    ]
+    boundary = compute_suggested_boundary(events, cfg)
+    # Any boundary >= 11 folds the call-owning assistant and orphans results.
+    assert boundary <= 10
+
+
+def test_snap_boundary_safe_retreats_past_call_owner() -> None:
+    events = [
+        user_message("u").model_copy(update={"id": 1}),
+        assistant_message("", tool_calls=[{"id": "c1", "name": "t", "args": {}}]).model_copy(
+            update={"id": 2}
+        ),
+        tool_call("c1", "t", {}).model_copy(update={"id": 3}),
+        tool_result("c1", "t", "r").model_copy(update={"id": 4}),
+        user_message("u2").model_copy(update={"id": 5}),
+    ]
+    # Snapping onto the owning assistant (2) or the call (3) retreats to 1.
+    assert snap_boundary_safe(events, 2) == 1
+    assert snap_boundary_safe(events, 3) == 1
+    # After the pair is complete the cut is fine.
+    assert snap_boundary_safe(events, 4) == 4
+    assert snap_boundary_safe(events, 5) == 5
+
+
 # ── orchestration ──────────────────────────────────────────────────────────
 
 
@@ -192,9 +236,11 @@ def test_snap_boundary_safe_avoids_tool_pairs() -> None:
         tool_result("c", "x", "out").model_copy(update={"id": 4}),
         user_message("u2").model_copy(update={"id": 5}),
     ]
-    # A boundary on the tool_call or its result snaps back to the owning turn.
-    assert snap_boundary_safe(events, 4) == 2
-    assert snap_boundary_safe(events, 3) == 2
+    # Folding the whole pair together (cut at the result) is safe; a cut that
+    # folds the call but not its result retreats before the owning assistant.
+    assert snap_boundary_safe(events, 4) == 4
+    assert snap_boundary_safe(events, 3) == 1
+    assert snap_boundary_safe(events, 2) == 1
     # A clean message boundary is unchanged; unknown ids pass through.
     assert snap_boundary_safe(events, 5) == 5
     assert snap_boundary_safe(events, 999) == 999

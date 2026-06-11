@@ -76,6 +76,24 @@ def test_parse_rejects_non_json() -> None:
         parse_compaction_response("nope", valid_event_ids={1}, suggested_boundary=1)
 
 
+def test_parse_accepts_literal_newlines_in_strings() -> None:
+    # Observed live with deepseek-v4-flash: unescaped newlines inside "body".
+    j = _GOOD_JSON.replace('"what happened"', '"line one\nline two"')
+    out = parse_compaction_response(j, valid_event_ids={5}, suggested_boundary=5)
+    assert out.sections[0].body == "line one\nline two"
+
+
+def test_parse_accepts_unfenced_prose_around_json() -> None:
+    wrapped = "Here is the summary you asked for:\n" + _GOOD_JSON + "\nLet me know!"
+    out = parse_compaction_response(wrapped, valid_event_ids={5}, suggested_boundary=5)
+    assert out.boundary_event_id == 5
+
+
+def test_parse_failure_includes_raw_snippet() -> None:
+    with pytest.raises(ValueError, match="raw starts"):
+        parse_compaction_response("{definitely not json", valid_event_ids={1}, suggested_boundary=1)
+
+
 def test_parse_rejects_boundary_past_suggested() -> None:
     j = _GOOD_JSON.replace('"boundary_event_id": 5', '"boundary_event_id": 7')
     with pytest.raises(ValueError, match="exceeds suggested"):

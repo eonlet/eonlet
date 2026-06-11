@@ -347,6 +347,58 @@ Test configuration (`pyproject.toml`):
 - `--strict-markers` — no undeclared pytest marks
 - Branch coverage over `src/eonlet`
 
+> If async tests fail en masse with "async def functions are not natively
+> supported", you're on a PATH pytest (e.g. miniconda's), not the venv's —
+> run `uv run python -m pytest` instead of bare `pytest`.
+
+---
+
+## Dogfooding: Live Testing with a Real LLM (DeepSeek)
+
+Unit tests use `FakeProvider`; real-model behavior (JSON discipline, retry
+habits, tool-call shapes) only surfaces against a live LLM. The standing
+dogfood loop uses DeepSeek (`DEEPSEEK_API_KEY` in the env; provider entry in
+`~/.eonlet/config.yaml`; models `deepseek-v4-pro` / `deepseek-v4-flash`).
+
+**Test instance.** `assistant.probe` (definition `~/.eonlet/agents/assistant/`)
+— switched to `permissions.mode: yolo` and `trace.enabled: true` so tools
+actually execute and every LLM request is recorded. To force the compaction
+cascade quickly, lower `memory.episodic.*_tokens` budgets there and restart.
+The repo templates keep their shipped defaults — never copy these testing
+overrides back into `src/eonlet/templates/`.
+
+**The loop.**
+
+```bash
+uv run eonlet send assistant.probe "<scenario>"   # one-shot turn (non-interactive: ask-mode destructive tools auto-deny)
+uv run eonlet replay assistant.probe | grep '^─── #'   # event-kind skeleton
+uv run eonlet tasks assistant.probe                # task forest state
+uv run eonlet trace assistant.probe                # lineage tree (lines, forks)
+```
+
+Then fix → quality gates → `eonlet stop/start assistant.probe` (workers run
+the *installed* code; restart after every change) → re-verify live.
+
+**Read contexts progressively** — never dump a whole line:
+
+```bash
+eonlet trace <id> --line <ln> --outline   # one row per message: role, size, preview, tool calls
+eonlet trace <id> --line <ln> --msg N     # expand one message (0 = system)
+eonlet trace <id> --line <ln> --at SEQ    # context exactly as the model saw it at call SEQ
+```
+
+Trace records keep DeepSeek's `reasoning_content` — when a turn goes weird,
+reading the model's own thinking (`--msg` on the reply) is the fastest way to
+tell a harness bug from a model quirk (it exposed both the blind-retry-after-
+deny habit and the invented "agent mode" remedy).
+
+**Timing traps.** The compaction cascade runs *after* the turn — `send`
+returns before it finishes, so wait a few seconds before checking
+`memory/short_term.md`, `memory/watermark`, or `mem_compacted` events. With
+`tasks.scheduling.enabled`, the idle worker starts pending leaf tasks on its
+own beats — token spend continues after `send` returns; watch
+`eonlet tasks` before assuming the worker is idle.
+
 ---
 
 ## Coding Standards

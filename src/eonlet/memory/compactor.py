@@ -85,6 +85,8 @@ _SYSTEM_PROMPT = (
     "- You MAY choose a smaller boundary than the suggested one to preserve "
     "topic coherence near the boundary. You MUST NOT choose a larger one.\n"
     "- Do not invent facts. If a turn is empty or noisy, omit it.\n"
+    "- Output raw JSON only — no markdown fences, no commentary. Escape "
+    "newlines inside string values as \\n.\n"
 )
 
 
@@ -135,11 +137,17 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 
 
 def _extract_json(content: str) -> str:
-    """Strip optional markdown fences around a JSON object."""
+    """Strip optional markdown fences (or surrounding prose) around a JSON object."""
     m = _FENCE_RE.search(content)
     if m:
         return m.group(1).strip()
-    return content.strip()
+    content = content.strip()
+    if not content.startswith("{"):
+        # Unfenced prose around the object ("Here is the summary: {...}").
+        start, end = content.find("{"), content.rfind("}")
+        if 0 <= start < end:
+            return content[start : end + 1]
+    return content
 
 
 def parse_compaction_response(
@@ -156,8 +164,16 @@ def parse_compaction_response(
     raw = _extract_json(content)
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"compactor response is not JSON: {e}") from e
+    except json.JSONDecodeError:
+        try:
+            # Lenient retry: real models (DeepSeek observed live) emit literal
+            # newlines inside string values; strict mode rejects them.
+            data = json.loads(raw, strict=False)
+        except json.JSONDecodeError as e:
+            # Keep a snippet — without it a live parse failure is undiagnosable.
+            raise ValueError(
+                f"compactor response is not JSON: {e}; raw starts: {raw[:400]!r}"
+            ) from e
     try:
         model = _CompactionResponseModel.model_validate(data)
     except ValidationError as e:
