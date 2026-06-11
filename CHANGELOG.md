@@ -14,6 +14,38 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — DeepSeek dogfood round 3 (live-testing findings)
+
+- **Compaction cascade un-gated.** Tier-2 only ran when tier-1 had run in the
+  same pass, so an over-budget STM (transient tier-2 failure, provider
+  resolution error, or a lowered budget) stayed over budget until the working
+  window happened to overflow again — observed live as a stuck 750-token STM
+  under a 600 budget. Every tier now checks its own threshold independently
+  (tier-3 already did; the asymmetry had no rationale). MEMORY_SPEC §10.3
+  updated.
+- **Terminal parent starved live subtasks (scheduler hole).** `task(done)` on
+  a parent with pending children was accepted; the terminal parent then pruned
+  its whole subtree from `next_runnable`, so the pending child could never run
+  again (observed live: an "urgent" subtask sat unreachable while the worker
+  idled). Both the `task` tool and the CLI control plane now refuse `done`
+  while live descendants remain, and `cancel` cascades over the live subtree
+  (`cascade:tool:cancel:<id>` / `cascade:cli:cancel:<id>`). New
+  `TaskForest.live_descendants`. TASK_SPEC §3 updated.
+- **No way to create a top-level task mid-run.** Inside a task-scoped run,
+  `task(add)` always parented to the current task (`args.parent_id or
+  ctx.current_task_id`) — yet the urgent-preemption flow documented in the
+  assistant template *requires* a new root. New `top_level=true` arg forces a
+  root; template updated. Verified live: mid-run creation of a p30 root
+  triggered cooperative preemption (`preempted:agent:<id>`), checkpoint,
+  preemptor run, and a faithful resume.
+- **Tier-2/tier-3 JSON parsing was still fragile.** Round 2 hardened only
+  tier-1's parser; tier-3 failed live ("not JSON: line 1 column 1" — prose
+  around the object) with the raw response discarded. All three tiers now
+  share `loads_llm_json` (fences, surrounding prose, literal newlines,
+  error-with-snippet), and the tier-2/3 prompts state the raw-JSON output
+  rule. Verified live: full tier-1 → tier-2 → tier-3 cascade with DeepSeek,
+  including a semantic 4-into-1 bullet merge at tier-3.
+
 ### Fixed — DeepSeek dogfood round 2 (live-testing findings)
 
 - **Empty-context hallucination (P0).** A task-scope compaction boundary could

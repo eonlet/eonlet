@@ -461,8 +461,9 @@ when the index exceeds `knowledge.index_max_tokens`.
 | `compact_ltm` | – | destructive |
 | `pause` / `resume` | – | destructive |
 
-`compact` runs tier-1; `compact_ltm` runs tier-3; tier-2 triggers only as a
-tier-1 follow-up. `propose_compact` is the §4.0 agent-proposed trigger.
+`compact` runs tier-1; `compact_ltm` runs tier-3; tier-2 has no direct tool
+action — it triggers from the post-run cascade whenever STM exceeds its
+budget (§10.3). `propose_compact` is the §4.0 agent-proposed trigger.
 
 ---
 
@@ -558,7 +559,10 @@ memory:
 2. **Event append** — `AgentRuntime._record` indexes every text-bearing event
    into the recall index synchronously.
 3. **Post-run** — the compaction cascade runs inline after every run:
-   tier-1 (threshold) → tier-2 (if tier-1 ran) → tier-3 (threshold).
+   tier-1 (threshold) → tier-2 (threshold) → tier-3 (threshold). Every tier
+   checks its own budget independently — tier-2 is not gated on tier-1 having
+   run in the same pass, so an over-budget STM (e.g. after a transient tier-2
+   failure or a lowered budget) is retried on the very next run.
 
 ---
 

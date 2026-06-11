@@ -363,3 +363,85 @@ def test_update_priority_on_subtask_rejected(tmp_path: Path) -> None:
     rid, cid = anyio.run(go)
     assert forest.get(cid).priority == 0  # type: ignore[union-attr]
     assert forest.get(rid).priority == 5  # type: ignore[union-attr]
+
+
+def test_done_refused_while_live_subtasks_remain(tmp_path: Path) -> None:
+    # Dogfood round 3: a terminal parent prunes its subtree from scheduling, so
+    # marking it done over a pending child would starve the child forever.
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> tuple[str, str]:
+        root = await tool(TaskArgs(action="add", content="parent"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        child = await tool(TaskArgs(action="add", content="part", parent_id=rid), ctx)
+        cid = child.structured_output["id"]  # type: ignore[index]
+        refused = await tool(TaskArgs(action="done", id=rid), ctx)
+        assert refused.is_error and "unfinished subtask" in refused.content
+        # Finish the child; the parent may then be done.
+        ok_child = await tool(TaskArgs(action="done", id=cid), ctx)
+        assert not ok_child.is_error
+        ok_parent = await tool(TaskArgs(action="done", id=rid), ctx)
+        assert not ok_parent.is_error
+        return rid, cid
+
+    rid, _cid = anyio.run(go)
+    assert forest.get(rid).status == "done"  # type: ignore[union-attr]
+
+
+def test_cancel_cascades_over_live_subtree(tmp_path: Path) -> None:
+    ctx, captured, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> tuple[str, str, str, str]:
+        root = await tool(TaskArgs(action="add", content="tree"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        c1 = await tool(TaskArgs(action="add", content="a", parent_id=rid), ctx)
+        cid1 = c1.structured_output["id"]  # type: ignore[index]
+        c2 = await tool(TaskArgs(action="add", content="b", parent_id=rid), ctx)
+        cid2 = c2.structured_output["id"]  # type: ignore[index]
+        g = await tool(TaskArgs(action="add", content="a.1", parent_id=cid1), ctx)
+        gid = g.structured_output["id"]  # type: ignore[index]
+        # One child already finished: cascade must not touch it.
+        await tool(TaskArgs(action="done", id=gid), ctx)
+        await tool(TaskArgs(action="done", id=cid1), ctx)
+        out = await tool(TaskArgs(action="cancel", id=rid), ctx)
+        assert not out.is_error and "cascade-cancelled" in out.content
+        return rid, cid1, cid2, gid
+
+    rid, cid1, cid2, gid = anyio.run(go)
+    assert forest.get(rid).status == "cancelled"  # type: ignore[union-attr]
+    assert forest.get(cid2).status == "cancelled"  # type: ignore[union-attr]
+    # Already-terminal nodes keep their state (terminal is sticky).
+    assert forest.get(cid1).status == "done"  # type: ignore[union-attr]
+    assert forest.get(gid).status == "done"  # type: ignore[union-attr]
+    reasons = [
+        e.payload.get("reason")
+        for e in captured
+        if e.kind == EventKind.TASK_TRANSITIONED and e.payload.get("id") == cid2
+    ]
+    assert reasons == [f"cascade:tool:cancel:{rid}"]
+
+
+def test_add_top_level_escapes_current_task_scope(tmp_path: Path) -> None:
+    # Dogfood round 3: inside a task-scoped run, plain add makes a subtask;
+    # top_level=true must force a new root (urgent work needs root priority).
+    ctx, _, forest = _ctx(tmp_path)
+    tool = TaskTool()
+
+    async def go() -> tuple[str, str, str]:
+        root = await tool(TaskArgs(action="add", content="current work"), ctx)
+        rid = root.structured_output["id"]  # type: ignore[index]
+        ctx.current_task_id = rid
+        sub = await tool(TaskArgs(action="add", content="implicit subtask"), ctx)
+        sid = sub.structured_output["id"]  # type: ignore[index]
+        urgent = await tool(
+            TaskArgs(action="add", content="urgent", top_level=True, priority=30), ctx
+        )
+        uid = urgent.structured_output["id"]  # type: ignore[index]
+        return rid, sid, uid
+
+    rid, sid, uid = anyio.run(go)
+    assert forest.get(sid).parent_id == rid  # type: ignore[union-attr]
+    assert forest.get(uid).parent_id is None  # type: ignore[union-attr]
+    assert forest.get(uid).priority == 30  # type: ignore[union-attr]

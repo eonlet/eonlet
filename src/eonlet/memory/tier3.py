@@ -14,9 +14,7 @@ Sequence per pass:
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..llm import LLMMessage, LLMProvider
 from ..runtime.events import mem_ltm_forgotten
+from .compactor import loads_llm_json
 from .config import MemoryConfig
 from .ltm import LTMBullet, LTMStore
 from .tier1 import RecordEventFn
@@ -92,6 +91,8 @@ _SYSTEM_PROMPT = (
     "- Minimise information loss. When in doubt about a recent entry, keep it.\n"
     "- Every kept bullet MUST have: section, content, src, ts.\n"
     "- 'merged_from' lists the original content strings that were combined.\n"
+    "- Output raw JSON only — no markdown fences, no commentary. Escape "
+    "newlines inside string values as \\n.\n"
 )
 
 
@@ -100,22 +101,12 @@ def build_tier3_prompt(ltm_raw: str) -> str:
     return f"Current long-term memory to compact:\n\n{ltm_raw}"
 
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
-
-
 def parse_tier3_response(content: str) -> _T3Response:
     """Parse and validate the tier-3 LLM response.
 
     Raises ``ValueError`` on malformed input.
     """
-    raw = content.strip()
-    m = _FENCE_RE.search(raw)
-    if m:
-        raw = m.group(1).strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"tier-3 response is not JSON: {e}") from e
+    data = loads_llm_json(content, what="tier-3")
     try:
         return _T3Response.model_validate(data)
     except ValidationError as e:

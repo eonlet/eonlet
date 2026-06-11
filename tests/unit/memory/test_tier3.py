@@ -292,3 +292,16 @@ def test_run_tier3_dropped_digest_in_event(tmp_path: Path) -> None:
     evts = [e for e in captured if e.kind == EventKind.MEM_LTM_FORGOTTEN]
     digest = evts[0].payload["dropped_digest"]
     assert any("DROPPED-PREVIEW" in d["preview"] for d in digest)
+
+
+def test_parse_accepts_prose_around_json() -> None:
+    # Dogfood round 3: observed live — tier-3 reply wrapped in prose failed the
+    # old fence-only parser; all tiers now share the lenient loads_llm_json.
+    wrapped = "Sure, here is the compacted memory:\n" + json.dumps(_GOOD_RESP) + "\nDone."
+    resp = parse_tier3_response(wrapped)
+    assert resp.kept_bullets
+
+
+def test_parse_failure_includes_raw_snippet() -> None:
+    with pytest.raises(ValueError, match="raw starts"):
+        parse_tier3_response("{broken json")

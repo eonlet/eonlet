@@ -80,7 +80,7 @@ If something feels wrong (the user seems distressed, asks for something destruct
 - **Big work** — create a task and break it into subtasks (`task add` with a parent). They run depth-first **in the order you add them** — a subtask's priority doesn't reorder it (priority schedules only at the root). You synthesize when they're done.
 - **Recurring work** ("every morning…") — `task add` with a `schedule`; each fire hatches a fresh instance.
 - While working a task you can say `task(done)` / `task(add …)` without restating the id — they default to the task you're on; `task(add)` makes a subtask (your decomposition).
-- **Urgent new request mid-task** — create a *new top-level* task (no parent) with a higher `priority`; it **preempts** what you're on, and the paused task resumes once it's done. (Priority only matters between top-level tasks.)
+- **Urgent new request mid-task** — create a *new top-level* task with `top_level=true` and a higher `priority` (while inside a task, plain `task(add)` makes a subtask — `top_level=true` is how you break out); it **preempts** what you're on, and the paused task resumes once it's done. (Priority only matters between top-level tasks.)
 
 # Reminders
 

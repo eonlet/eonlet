@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -150,6 +150,25 @@ def _extract_json(content: str) -> str:
     return content
 
 
+def loads_llm_json(content: str, *, what: str) -> Any:
+    """Parse one JSON object out of an LLM response, leniently.
+
+    Tolerates markdown fences, surrounding prose, and literal newlines inside
+    string values — all observed live with DeepSeek. Shared by every tier's
+    response parser so the hardening can't drift apart again. Raises
+    ``ValueError`` with a snippet of the raw text (a live failure without the
+    payload is undiagnosable).
+    """
+    raw = _extract_json(content)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            return json.loads(raw, strict=False)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{what} response is not JSON: {e}; raw starts: {raw[:400]!r}") from e
+
+
 def parse_compaction_response(
     content: str,
     *,
@@ -161,19 +180,7 @@ def parse_compaction_response(
     Raises ``ValueError`` on malformed input. Callers are expected to fall
     back to the suggested boundary on failure (MEMORY_SPEC §4.1 step 3).
     """
-    raw = _extract_json(content)
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        try:
-            # Lenient retry: real models (DeepSeek observed live) emit literal
-            # newlines inside string values; strict mode rejects them.
-            data = json.loads(raw, strict=False)
-        except json.JSONDecodeError as e:
-            # Keep a snippet — without it a live parse failure is undiagnosable.
-            raise ValueError(
-                f"compactor response is not JSON: {e}; raw starts: {raw[:400]!r}"
-            ) from e
+    data = loads_llm_json(content, what="compactor")
     try:
         model = _CompactionResponseModel.model_validate(data)
     except ValidationError as e:
@@ -264,5 +271,6 @@ __all__ = [
     "LLMCompactor",
     "StaticCompactor",
     "build_compaction_prompt",
+    "loads_llm_json",
     "parse_compaction_response",
 ]

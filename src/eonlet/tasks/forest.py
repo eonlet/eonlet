@@ -204,6 +204,24 @@ class TaskForest:
         leaves = [t for t in self._nodes.values() if t.status == "pending" and self.is_leaf(t.id)]
         return sorted(leaves, key=lambda t: (-t.priority, t.created_at, t.id))
 
+    def live_descendants(self, task_id: str) -> list[Task]:
+        """Non-terminal descendants of ``task_id`` (pre-order), excluding itself.
+
+        A terminal node prunes its subtree from scheduling (`_runnable_in_subtree`),
+        so finishing a parent with live descendants would starve them silently —
+        callers use this to refuse `done` / cascade `cancel` instead.
+        """
+        out: list[Task] = []
+
+        def walk(node_id: str) -> None:
+            for child in self.children(node_id):
+                if not is_terminal(child.status):
+                    out.append(child)
+                walk(child.id)
+
+        walk(task_id)
+        return out
+
     def dfs(self) -> Iterator[tuple[Task, int]]:
         """Pre-order (task, depth) over the whole forest, priority-ordered roots."""
 

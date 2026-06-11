@@ -37,6 +37,14 @@ class TaskArgs(BaseModel):
     parent_id: str | None = Field(
         default=None, description="For action='add': attach as a subtask of this task id."
     )
+    top_level: bool = Field(
+        default=False,
+        description=(
+            "For action='add': force a new TOP-LEVEL task even while working inside "
+            "a task (where omitting parent_id normally creates a subtask). Use for "
+            "urgent/unrelated work that should preempt by priority."
+        ),
+    )
     priority: int | None = Field(
         default=None,
         description=(
@@ -148,11 +156,13 @@ class TaskTool:
         "Scheduling is by priority between TOP-LEVEL tasks; subtasks run depth-first "
         "in creation order (their priority is ignored). A higher-priority top-level "
         "task preempts a running lower-priority one. Actions: "
-        "'add' (content required; optional parent_id/priority/goal/due/tags), "
+        "'add' (content required; optional parent_id/priority/goal/due/tags; "
+        "top_level=true forces a new root even while inside a task), "
         "'list' (status filter: pending|active|suspended|blocked|done|cancelled|all; "
         "rendered as a tree), "
-        "'done' (mark → done by id; pass result=<short outcome summary>), "
-        "'cancel' (mark → cancelled by id), "
+        "'done' (mark → done by id; pass result=<short outcome summary>; refused "
+        "while unfinished subtasks remain), "
+        "'cancel' (mark → cancelled by id; cascades over unfinished subtasks), "
         "'resume' (re-queue a suspended task by id so the scheduler picks it up), "
         "'update' (id + any of content/goal/priority/due/tags), 'delete' (id)."
     )
@@ -173,7 +183,9 @@ class TaskTool:
                 return await _schedule_task(args, ctx)
             # Inside a task-scoped run, a new task without an explicit parent is a
             # subtask of the task being worked on (the decomposition signal).
-            parent_id = args.parent_id or ctx.current_task_id
+            # ``top_level`` is the escape hatch: urgent/unrelated work must become
+            # a new root so root-priority scheduling/preemption can see it.
+            parent_id = args.parent_id or (None if args.top_level else ctx.current_task_id)
             if parent_id and forest is not None and forest.get(parent_id) is None:
                 return ToolResult(
                     content=f"task add: no such parent task: {parent_id}", is_error=True
@@ -249,6 +261,31 @@ class TaskTool:
                     content=f"task {args.action}: cannot move {tid} from {task.status} to {dst}",
                     is_error=True,
                 )
+            # A terminal node prunes its subtree from scheduling, so live
+            # descendants must not be left behind: `done` refuses (finish or
+            # cancel them first; the parent gets its synthesis turn once all
+            # children are terminal), `cancel` cascades over the subtree.
+            live = forest.live_descendants(tid) if forest is not None else []
+            if args.action == "done" and live:
+                ids = ", ".join(t.id for t in live[:5])
+                return ToolResult(
+                    content=(
+                        f"task done: {tid} still has {len(live)} unfinished subtask(s) "
+                        f"({ids}). Finish or cancel them first — once all children are "
+                        "terminal the parent automatically gets its synthesis turn."
+                    ),
+                    is_error=True,
+                )
+            if args.action == "cancel":
+                for desc in live:
+                    await ctx.record_event(
+                        task_transitioned(
+                            id=desc.id,
+                            from_state=desc.status,
+                            to_state="cancelled",
+                            reason=f"cascade:tool:cancel:{tid}",
+                        )
+                    )
             await ctx.record_event(
                 task_transitioned(
                     id=task.id,
@@ -258,7 +295,12 @@ class TaskTool:
                     result=args.result if args.action == "done" else None,
                 )
             )
-            return ToolResult(content=f"{args.action} {task.id}")
+            suffix = (
+                f" (+{len(live)} subtask(s) cascade-cancelled)"
+                if (args.action == "cancel" and live)
+                else ""
+            )
+            return ToolResult(content=f"{args.action} {task.id}{suffix}")
 
         if args.action == "resume":
             # Re-queue a suspended task (→ pending) so the scheduler picks it

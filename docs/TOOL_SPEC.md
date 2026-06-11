@@ -436,6 +436,8 @@ input:
                                           #   required for resume
   goal: string | null                     # durable objective (used on resume)
   parent_id: string | null               # for add → create a subtask (tree)
+  top_level: bool = false                 # for add → force a new ROOT task even inside a
+                                          #   task-scoped run (urgent/preempting work)
   priority: int | null                    # higher runs first (default 0)
   result: string | null                   # for done → outcome summary (REQUIRED when a
                                           #   task-scoped run finishes its own task)
@@ -449,10 +451,14 @@ annotations: destructive
 
 Inside a scheduled task-run the agent calls `task(done)` / `task(add …)` without
 restating the id (they default to the *current task*); `add` without a parent is
-a subtask of it (the decomposition signal). `done` for the run's own task
-requires a non-empty `result` — it is the only payload that flows up the tree.
-`resume` re-queues a suspended task (→ pending) so the scheduler picks it up.
-Creation respects the `tasks.scheduling` depth/fan-out caps.
+a subtask of it (the decomposition signal) — `top_level=true` breaks out and
+creates a new root instead (only roots participate in priority scheduling and
+preemption). `done` for the run's own task requires a non-empty `result` — it is
+the only payload that flows up the tree — and is refused while unfinished
+subtasks remain (a terminal parent would starve them); `cancel` cascades over
+the live subtree. `resume` re-queues a suspended task (→ pending) so the
+scheduler picks it up. Creation respects the `tasks.scheduling` depth/fan-out
+caps.
 
 ### 6.13 `send_email`
 

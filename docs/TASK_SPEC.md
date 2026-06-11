@@ -73,6 +73,18 @@ dropped). `pending` is the only state the scheduler picks up as new work;
 `suspended` is *not* auto-resumed (it waits for an explicit `resume` or, for a
 preempted task, it is re-queued as `pending` instead of suspended).
 
+**Live-descendant rules.** A terminal node prunes its whole subtree from
+scheduling, so finishing a parent that still has non-terminal descendants would
+starve them silently. Both the `task` tool and the CLI control plane therefore:
+refuse `done` while live descendants remain (finish or cancel them first — the
+parent then gets its synthesis turn), and **cascade `cancel`** over the live
+subtree (reason `cascade:tool:cancel:<id>` / `cascade:cli:cancel:<id>`).
+
+**Top-level escape hatch.** Inside a task-scoped run, `task(add)` without a
+parent creates a subtask (§4.1). `task(add, top_level=true)` forces a new root
+instead — required for urgent/unrelated work, since only root trees participate
+in priority scheduling and preemption (§5).
+
 ## 4. Scheduler
 
 The **TaskScheduler** is an in-worker component (not a daemon — ADR-0001),

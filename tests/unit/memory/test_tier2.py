@@ -305,3 +305,19 @@ def test_run_tier2_emits_event(tmp_path: Path) -> None:
         )
     )
     assert any(e.kind == EventKind.MEM_LTM_PROMOTED for e in captured)
+
+
+def test_parse_accepts_prose_and_literal_newlines() -> None:
+    # Dogfood round 3: tier-2/3 had their own fragile parsers — the round-2
+    # lenient hardening only covered tier-1. All tiers now share loads_llm_json.
+    wrapped = "Here you go:\n" + json.dumps(_GOOD_RESP).replace(
+        "compacted portfolio notes", "line one\\nline two"
+    )
+    raw = wrapped.replace("\\\\n", "\n")  # turn the escape into a literal newline
+    resp = parse_tier2_response(raw, [_section()])
+    assert len(resp.ltm_additions) == 2
+
+
+def test_parse_failure_includes_raw_snippet() -> None:
+    with pytest.raises(ValueError, match="raw starts"):
+        parse_tier2_response("{broken json", [])

@@ -815,9 +815,12 @@ async def _hatch_task(runtime: AgentRuntime, item: TriggerItem) -> None:
 
 async def _run_cascade(runtime: AgentRuntime) -> None:
     """Post-run compaction cascade (MEMORY_SPEC §4.1 / §4.4 / §4.5)."""
-    tier1_ran = await _maybe_run_tier1(runtime)
-    if tier1_ran:
-        await _maybe_run_tier2(runtime)
+    # Each tier guards on its own budget threshold. Tier-2 is deliberately NOT
+    # gated on tier-1 having run this pass: a swallowed tier-2 failure or a
+    # lowered budget would otherwise latch STM over budget until the working
+    # window happens to overflow again.
+    await _maybe_run_tier1(runtime)
+    await _maybe_run_tier2(runtime)
     await _maybe_run_tier3(runtime)
 
 
@@ -1379,10 +1382,34 @@ async def _handle_memory_ipc(
             }[sub]
             if not can_transition(task.status, dst):
                 return {"ok": False, "error": f"cannot {sub} task in state {task.status}"}
+            # Same live-descendant rules as the task tool: a terminal node prunes
+            # its subtree from scheduling, so done refuses / cancel cascades.
+            live = forest.live_descendants(tid)
+            if sub == "done" and live:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"{tid} still has {len(live)} unfinished subtask(s); "
+                        "finish or cancel them first"
+                    ),
+                }
+            if sub == "cancel":
+                for desc in live:
+                    await runtime._record(
+                        task_transitioned(
+                            id=desc.id,
+                            from_state=desc.status,
+                            to_state="cancelled",
+                            reason=f"cascade:cli:cancel:{tid}",
+                        )
+                    )
             await runtime._record(
                 task_transitioned(id=tid, from_state=task.status, to_state=dst, reason=f"cli:{sub}")
             )
-            return {"ok": True}
+            return {
+                "ok": True,
+                "cascade_cancelled": [t.id for t in live] if sub == "cancel" else [],
+            }
         if sub == "update":
             tid = str(params.get("id", ""))
             if not tid:

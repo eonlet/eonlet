@@ -15,9 +15,7 @@ Sequence per pass:
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +26,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..llm import LLMMessage, LLMProvider
 from ..runtime.events import mem_ltm_promoted
+from .compactor import loads_llm_json
 from .config import MemoryConfig
 from .ltm import CATEGORIES, LTMStore
 from .stm import STMSection, STMStore
@@ -91,6 +90,8 @@ _SYSTEM_PROMPT = (
     "  Sections NOT listed are dropped from STM (they are represented by LTM now).\n"
     "- Keep sections that contain very recent context. Promote older ones.\n"
     "- Do not invent facts. Be concise.\n"
+    "- Output raw JSON only — no markdown fences, no commentary. Escape "
+    "newlines inside string values as \\n.\n"
 )
 
 
@@ -108,23 +109,13 @@ def build_tier2_prompt(sections: list[STMSection]) -> str:
     return "\n".join(lines)
 
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
-
-
 def parse_tier2_response(content: str, sections: list[STMSection]) -> _T2Response:
     """Parse and validate the tier-2 LLM response.
 
     Raises ``ValueError`` on malformed input; callers should treat this as a
     soft failure (log, skip the pass, leave STM unchanged).
     """
-    raw = content.strip()
-    m = _FENCE_RE.search(raw)
-    if m:
-        raw = m.group(1).strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"tier-2 response is not JSON: {e}") from e
+    data = loads_llm_json(content, what="tier-2")
     try:
         resp = _T2Response.model_validate(data)
     except ValidationError as e:
