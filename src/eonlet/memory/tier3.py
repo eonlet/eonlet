@@ -23,7 +23,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..llm import LLMMessage, LLMProvider
 from ..runtime.events import mem_ltm_forgotten
-from .compactor import loads_llm_json
+from .compactor import COMPACTION_MAX_TOKENS, loads_llm_json, raise_if_truncated
 from .config import MemoryConfig
 from .ltm import LTMBullet, LTMStore
 from .tier1 import RecordEventFn
@@ -160,6 +160,7 @@ async def run_tier3(
                 [LLMMessage(role="user", content=prompt)],
                 system=_SYSTEM_PROMPT,
                 tools=None,
+                max_tokens=COMPACTION_MAX_TOKENS,
             )
         except Exception as e:
             err = f"tier-3 LLM call failed: {e}"
@@ -167,6 +168,7 @@ async def run_tier3(
             return ForgettingOutcome(ran=False, error=err)
 
         try:
+            raise_if_truncated(llm_resp, what="tier-3")
             resp = parse_tier3_response(llm_resp.content)
         except ValueError as e:
             err = f"tier-3 parse failed: {e}"

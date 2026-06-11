@@ -223,3 +223,27 @@ def test_llm_compactor_exposes_model_name() -> None:
 
     comp = LLMCompactor(SimpleNamespace(model="fake-haiku"))  # type: ignore[arg-type]
     assert comp.model_name == "fake-haiku"
+
+
+def test_summarize_raises_clearly_on_truncation() -> None:
+    # Dogfood round 3: DeepSeek spent the 4096 max_tokens on reasoning and the
+    # JSON answer was cut mid-string ("Unterminated string"). stop_reason
+    # carries the truth — surface it instead of a cryptic parse error.
+    from unittest.mock import AsyncMock, MagicMock
+
+    from eonlet.llm.protocol import LLMResponse
+
+    provider = MagicMock()
+    provider.complete = AsyncMock(
+        return_value=LLMResponse(
+            content='{"sections": [{"ts_start": "x", "ts_end": "y", "topic": "cut off',
+            tool_calls=[],
+            stop_reason="length",
+        )
+    )
+    compactor = LLMCompactor(provider)
+    events = [_evt(user_message("hello"), 1)]
+    with pytest.raises(ValueError, match="truncated at max_tokens"):
+        anyio.run(compactor.summarize, events, 1)
+    # And the call asked for the larger compaction budget.
+    assert provider.complete.call_args.kwargs["max_tokens"] == 8192

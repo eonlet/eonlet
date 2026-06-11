@@ -150,6 +150,26 @@ def _extract_json(content: str) -> str:
     return content
 
 
+# Reasoning models (DeepSeek observed live) spend the max_tokens budget on
+# chain-of-thought before emitting the JSON answer; the provider default of
+# 4096 truncated a tier-1 response mid-string (~450 output tokens). All
+# compaction-purpose calls share this larger cap.
+COMPACTION_MAX_TOKENS = 8192
+
+
+def raise_if_truncated(resp: Any, *, what: str) -> None:
+    """Fail fast (and clearly) when the LLM hit max_tokens mid-answer.
+
+    Without this, a truncated JSON surfaces as a cryptic "Unterminated
+    string" parse error.
+    """
+    if getattr(resp, "stop_reason", "") == "length":
+        raise ValueError(
+            f"{what} response truncated at max_tokens (stop_reason=length) after "
+            f"{len(resp.content)} chars — raise max_tokens or shrink the input"
+        )
+
+
 def loads_llm_json(content: str, *, what: str) -> Any:
     """Parse one JSON object out of an LLM response, leniently.
 
@@ -229,7 +249,10 @@ class LLMCompactor:
     async def summarize(self, events: list[Event], suggested_boundary: int) -> CompactionResult:
         prompt = build_compaction_prompt(events, suggested_boundary)
         msg = LLMMessage(role="user", content=prompt)
-        resp = await self._provider.complete([msg], system=_SYSTEM_PROMPT, tools=None)
+        resp = await self._provider.complete(
+            [msg], system=_SYSTEM_PROMPT, tools=None, max_tokens=COMPACTION_MAX_TOKENS
+        )
+        raise_if_truncated(resp, what="compactor")
         valid_ids = {e.id for e in events if e.id is not None}
         return parse_compaction_response(
             resp.content,
@@ -265,6 +288,7 @@ class StaticCompactor:
 
 
 __all__ = [
+    "COMPACTION_MAX_TOKENS",
     "CompactionFn",
     "CompactionResult",
     "Compactor",
@@ -273,4 +297,5 @@ __all__ = [
     "build_compaction_prompt",
     "loads_llm_json",
     "parse_compaction_response",
+    "raise_if_truncated",
 ]

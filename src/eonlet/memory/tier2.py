@@ -26,7 +26,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..llm import LLMMessage, LLMProvider
 from ..runtime.events import mem_ltm_promoted
-from .compactor import loads_llm_json
+from .compactor import COMPACTION_MAX_TOKENS, loads_llm_json, raise_if_truncated
 from .config import MemoryConfig
 from .ltm import CATEGORIES, LTMStore
 from .stm import STMSection, STMStore
@@ -174,6 +174,7 @@ async def run_tier2(
                 [LLMMessage(role="user", content=prompt)],
                 system=_SYSTEM_PROMPT,
                 tools=None,
+                max_tokens=COMPACTION_MAX_TOKENS,
             )
         except Exception as e:
             err = f"tier-2 LLM call failed: {e}"
@@ -181,6 +182,7 @@ async def run_tier2(
             return PromotionOutcome(ran=False, error=err)
 
         try:
+            raise_if_truncated(llm_resp, what="tier-2")
             resp = parse_tier2_response(llm_resp.content, sections)
         except ValueError as e:
             err = f"tier-2 parse failed: {e}"
