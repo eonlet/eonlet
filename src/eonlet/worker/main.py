@@ -66,13 +66,18 @@ def main() -> None:
     parser.add_argument("eonlet_id", help="<type>.<name>")
     args = parser.parse_args()
 
+    # When spawned by the CLI, stderr is already redirected into current.log —
+    # an unconditional StreamHandler would write every line twice. Keep the
+    # stream copy only for a human running the worker by hand in a terminal.
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(_log_file(args.eonlet_id), encoding="utf-8")
+    ]
+    if sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=os.environ.get("EONLET_LOG", "INFO"),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(_log_file(args.eonlet_id), encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=handlers,
     )
     try:
         anyio.run(_worker_main, args.eonlet_id)
@@ -174,7 +179,14 @@ async def run_worker(
     # Blocking user-decision channel (ADR-0006): shared by the interactive
     # permission confirm and (M3) compaction proposals.
     broker = DecisionBroker(server)
-    server.on_disconnect = broker.on_session_closed
+
+    def _on_disconnect(sid: str) -> None:
+        broker.on_session_closed(sid)
+        # Keep the gate's view of "someone can confirm" in sync — previously
+        # session_attached stayed True forever after the first attach.
+        runtime.gate.session_attached = broker.has_listener()
+
+    server.on_disconnect = _on_disconnect
     runtime.decision_broker = broker
     runtime.event_listener = _make_event_broadcaster(server)
     runtime.on_delta = _make_delta_broadcaster(server, runtime)
@@ -935,8 +947,18 @@ def _make_handler(
 
     async def handle(method: str, params: dict[str, Any]) -> Any:
         if method == "session.start":
-            runtime.gate.session_attached = True
             session = params.get("_session")
+            if session is not None:
+                # One-shot clients (send/tail/tasks) declare interactive: false —
+                # they can't answer decision prompts (ADR-0006), so neither the
+                # broker nor the permission gate may treat them as confirmers.
+                session.interactive = bool(params.get("interactive", True))
+            broker = runtime.decision_broker
+            runtime.gate.session_attached = (
+                broker.has_listener()
+                if broker is not None
+                else session is not None and session.interactive
+            )
             return {
                 "session_id": session.id if session is not None else None,
                 "state": {

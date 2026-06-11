@@ -96,7 +96,11 @@ class PermissionGate:
         # 3. Mode + annotations.
         if ann.requires_confirmation and not self.session_attached:
             return Decision(
-                False, "tool requires confirmation but no session attached", "needs_confirm"
+                False,
+                "denied: this tool requires explicit user confirmation, but no "
+                "interactive session is attached to confirm it. Do not retry; "
+                "tell the user to run `eonlet attach` and ask again there.",
+                "needs_confirm",
             )
 
         if self.mode == "yolo":
@@ -117,7 +121,14 @@ class PermissionGate:
                 needs_prompt=True,
             )
 
-        return Decision(False, "ask mode and no session attached", "ask_no_session")
+        return Decision(
+            False,
+            "denied: permissions.mode is 'ask' and no interactive session is "
+            "attached, so destructive tool calls are auto-denied (nobody can "
+            "approve them). Do not retry; tell the user to run `eonlet attach` "
+            "and confirm there, or configure permissions.mode: yolo.",
+            "ask_no_session",
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

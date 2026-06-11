@@ -1513,7 +1513,7 @@ def cmd_send(eonlet_id: str, message: str) -> None:
 async def _send_async(sock: str, message: str) -> None:
     async with IPCClient(sock) as client, anyio.create_task_group() as tg:
         tg.start_soon(client.run)
-        await client.request("session.start", {"client_id": "cli-send"})
+        await client.request("session.start", {"client_id": "cli-send", "interactive": False})
         await client.request("message.send", {"content": message})
         # End-of-run = an assistant_message event with no tool_calls.
         async for msg in client.notifications():
@@ -1696,7 +1696,7 @@ def _cmd_tasks_mutate(
     async def go() -> None:
         async with IPCClient(str(sock)) as client, anyio.create_task_group() as tg:
             tg.start_soon(client.run)
-            await client.request("session.start", {"client_id": "cli-tasks"})
+            await client.request("session.start", {"client_id": "cli-tasks", "interactive": False})
             result.update(await client.request(method, params) or {})
             tg.cancel_scope.cancel()
 
@@ -1808,7 +1808,7 @@ def cmd_tail(eonlet_id: str) -> None:
     async def go() -> None:
         async with IPCClient(str(sock)) as client, anyio.create_task_group() as tg:
             tg.start_soon(client.run)
-            await client.request("session.start", {"client_id": "cli-tail"})
+            await client.request("session.start", {"client_id": "cli-tail", "interactive": False})
             async for msg in client.notifications():
                 if msg.get("method") != "event":
                     continue
@@ -2345,6 +2345,9 @@ def cmd_trace(
     eonlet_id: str,
     *,
     line: str | None = None,
+    outline: bool = False,
+    msg: int | None = None,
+    at: int | None = None,
     json_out: bool = False,
     html_path: str | None = None,
 ) -> None:
@@ -2352,8 +2355,10 @@ def cmd_trace(
 
     Default renders the line tree (forks = context rewrites such as
     compaction). ``--line`` folds one line and prints its latest full context,
-    replay-style: everything the model saw, exactly as it saw it. ``--html``
-    writes a self-contained browser viewer instead of printing.
+    replay-style: everything the model saw, exactly as it saw it. ``--outline``
+    collapses that to one summary row per message; ``--msg N`` expands a single
+    message; ``--at SEQ`` folds only up to that call. ``--html`` writes a
+    self-contained browser viewer instead of printing.
     """
     from ..trace import TRACE_FILENAME, read_trace
 
@@ -2381,8 +2386,10 @@ def cmd_trace(
             console.print_json(data=r, indent=None)
         return
     if line is not None:
-        _trace_print_line(records, line)
+        _trace_print_line(records, line, outline=outline, msg=msg, at=at)
         return
+    if outline or msg is not None or at is not None:
+        fail("--outline/--msg/--at need --line", code=2)
     _trace_print_tree(records)
 
 
@@ -2436,35 +2443,108 @@ def _trace_print_tree(records: list[dict[str, Any]]) -> None:
     console.print(tree)
 
 
-def _trace_print_line(records: list[dict[str, Any]], line_id: str) -> None:
+def _trace_print_line(
+    records: list[dict[str, Any]],
+    line_id: str,
+    *,
+    outline: bool = False,
+    msg: int | None = None,
+    at: int | None = None,
+) -> None:
     from ..trace import fold_line
 
-    folded = fold_line(records, line_id)
+    folded = fold_line(records, line_id, up_to_seq=at)
     if not folded["records"]:
         known = ", ".join(dict.fromkeys(str(r.get("line")) for r in records))
+        if at is not None:
+            fail(f"line {line_id!r} has no records at or before seq {at}", code=3)
         fail(f"unknown line {line_id!r}; known lines: {known}", code=3)
-    parent = folded["parent"]
-    if parent:
-        console.print(f"[dim]forked from {parent.get('line')} at seq {parent.get('seq')}[/]")
-    console.print(f"[bold cyan]── system ──[/]\n{folded['system']}")
 
     def print_message(m: dict[str, Any], heading: str) -> None:
         console.print(f"\n[bold cyan]── {heading} ──[/]")
         if m.get("content"):
             console.print(m["content"], markup=False)
+        if m.get("reasoning_content"):
+            console.print(f"[dim]thinking: {m['reasoning_content']}[/]")
         for tc in m.get("tool_calls") or []:
             console.print(f"[yellow]tool_call[/] {tc.get('name')}({tc.get('arguments')})")
         if m.get("tool_call_id"):
             err = " [red](error)[/]" if m.get("is_error") else ""
             console.print(f"[dim]↳ result for {m['tool_call_id']}{err}[/]")
 
-    for i, m in enumerate(folded["messages"], start=1):
-        print_message(m, f"{i}. {m.get('role', '?')}")
-    # The line's trailing reply (a ``response`` record) is not part of any
-    # request context yet — without this, the run's last turn is invisible.
+    # Numbering is stable across views: system is 0, messages are 1..N, the
+    # trailing reply (when present) is N+1 — so --msg expands exactly the row
+    # the outline showed.
+    numbered: list[tuple[str, dict[str, Any]]] = [
+        (f"{i}. {m.get('role', '?')}", m) for i, m in enumerate(folded["messages"], start=1)
+    ]
     tail = folded["records"][-1]
     if tail.get("kind") == "response" and isinstance(tail.get("message"), dict):
-        print_message(tail["message"], f"reply to seq {tail.get('for_seq')}")
+        # The line's trailing reply (a ``response`` record) is not part of any
+        # request context yet — without this, the run's last turn is invisible.
+        numbered.append(
+            (f"{len(numbered) + 1}. reply to seq {tail.get('for_seq')}", tail["message"])
+        )
+
+    if msg is not None:
+        if msg == 0:
+            console.print(f"[bold cyan]── system ──[/]\n{folded['system']}")
+            return
+        if not 1 <= msg <= len(numbered):
+            fail(f"--msg {msg} out of range (0=system, 1..{len(numbered)})", code=3)
+        print_message(numbered[msg - 1][1], numbered[msg - 1][0])
+        return
+
+    parent = folded["parent"]
+    if parent:
+        console.print(f"[dim]forked from {parent.get('line')} at seq {parent.get('seq')}[/]")
+
+    if outline:
+        _trace_print_outline(folded, numbered)
+        return
+
+    console.print(f"[bold cyan]── system ──[/]\n{folded['system']}")
+    for heading, m in numbered:
+        print_message(m, heading)
+
+
+def _trace_print_outline(
+    folded: dict[str, Any], numbered: list[tuple[str, dict[str, Any]]]
+) -> None:
+    """One row per message: index, role, size, first-line preview, tool names.
+
+    The cheap middle step between the line tree and a full ``--line`` dump —
+    scan the shape, then expand single messages with ``--msg N``.
+    """
+
+    def preview(text: str, width: int = 72) -> str:
+        flat = " ".join(text.split())
+        return flat[: width - 1] + "…" if len(flat) > width else flat
+
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("#", justify="right")
+    table.add_column("role")
+    table.add_column("chars", justify="right")
+    table.add_column("summary", overflow="fold")
+    table.add_row("0", "system", str(len(folded["system"])), preview(folded["system"]))
+    for heading, m in numbered:
+        idx = heading.split(".", 1)[0]
+        role = str(m.get("role", "?"))
+        if "reply to seq" in heading:
+            role += " (reply)"
+        bits: list[str] = []
+        if m.get("content"):
+            bits.append(preview(str(m["content"])))
+        for tc in m.get("tool_calls") or []:
+            bits.append(f"[yellow]→ {tc.get('name')}[/]")
+        if m.get("tool_call_id"):
+            mark = "[red]✗[/]" if m.get("is_error") else "✓"
+            bits.append(f"[dim]{mark} result {m['tool_call_id']}[/]")
+        size = len(str(m.get("content") or "")) + sum(
+            len(str(tc.get("arguments") or "")) for tc in m.get("tool_calls") or []
+        )
+        table.add_row(idx, role, str(size), "  ".join(bits) or "[dim](empty)[/]")
+    console.print(table)
 
 
 def _parse_env_lines(lines: list[str]) -> dict[str, str]:

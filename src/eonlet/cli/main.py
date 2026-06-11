@@ -243,6 +243,25 @@ def trace(
     line: str | None = typer.Option(
         None, "--line", "-l", help="Fold one line and print its latest full context."
     ),
+    outline: bool = typer.Option(
+        False,
+        "--outline",
+        "-o",
+        help="With --line: one summary row per message instead of full bodies.",
+    ),
+    msg: int | None = typer.Option(
+        None,
+        "--msg",
+        "-m",
+        metavar="N",
+        help="With --line: print only message N (numbering matches --outline) in full.",
+    ),
+    at: int | None = typer.Option(
+        None,
+        "--at",
+        metavar="SEQ",
+        help="With --line: fold only up to call SEQ — the context as the model saw it then.",
+    ),
     json_out: bool = typer.Option(False, "--json", help="Raw JSONL records, one per line."),
     html: str | None = typer.Option(
         None,
@@ -255,8 +274,13 @@ def trace(
 
     Forks in the tree are context rewrites — compaction, /compact, window
     slides, task-scope switches. Requires ``trace.enabled: true`` in agent.yaml.
+
+    Progressive inspection: start with the tree, then ``--line X --outline``
+    for a per-message summary, then ``--msg N`` to expand one message.
     """
-    commands.cmd_trace(id_, line=line, json_out=json_out, html_path=html)
+    commands.cmd_trace(
+        id_, line=line, outline=outline, msg=msg, at=at, json_out=json_out, html_path=html
+    )
 
 
 @app.command()

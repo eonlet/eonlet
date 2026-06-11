@@ -231,6 +231,21 @@ def test_fold_line_reconstructs_full_context(tmp_path: Path) -> None:
     assert len(folded["records"]) == 2
 
 
+def test_fold_line_up_to_seq_stops_at_that_call(tmp_path: Path) -> None:
+    t = _tracer(tmp_path)
+    r1 = t.record(system="sys-A", messages=_msgs("a"))
+    t.record_response(LLMMessage(role="assistant", content="ra"))
+    t.record(system="sys-B", messages=_msgs("a", "ra", "b"))
+    records = read_trace(t.path)
+    folded = fold_line(records, r1["line"], up_to_seq=r1["seq"])
+    assert [m["content"] for m in folded["messages"]] == ["a"]
+    assert folded["system"] == "sys-A"  # later sys-B not folded in
+    # No cutoff → latest state, unchanged behavior.
+    assert [m["content"] for m in fold_line(records, r1["line"])["messages"]] == ["a", "ra", "b"]
+    # Cutoff before the line's first record → empty fold.
+    assert fold_line(records, r1["line"], up_to_seq=0)["records"] == []
+
+
 def test_records_are_one_json_object_per_line(tmp_path: Path) -> None:
     t = _tracer(tmp_path)
     t.record(system="sys", messages=_msgs("hi"))

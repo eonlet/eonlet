@@ -53,8 +53,15 @@ class DecisionBroker:
         self._counter = 0
 
     def has_listener(self) -> bool:
-        """True if at least one client session is currently attached."""
-        return bool(self._server.sessions)
+        """True if at least one *interactive* session is currently attached.
+
+        Non-interactive clients (`eonlet send`, `tail`, …) declare
+        ``interactive: false`` at ``session.start`` — they cannot answer a
+        ``decision/request``, so they must not count as listeners (otherwise a
+        one-shot ``send`` hitting an ask-mode destructive tool deadlocks the
+        turn). ``getattr`` default keeps bare test doubles counting.
+        """
+        return any(getattr(s, "interactive", True) for s in self._server.sessions.values())
 
     async def ask(
         self,
@@ -107,10 +114,11 @@ class DecisionBroker:
         return True
 
     def on_session_closed(self, _sid: str) -> None:
-        """Decline every outstanding decision once the last session detaches, so
-        a blocked agent task unblocks instead of hanging forever.
+        """Decline every outstanding decision once the last *interactive*
+        session detaches, so a blocked agent task unblocks instead of hanging
+        forever.
         """
-        if self._server.sessions:
+        if self.has_listener():
             return
         for pending in list(self._pending.values()):
             if not pending.event.is_set():

@@ -485,9 +485,18 @@ Show the LLM context-trace lineage (ADR-0010). Offline — reads
 ```bash
 eonlet trace <id>                  # lineage tree: lines, forks, call counts
 eonlet trace <id> --line <ln-…>    # fold one line; print its latest full context
+eonlet trace <id> --line <ln-…> --outline   # one summary row per message
+eonlet trace <id> --line <ln-…> --msg 7     # expand a single message (0 = system)
+eonlet trace <id> --line <ln-…> --at 14     # fold only up to call seq 14
 eonlet trace <id> --json           # raw JSONL records, one per line (for jq)
 eonlet trace <id> --html out.html  # write a self-contained HTML viewer
 ```
+
+Inspect progressively, cheap to expensive: the tree, then `--outline` to scan
+a line's shape (index, role, size, preview, tool calls, result status), then
+`--msg N` to read one message in full. `--msg` numbering matches the outline
+rows. `--at SEQ` views the context as the model saw it at that call rather
+than the line's latest state; it composes with `--outline`/`--msg`.
 
 `--html` produces a single dependency-free file (embedded data + vanilla
 JS/CSS — the claude-trace deliverable shape): a sidebar lineage tree, per-call

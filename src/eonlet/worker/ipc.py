@@ -41,6 +41,11 @@ class Session:
     id: str
     stream: SocketStream
     _lock: anyio.Lock
+    # Declared via ``session.start`` (``interactive: false`` for one-shot
+    # clients like `eonlet send`/`tail`). Only interactive sessions count as
+    # decision listeners (ADR-0006) — a client that can't answer a
+    # ``decision/request`` must not make the worker block on one.
+    interactive: bool = False
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         msg = {"jsonrpc": "2.0", "method": method, "params": params}

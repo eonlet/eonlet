@@ -129,6 +129,11 @@ def test_decision_round_trip_over_real_socket(short_tmp_path: Path) -> None:
     holder: dict[str, DecisionBroker] = {}
 
     async def handler(method: str, params: dict[str, Any]) -> Any:
+        if method == "session.start":
+            # Mirror the worker: only sessions that declare themselves
+            # interactive count as decision listeners.
+            params["_session"].interactive = bool(params.get("interactive", True))
+            return {"ok": True}
         if method == "decision.respond":
             ok = holder["broker"].resolve(str(params.get("id")), str(params.get("choice")))
             return {"ok": ok}
@@ -150,7 +155,9 @@ def test_decision_round_trip_over_real_socket(short_tmp_path: Path) -> None:
 
             async with IPCClient(sock) as client, anyio.create_task_group() as ctg:
                 ctg.start_soon(client.run)
-                # Wait until the server has registered our session.
+                # Declare an interactive session, then wait until the server
+                # counts us as a decision listener.
+                await client.request("session.start", {"interactive": True})
                 for _ in range(100):
                     if broker.has_listener():
                         break

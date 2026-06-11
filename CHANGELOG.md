@@ -14,6 +14,40 @@ Remaining work for the v0.1.0 release tag (non-engineering):
 - Two weeks of author dogfooding without a P0 bug. ADR-0004's 48-hour
   `x-digest` live-feed canary is part of this window.
 
+### Fixed — DeepSeek dogfood round 1 (live-testing findings)
+
+- **`eonlet send` deadlock under `ask` mode.** `send`/`tasks`/`tail` now declare
+  `interactive: false` at `session.start`; the `DecisionBroker` and the
+  permission gate only count *interactive* sessions as confirmers. Previously a
+  one-shot `send` hitting an ask-mode destructive tool blocked the turn forever
+  (the broker waited for a `decision.respond` that `send` never sends).
+- **`gate.session_attached` never reset.** It now tracks live interactive
+  sessions via the broker on every connect/disconnect; before, the first attach
+  flipped it `True` permanently.
+- **Permission-denial reasons are now actionable.** The two auto-deny strings
+  tell the model *not to retry* and what the user should do (`eonlet attach`
+  or `permissions.mode: yolo`). Traces showed models guessing at made-up
+  remedies ("switch to agent mode") and blindly retrying after the terse
+  denials.
+- **Duplicate worker log lines.** The worker added a `StreamHandler` (stderr)
+  on top of its `FileHandler` while the CLI already redirects worker stderr
+  into the same `current.log` — every line landed twice. The stream copy is
+  now added only when stderr is a TTY (running the worker by hand).
+
+### Added — progressive trace inspection
+
+`eonlet trace --line X` used to be all-or-nothing (a full context dump).
+New flags for fold/expand-style reading, cheap-to-expensive:
+
+- `--outline` — one summary row per message (index, role, size, preview,
+  tool-call names, result status). The middle step between the line tree and a
+  full dump.
+- `--msg N` — print exactly one message in full (`0` = system prompt;
+  numbering matches `--outline`).
+- `--at SEQ` — fold the line only up to that call: the context exactly as the
+  model saw it at that request. `fold_line()` gained the matching
+  `up_to_seq` keyword.
+
 ### Added — context trace ([ADR-0010](docs/adr/0010-context-trace.md))
 
 Lineage-aware recording of every LLM request, answering "what exactly did the

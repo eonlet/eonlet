@@ -326,7 +326,7 @@ The project uses **uv** (not pip/poetry/conda):
 ```bash
 # One-time setup
 uv venv
-uv sync --dev          # install all deps including dev extras
+uv sync --extra dev    # install all deps including dev extras (dev is an extra, not a dependency-group — `--dev` silently installs nothing)
 pre-commit install
 
 # Daily development

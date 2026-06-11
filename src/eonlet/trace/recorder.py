@@ -76,7 +76,9 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def fold_line(records: list[dict[str, Any]], line_id: str) -> dict[str, Any]:
+def fold_line(
+    records: list[dict[str, Any]], line_id: str, *, up_to_seq: int | None = None
+) -> dict[str, Any]:
     """Reconstruct one line's latest full context from its root + deltas.
 
     Returns ``{"line", "parent", "system", "messages", "hashes", "records"}``
@@ -84,8 +86,13 @@ def fold_line(records: list[dict[str, Any]], line_id: str) -> dict[str, Any]:
     record and ``system`` is the last non-null system prompt seen on the line.
     ``response`` records stay in ``records`` but never enter the context fold
     — they describe what came *back*, not what was sent.
+
+    ``up_to_seq`` stops the fold after that call seq — the context exactly as
+    the model saw it at that request, not the line's latest state.
     """
     own = [r for r in records if r.get("line") == line_id]
+    if up_to_seq is not None:
+        own = [r for r in own if isinstance(r.get("seq"), int) and r["seq"] <= up_to_seq]
     messages: list[dict[str, Any]] = []
     hashes: list[str] = []
     system = ""
